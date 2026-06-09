@@ -16,6 +16,9 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # NPM_TOKEN is stored as an environment secret on the `production`
+    # environment, so the job must run in that environment to read it.
+    environment: production
     steps:
       - uses: actions/checkout@v4
 
