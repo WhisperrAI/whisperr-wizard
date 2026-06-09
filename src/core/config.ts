@@ -15,10 +15,11 @@ import type { WizardConfig } from "../types.js";
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
-// Current coding-agent default. Override with WHISPERR_WIZARD_MODEL.
-//   claude-opus-4-8   — most capable, best for autonomous agentic edits
-//   claude-sonnet-4-6 — faster/cheaper workhorse
-const DEFAULT_MODEL = "claude-opus-4-8";
+// Coding-agent default. Sonnet is the right tool for mechanical SDK wiring:
+// fast, and ~5x cheaper output than Opus, which over-thinks/over-narrates this
+// kind of work. Override with WHISPERR_WIZARD_MODEL=claude-opus-4-8 for the
+// hardest repos.
+const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 export interface CliFlags {
   offline?: boolean;
@@ -51,7 +52,7 @@ export function resolveConfig(flags: CliFlags = {}): WizardConfig {
     apiBaseUrl,
     llmBaseUrl,
     model: flags.model ?? process.env.WHISPERR_WIZARD_MODEL ?? DEFAULT_MODEL,
-    maxTurns: Number(process.env.WHISPERR_WIZARD_MAX_TURNS ?? 40),
+    maxTurns: Number(process.env.WHISPERR_WIZARD_MAX_TURNS ?? 55),
     directAnthropicKey,
     offline,
   };

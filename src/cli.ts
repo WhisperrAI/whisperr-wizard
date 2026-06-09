@@ -98,8 +98,8 @@ export async function run(options: RunOptions): Promise<number> {
 
   // 5. Run the coding agent.
   const spin = p.spinner();
-  spin.start(theme.bright("Integrating") + theme.muted(" — the agent is working in your code"));
-  let lastLine = "";
+  let phaseLabel = "Integrating";
+  spin.start(theme.bright(phaseLabel) + theme.muted(" — the agent is working in your code"));
   const outcome = await runIntegrationAgent({
     repoPath,
     config,
@@ -107,25 +107,32 @@ export async function run(options: RunOptions): Promise<number> {
     playbook: chosen.playbook,
     manifest,
     progress: {
+      onPhase(label) {
+        phaseLabel = label;
+        spin.message(theme.bright(label));
+      },
       onActivity(line) {
-        lastLine = line;
-        spin.message(theme.bright("Integrating") + theme.muted(` — ${line}`));
+        spin.message(theme.bright(phaseLabel) + theme.muted(` — ${line}`));
       },
     },
   }).catch((err) => {
-    spin.stop(theme.alert("Integration failed"));
+    spin.stop(theme.alert("Integration stopped"));
     p.log.error((err as Error).message);
     return null;
   });
 
   if (!outcome) return 1;
-  spin.stop(
-    outcome.ok
-      ? theme.success("Integration complete")
-      : theme.warn("Integration finished with notes"),
-  );
 
-  // 6. Show what changed + the agent's summary.
+  // Honest stop label: the core landing is the bar; events may be partial.
+  const stopLabel = !outcome.coreOk
+    ? theme.warn("Stopped early — partial setup is in your working tree")
+    : outcome.eventsComplete
+      ? theme.success("Integration complete")
+      : theme.success("Core integration done") +
+        theme.muted(" — some events left as follow-ups");
+  spin.stop(stopLabel);
+
+  // 6. Show what changed + cost + the agent's summary.
   const files = await changedFiles(repoPath, checkpoint);
   if (files.length) {
     p.note(files.map((f) => theme.muted("• ") + f).join("\n"), "Files changed");
@@ -133,6 +140,12 @@ export async function run(options: RunOptions): Promise<number> {
   if (outcome.summary.trim()) {
     p.log.message(outcome.summary.trim());
   }
+  p.log.info(
+    theme.muted(
+      `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
+        `~$${outcome.costUsd.toFixed(2)} · ${Math.round(outcome.durationMs / 1000)}s`,
+    ),
+  );
 
   // 7. Activation: wait for the first event (skipped offline).
   if (!config.offline) {
@@ -171,7 +184,6 @@ export async function run(options: RunOptions): Promise<number> {
     .join("\n");
   p.note(nextSteps, theme.bright("Next"));
   p.outro(theme.signal("⌁ ") + theme.bright("Whisperr is wired in."));
-  void lastLine;
   return 0;
 }
 

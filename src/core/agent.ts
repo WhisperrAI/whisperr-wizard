@@ -5,31 +5,38 @@ import type {
   WizardConfig,
   WizardSession,
 } from "../types.js";
-import { BASE_WIZARD_PROMPT, renderManifestBrief } from "./playbooks/shared-prompt.js";
+import {
+  BASE_WIZARD_PROMPT,
+  renderEventsBrief,
+  renderIdentifyBrief,
+} from "./playbooks/shared-prompt.js";
 
 export interface AgentProgress {
-  /** Free-text line, e.g. "Editing lib/main.dart". */
+  /** A new phase started, e.g. "Installing the SDK". */
+  onPhase?(label: string): void;
+  /** Free-text activity line, e.g. "Editing lib/main.dart". */
   onActivity?(line: string): void;
-  /** Final result summary text from the agent. */
-  onResult?(summary: string, costUsd?: number): void;
 }
 
 export interface AgentRunOutcome {
   summary: string;
-  costUsd?: number;
-  durationMs?: number;
-  ok: boolean;
+  costUsd: number;
+  durationMs: number;
+  /** Core (install + identify) landed. The bar for "the integration works". */
+  coreOk: boolean;
+  /** Event instrumentation completed without hitting the step limit. */
+  eventsComplete: boolean;
 }
 
 /**
- * Run the coding agent over `repoPath` to perform the integration.
+ * Run the integration in two phases so we ALWAYS deliver the valuable core:
+ *   1. Core — install SDK + initialize + identify(). Small, deterministic,
+ *      must succeed. Locked in even if phase 2 runs long.
+ *   2. Events — instrument product events, highest-impact first, skipping fast
+ *      when a client call site doesn't exist (most server-side events won't).
  *
- * Auth model:
- *  - production: point the Agent SDK at Whisperr's Anthropic-compatible gateway
- *    via ANTHROPIC_BASE_URL, with the short-lived wizard token as
- *    ANTHROPIC_AUTH_TOKEN. The CLI never holds an Anthropic key; the gateway
- *    injects it and meters usage per app.
- *  - local dev: if a direct Anthropic key is configured, use it as-is.
+ * Default model is Sonnet (fast + ~5x cheaper than Opus for this mechanical
+ * work). The whole design fights the "explore forever, never land" failure mode.
  */
 export async function runIntegrationAgent(opts: {
   repoPath: string;
@@ -42,46 +49,121 @@ export async function runIntegrationAgent(opts: {
   const { repoPath, config, session, playbook, manifest, progress } = opts;
 
   applyModelAuthEnv(config, session);
-
   const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt].join("\n\n");
 
-  const verifyHint = playbook.verifyCommand
-    ? `\n\nWhen finished, run \`${playbook.verifyCommand}\` and fix anything it flags.`
-    : "";
+  const started = Date.now();
+  let costUsd = 0;
+  const summaries: string[] = [];
 
-  const prompt = [
-    `Integrate the Whisperr ${playbook.target.displayName} SDK into this repository.`,
+  // ---- Phase 1: core (install + initialize + identify) ----
+  progress?.onPhase?.("Installing the SDK & wiring identify()");
+  const verifyHint = playbook.verifyCommand
+    ? ` Finish with a single \`${playbook.verifyCommand}\` and fix only what it flags.`
+    : "";
+  const corePrompt = [
+    `Integrate the Whisperr ${playbook.target.displayName} SDK — CORE SETUP ONLY.`,
     `Project root: ${repoPath}`,
     "",
-    "Here is the integration manifest derived from this customer's Whisperr",
-    "onboarding. Wire identify() and instrument every event below at the correct",
-    "call site, following the SDK guide in your system prompt.",
+    "Do exactly these, then stop:",
+    `1. Add the Whisperr SDK dependency and install it (${playbook.packageRef}).`,
+    "2. Initialize it once at app startup with the key + base URL below.",
+    "3. Wire identify() where the end-user becomes known (login / signup /",
+    "   session restore), and reset() on logout.",
     "",
-    "----- MANIFEST -----",
-    renderManifestBrief(manifest),
-    "----- END MANIFEST -----",
-    verifyHint,
+    "Do NOT instrument product events yet — that is a separate step." + verifyHint,
+    "",
+    "----- IDENTIFY -----",
+    renderIdentifyBrief(manifest),
+    "----- END -----",
   ].join("\n");
 
-  const started = Date.now();
+  const core = await runPass({
+    prompt: corePrompt,
+    systemPrompt,
+    repoPath,
+    model: config.model,
+    maxTurns: 20,
+    progress,
+  });
+  costUsd += core.costUsd;
+  if (core.summary) summaries.push(`Core setup:\n${core.summary}`);
+
+  // ---- Phase 2: events (bounded, skip-fast) ----
+  let eventsComplete = true;
+  if (manifest.events.length > 0) {
+    progress?.onPhase?.("Instrumenting your events");
+    const eventsPrompt = [
+      `The Whisperr ${playbook.target.displayName} SDK is already installed,`,
+      "initialized, and identify() is wired. Now add track() calls for product",
+      "events.",
+      "",
+      "How to work:",
+      "- Go in the order listed (highest-impact first).",
+      "- For each event, Grep for where that user action happens. If there is a",
+      "  clear client-side call site, add the track() call with the exact name.",
+      "  If not, SKIP it (most server-side events won't exist here) — do not hunt.",
+      "- You have a limited number of steps; spend them placing events, not",
+      "  exploring. Stop once the events that clearly exist in this app are wired.",
+      "",
+      "----- EVENTS -----",
+      renderEventsBrief(manifest),
+      "----- END -----",
+    ].join("\n");
+
+    const events = await runPass({
+      prompt: eventsPrompt,
+      systemPrompt,
+      repoPath,
+      model: config.model,
+      maxTurns: config.maxTurns,
+      progress,
+    });
+    costUsd += events.costUsd;
+    eventsComplete = !events.maxedOut;
+    if (events.summary) summaries.push(`Events:\n${events.summary}`);
+  }
+
+  return {
+    summary: summaries.join("\n\n"),
+    costUsd,
+    durationMs: Date.now() - started,
+    coreOk: core.ok,
+    eventsComplete,
+  };
+}
+
+interface PassResult {
+  summary: string;
+  costUsd: number;
+  ok: boolean;
+  /** Hit the step limit (ran out of turns) rather than finishing. */
+  maxedOut: boolean;
+}
+
+async function runPass(opts: {
+  prompt: string;
+  systemPrompt: string;
+  repoPath: string;
+  model: string;
+  maxTurns: number;
+  progress?: AgentProgress;
+}): Promise<PassResult> {
+  const { prompt, systemPrompt, repoPath, model, maxTurns, progress } = opts;
+
   let summary = "";
-  let costUsd: number | undefined;
+  let costUsd = 0;
   let ok = false;
+  let maxedOut = false;
 
   const response = query({
     prompt,
     options: {
-      model: config.model,
+      model,
       cwd: repoPath,
       systemPrompt,
-      // Full file-system agent toolset.
       allowedTools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
-      // Fully autonomous edits (the user opted into auto-apply; the wizard takes
-      // a git checkpoint before this runs so revert is one command).
       permissionMode: "bypassPermissions",
-      maxTurns: config.maxTurns,
-      // Don't pick up the user's own CLAUDE.md / settings — the wizard's prompt
-      // is the single source of truth.
+      maxTurns,
       settingSources: [],
     },
   });
@@ -97,32 +179,28 @@ export async function runIntegrationAgent(opts: {
       }
     } else if (message.type === "result") {
       ok = message.subtype === "success";
-      costUsd = message.total_cost_usd;
+      maxedOut = (message.subtype ?? "").includes("max_turns");
+      costUsd = message.total_cost_usd ?? 0;
       summary = message.result ?? extractLastText(message) ?? summary;
     }
   }
 
-  progress?.onResult?.(summary, costUsd);
-  return { summary, costUsd, ok, durationMs: Date.now() - started };
+  return { summary, costUsd, ok, maxedOut };
 }
 
-/** Configure where the Agent SDK sends model calls. */
+/** Configure where the Agent SDK sends model calls (gateway or direct key). */
 function applyModelAuthEnv(config: WizardConfig, session: WizardSession): void {
   if (config.directAnthropicKey) {
     process.env.ANTHROPIC_API_KEY = config.directAnthropicKey;
-    // Make sure a stale gateway base from a prior run doesn't leak in.
     delete process.env.ANTHROPIC_AUTH_TOKEN;
     return;
   }
-  // Gateway mode: token is the wizard session token, base is our proxy.
   process.env.ANTHROPIC_BASE_URL = config.llmBaseUrl;
   process.env.ANTHROPIC_AUTH_TOKEN = session.token;
   delete process.env.ANTHROPIC_API_KEY;
 }
 
 // --- minimal structural typings over the Agent SDK message stream ---
-// We keep these local + permissive so a minor SDK shape change doesn't break the
-// build; we only read a handful of fields.
 interface AgentTextBlock {
   type: "text";
   text?: string;
