@@ -103,12 +103,22 @@ export function renderEventsBrief(m: IntegrationManifest): string {
       ` there. Skip an event entirely if it has no clear client-side trigger.`,
   );
 
+  if (events.some((e) => e.coverage?.length)) {
+    lines.push("");
+    lines.push(
+      "Some events are already instrumented elsewhere (noted inline). Skip any" +
+        " marked [already wired here]; for [wired on <surface>], only add it if" +
+        " this codebase ALSO genuinely triggers it.",
+    );
+  }
+
   for (const e of events) {
     lines.push("");
     const why = e.interventions?.length
       ? `  ·  drives: ${e.interventions.map((i) => i.label ?? i.code).join(", ")}`
       : "";
-    lines.push(`■ ${e.eventType}${e.label ? `  (${e.label})` : ""}${why}`);
+    const cov = coverageNote(e.coverage);
+    lines.push(`■ ${e.eventType}${e.label ? `  (${e.label})` : ""}${why}${cov}`);
     if (e.description) lines.push(`  ${e.description}`);
     if (e.properties?.length) {
       lines.push("  properties to capture if available:");
@@ -120,4 +130,18 @@ export function renderEventsBrief(m: IntegrationManifest): string {
     }
   }
   return lines.join("\n");
+}
+
+/** Inline coverage hint for an event, e.g. " [already wired here]". */
+function coverageNote(
+  coverage?: Array<{ target: string; status: string; sameSurface: boolean }>,
+): string {
+  if (!coverage?.length) return "";
+  const here = coverage.find((c) => c.sameSurface && c.status === "wired");
+  if (here) return "  [already wired here]";
+  const elsewhere = coverage.filter((c) => c.status === "wired");
+  if (elsewhere.length) {
+    return `  [wired on ${elsewhere.map((c) => c.target).join(", ")}]`;
+  }
+  return "";
 }

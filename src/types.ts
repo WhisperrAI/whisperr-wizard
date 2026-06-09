@@ -84,6 +84,13 @@ export interface ManifestEvent {
   interventions?: Array<{ code: string; label?: string; weight?: number }>;
   /** Relative importance 0..1 (max weight across its interventions). */
   importance?: number;
+  /** Where this event is already instrumented across the app's surfaces. */
+  coverage?: Array<{
+    target: string;
+    repoFingerprint?: string;
+    status: string;
+    sameSurface: boolean;
+  }>;
 }
 
 /** Guidance for the identify() call. */

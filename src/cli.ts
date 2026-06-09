@@ -7,8 +7,15 @@ import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
 import { authenticate } from "./core/auth.js";
 import { fetchManifest } from "./core/manifest.js";
 import { runIntegrationAgent } from "./core/agent.js";
-import { takeCheckpoint, changedFiles, revertHint } from "./core/git.js";
+import {
+  takeCheckpoint,
+  changedFiles,
+  revertHint,
+  repoFingerprint,
+  scanWiredEvents,
+} from "./core/git.js";
 import { pollFirstEvent } from "./core/verify.js";
+import { postRunReport, type ReportEvent } from "./core/report.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
 import type { Detection, Playbook } from "./types.js";
@@ -78,9 +85,11 @@ export async function run(options: RunOptions): Promise<number> {
     return 1;
   }
 
-  // 3. Pull the integration manifest (events/interventions/key).
+  // 3. Pull the integration manifest (events/interventions/key), telling the
+  //    backend which surface this is so it can mark what's already covered.
+  const fingerprint = await repoFingerprint(repoPath);
   const manifest = await withSpinner("Loading your onboarding context", () =>
-    fetchManifest(config, session, chosen.playbook.target.id),
+    fetchManifest(config, session, chosen.playbook.target.id, fingerprint),
   );
   p.note(
     summarizeManifest(manifest),
@@ -156,9 +165,32 @@ export async function run(options: RunOptions): Promise<number> {
   if (outcome.summary.trim()) {
     p.log.message(outcome.summary.trim());
   }
+  // Derive which events actually got wired (from the diff) and record coverage
+  // so future runs — including on other surfaces — know what this one handled.
+  const wiredMap = await scanWiredEvents(
+    repoPath,
+    files,
+    manifest.events.map((e) => e.eventType),
+  );
+  const reportEvents: ReportEvent[] = manifest.events.map((e) => ({
+    event_type: e.eventType,
+    status: wiredMap.has(e.eventType) ? "wired" : "skipped",
+    file: wiredMap.get(e.eventType),
+  }));
+  await postRunReport(config, session, {
+    target: chosen.playbook.target.id,
+    repo_fingerprint: fingerprint,
+    identify_wired: outcome.coreOk,
+    cost_usd: outcome.costUsd,
+    duration_ms: outcome.durationMs,
+    summary: outcome.summary.slice(0, 4000),
+    events: reportEvents,
+  });
+
   p.log.info(
     theme.muted(
-      `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
+      `${wiredMap.size}/${manifest.events.length} events wired · ` +
+        `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
         `~$${outcome.costUsd.toFixed(2)} · ${Math.round(outcome.durationMs / 1000)}s`,
     ),
   );

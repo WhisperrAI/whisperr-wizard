@@ -22,11 +22,13 @@ export async function fetchManifest(
   config: WizardConfig,
   session: WizardSession,
   targetId?: string,
+  repoFingerprint?: string,
 ): Promise<IntegrationManifest> {
   if (config.offline) return mockManifest(session.appId, config);
 
   const url = new URL(`${config.apiBaseUrl}/wizard/manifest`);
   if (targetId) url.searchParams.set("target", targetId);
+  if (repoFingerprint) url.searchParams.set("repo", repoFingerprint);
 
   const res = await fetch(url, {
     headers: { authorization: `Bearer ${session.token}` },
