@@ -77,7 +77,7 @@ async function main(): Promise<void> {
   }
   if ("version" in parsed) {
     // eslint-disable-next-line no-console
-    console.log("0.1.3");
+    console.log("0.1.4");
     return;
   }
 
