@@ -57,9 +57,6 @@ export async function runIntegrationAgent(opts: {
 
   // ---- Phase 1: core (install + initialize + identify) ----
   progress?.onPhase?.("Installing the SDK & wiring identify()");
-  const verifyHint = playbook.verifyCommand
-    ? ` Finish with a single \`${playbook.verifyCommand}\` and fix only what it flags.`
-    : "";
   const corePrompt = [
     `Integrate the Whisperr ${playbook.target.displayName} SDK — CORE SETUP ONLY.`,
     `Project root: ${repoPath}`,
@@ -67,10 +64,16 @@ export async function runIntegrationAgent(opts: {
     "Do exactly these, then stop:",
     `1. Add the Whisperr SDK dependency and install it (${playbook.packageRef}).`,
     "2. Initialize it once at app startup with the key + base URL below.",
-    "3. Wire identify() where the end-user becomes known (login / signup /",
-    "   session restore), and reset() on logout.",
+    "3. Wire identify() at the PRIMARY place the user becomes authenticated",
+    "   (after a successful login) and on session restore at app startup; call",
+    "   reset() on logout. Do NOT enumerate every auth method — one primary",
+    "   login path plus session restore is enough. Keep channels minimal: pass",
+    "   email if it's readily at hand; phone/push are optional, skip them if not",
+    "   obvious. Do not go hunting through every auth file.",
     "",
-    "Do NOT instrument product events yet — that is a separate step." + verifyHint,
+    "This is a real app — be quick and decisive, aim to finish in ~15 steps.",
+    "Do NOT instrument product events yet — that is a separate step. Do not run",
+    "the analyzer or build; the human will review the diff.",
     "",
     "----- IDENTIFY -----",
     renderIdentifyBrief(manifest),
@@ -82,7 +85,7 @@ export async function runIntegrationAgent(opts: {
     systemPrompt,
     repoPath,
     model: config.model,
-    maxTurns: 20,
+    maxTurns: 35,
     progress,
   });
   costUsd += core.costUsd;

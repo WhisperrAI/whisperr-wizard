@@ -99,7 +99,20 @@ export async function run(options: RunOptions): Promise<number> {
   // 5. Run the coding agent.
   const spin = p.spinner();
   let phaseLabel = "Integrating";
-  spin.start(theme.bright(phaseLabel) + theme.muted(" — the agent is working in your code"));
+  let lastLine = "";
+  const startedAt = Date.now();
+  spin.start(theme.bright(phaseLabel));
+  // Drive the spinner off a ticking clock so it always reads as alive, even
+  // while the agent spends 30s+ inside one set of tool calls.
+  const tick = setInterval(() => {
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    spin.message(
+      theme.bright(phaseLabel) +
+        theme.muted(` · ${secs}s`) +
+        (lastLine ? theme.muted(` — ${lastLine}`) : ""),
+    );
+  }, 1000);
+
   const outcome = await runIntegrationAgent({
     repoPath,
     config,
@@ -109,19 +122,22 @@ export async function run(options: RunOptions): Promise<number> {
     progress: {
       onPhase(label) {
         phaseLabel = label;
-        spin.message(theme.bright(label));
+        lastLine = "";
       },
       onActivity(line) {
-        spin.message(theme.bright(phaseLabel) + theme.muted(` — ${line}`));
+        lastLine = line;
       },
     },
   }).catch((err) => {
-    spin.stop(theme.alert("Integration stopped"));
     p.log.error((err as Error).message);
     return null;
   });
 
-  if (!outcome) return 1;
+  clearInterval(tick);
+  if (!outcome) {
+    spin.stop(theme.alert("Integration stopped"));
+    return 1;
+  }
 
   // Honest stop label: the core landing is the bar; events may be partial.
   const stopLabel = !outcome.coreOk
