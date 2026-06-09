@@ -4,7 +4,7 @@ const target = {
   id: "nextjs",
   displayName: "Next.js",
   language: "typescript",
-  availability: "planned" as const,
+  availability: "available" as const,
 };
 
 async function detect(ctx: DetectContext): Promise<Detection | null> {
@@ -33,34 +33,37 @@ async function detect(ctx: DetectContext): Promise<Detection | null> {
 }
 
 const systemPrompt = `
-## SDK: Whisperr for Web in Next.js — package \`@whisperr/web\`
+## SDK: Whisperr for Next.js — package \`@whisperr/next\` (+ \`@whisperr/web\`)
 
-Same SDK as plain web, with Next-specific wiring.
+1) Install: \`<pm> add @whisperr/next @whisperr/web\`. Put the key in
+   NEXT_PUBLIC_WHISPERR_KEY in .env.local (and add it to .env.example).
 
-1) Install \`@whisperr/web\`. Put the key in NEXT_PUBLIC_WHISPERR_KEY in
-   .env.local (and add it to .env.example).
+2) Mount the provider in app/layout.tsx. It is already a 'use client' boundary,
+   so it drops straight into the server-component layout — no wrapper file needed:
+     import { WhisperrProvider } from '@whisperr/next';
+     // inside <body>:
+     <WhisperrProvider apiKey={process.env.NEXT_PUBLIC_WHISPERR_KEY!}>{children}</WhisperrProvider>
+   Pages Router: wrap the tree in pages/_app.tsx with <WhisperrProvider apiKey=...>.
 
-2) Whisperr runs client-side. Create a client provider:
-   - App Router: a 'use client' component (e.g. app/whisperr-provider.tsx) that
-     calls Whisperr.init(...) in a useEffect and renders children; mount it in
-     app/layout.tsx.
-   - Pages Router: init in pages/_app.tsx inside a useEffect.
+3) identify() after auth resolves on the client (in your session hook/effect);
+   reset() on sign-out. Use the useWhisperr() hook inside 'use client' components.
 
-3) identify() after auth resolves on the client (e.g. in your auth/session
-   hook). reset() on sign-out.
-
-4) track() in client components / event handlers / mutation callbacks. Do NOT
-   call track from server components, route handlers, or getServerSideProps —
-   this SDK is a browser client. Copy event_type verbatim from the manifest.
+4) track() in client components / event handlers / mutation callbacks:
+     'use client';
+     import { useWhisperr } from '@whisperr/next';
+     const whisperr = useWhisperr();
+     whisperr.track('event_type_from_manifest', { ... });
+   Do NOT call track from server components, route handlers, or getServerSideProps —
+   it is a browser client. Copy event_type verbatim (snake_case) from the manifest.
 
 Notes:
-- Guard against double-init under React Strict Mode (init is idempotent, but
-  wire it so it only runs once).
+- Pageviews are auto-captured via the History API (covers Next client navigation).
+- Provider init is idempotent (safe under React Strict Mode).
 `.trim();
 
 export const nextjsPlaybook: Playbook = {
   target,
   detect,
-  packageRef: "@whisperr/web (npm)",
+  packageRef: "@whisperr/next (npm)",
   systemPrompt,
 };

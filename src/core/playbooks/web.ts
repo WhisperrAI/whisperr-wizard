@@ -4,8 +4,7 @@ const target = {
   id: "web-js",
   displayName: "Web (JavaScript / TypeScript)",
   language: "typescript",
-  // Flip to "available" once @whisperr/web ships (Phase 2).
-  availability: "planned" as const,
+  availability: "available" as const,
 };
 
 /** True if package.json depends on any of `names`. */
@@ -44,41 +43,41 @@ async function detect(ctx: DetectContext): Promise<Detection | null> {
 }
 
 const systemPrompt = `
-## SDK: Whisperr for Web (TypeScript/JavaScript) — package \`@whisperr/web\`
+## SDK: Whisperr for Web — package \`@whisperr/web\` (+ \`@whisperr/react\` for React)
 
-1) Dependency. Install with the repo's package manager (detect pnpm/yarn/npm
-   from the lockfile): \`<pm> add @whisperr/web\`.
+1) Install (detect pnpm/yarn/npm from the lockfile):
+   - Vanilla / Vue / Svelte / Angular / plain TS: \`<pm> add @whisperr/web\`
+   - React (not Next.js): \`<pm> add @whisperr/react @whisperr/web\`
 
-2) Initialize once at app entry (e.g. src/main.tsx, src/index.ts, or the root
-   layout). Create a singleton client:
-     import { Whisperr } from '@whisperr/web';
-     export const whisperr = Whisperr.init({
-       apiKey: import.meta.env.VITE_WHISPERR_KEY, // or process.env.NEXT_PUBLIC_... etc
-       baseUrl: '<INGESTION_BASE_URL from manifest>',
-     });
-   Put the key in the project's env mechanism (Vite VITE_*, CRA REACT_APP_*,
-   plain .env) and write the example var into .env / .env.example.
+2) Initialize once at app entry, using the app's PUBLIC env var (VITE_*,
+   REACT_APP_*, etc.). Write the var into .env / .env.example.
+   - Core (any framework): create a singleton in e.g. src/whisperr.ts:
+       import { Whisperr } from '@whisperr/web';
+       export const whisperr = Whisperr.init({
+         apiKey: import.meta.env.VITE_WHISPERR_KEY,
+         baseUrl: '<INGESTION_BASE_URL from manifest>', // omit if it's the default
+       });
+   - React: wrap the app root instead of a bare singleton:
+       import { WhisperrProvider } from '@whisperr/react';
+       <WhisperrProvider apiKey={import.meta.env.VITE_WHISPERR_KEY}>…</WhisperrProvider>
 
 3) identify(). After auth resolves (login success, and on app load if a session
    is restored):
-     whisperr.identify(user.id, {
-       traits: { /* manifest traits */ },
-       email: user.email, phone: user.phone,
-     });
+       whisperr.identify(user.id, { traits: { /* manifest traits */ }, email: user.email, phone: user.phone });
+   React: const whisperr = useWhisperr();  then whisperr.identify(...).
    Call whisperr.reset() on logout.
 
 4) track(). For each manifest event, instrument the real handler:
-     whisperr.track('event_type_from_manifest', { /* properties */ });
-   In React, this belongs in event handlers / effects / mutation callbacks, not
+       whisperr.track('event_type_from_manifest', { /* properties */ });
+   In React this belongs in event handlers / effects / mutation callbacks, never
    in render. Copy event_type verbatim (snake_case) from the manifest.
 
 Notes:
-- The SDK batches via /v1/events/batch and flushes on a timer + on
-  visibilitychange/unload (sendBeacon). Fire-and-forget is fine.
-- Only the NEXT_PUBLIC_/VITE_-style public env vars are exposed to the browser;
-  the ingestion key is a public, rate-limited key so that is expected.
-- If the project uses an analytics wrapper/provider pattern, follow it rather
-  than scattering raw whisperr.track calls.
+- The SDK batches + flushes automatically (timer + on page hide). Fire-and-forget
+  is fine; do NOT await track().
+- It auto-captures pageviews — you only add the named business events.
+- Only PUBLIC env vars (VITE_/REACT_APP_/NEXT_PUBLIC_) reach the browser; the
+  ingestion key is meant to be public + rate-limited, so that's expected.
 `.trim();
 
 export const webPlaybook: Playbook = {
