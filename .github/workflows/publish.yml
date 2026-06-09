@@ -1,0 +1,36 @@
+name: Publish
+
+# Publishes @whisperr/wizard to npm when a version tag is pushed.
+#   git tag v0.1.0 && git push origin v0.1.0
+# Requires repo secret NPM_TOKEN (an npm automation token with publish rights
+# to the @whisperr scope).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      # publishConfig.access=public in package.json makes this publish publicly.
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
