@@ -36,7 +36,7 @@ async function detect(ctx: DetectContext): Promise<Detection | null> {
 }
 
 const systemPrompt = `
-## SDK: Whisperr for PHP (server-side) — package \`whisperr/whisperr-php\` (Laravel facade + service provider included)
+## SDK: Whisperr for PHP (server-side) — package \`whisperr/php\` (Laravel facade + service provider included)
 
 This is a BACKEND surface. Instrument events at the real SERVER-SIDE moment they
 happen — inside controllers/request handlers, webhook handlers, billing logic,
@@ -49,7 +49,7 @@ take the end-user id as the FIRST argument — the server has no session to infe
 it from. Source the real user id at each call site.
 
 1) Install:
-     composer require whisperr/whisperr-php
+     composer require whisperr/php
 
 2) Config. Set the key in the environment (.env), never hardcoded:
      WHISPERR_API_KEY=<INGESTION_API_KEY from manifest>
@@ -91,7 +91,7 @@ Notes / gotchas:
 export const phpPlaybook: Playbook = {
   target,
   detect,
-  packageRef: "whisperr/whisperr-php (Packagist)",
+  packageRef: "whisperr/php (Packagist)",
   systemPrompt,
   verifyCommand: undefined,
 };
