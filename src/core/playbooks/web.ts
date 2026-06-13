@@ -31,6 +31,24 @@ async function detect(ctx: DetectContext): Promise<Detection | null> {
   if (dependsOn(pkgJson, ["next"])) return null;
   if (dependsOn(pkgJson, ["react-native", "expo"])) return null;
 
+  // Defer to the backend (node) playbook for a server framework with no UI —
+  // the server SDK belongs there, not a browser bundle.
+  const hasUi =
+    dependsOn(pkgJson, ["react", "vue", "svelte", "@angular/core"]) ||
+    (await ctx.exists("index.html"));
+  const isBackend = dependsOn(pkgJson, [
+    "express",
+    "fastify",
+    "koa",
+    "@nestjs/core",
+    "hapi",
+    "@hapi/hapi",
+    "restify",
+    "h3",
+    "@adonisjs/core",
+  ]);
+  if (isBackend && !hasUi) return null;
+
   if (dependsOn(pkgJson, ["react", "vue", "svelte", "@angular/core"])) {
     evidence.push("frontend framework dependency");
     confidence += 0.4;

@@ -100,7 +100,7 @@ export function renderEventsBrief(m: IntegrationManifest): string {
     `${events.length} candidate events (highest-impact first). For each: fire` +
       ` track('<event_type>', { ...properties }) at the real moment it happens,` +
       ` and attach every listed property you can source from values in scope` +
-      ` there. Skip an event entirely if it has no clear client-side trigger.`,
+      ` there. Skip an event entirely if it has no clear trigger in this codebase.`,
   );
 
   if (events.some((e) => e.coverage?.length)) {

@@ -2,6 +2,8 @@ import type { Playbook } from "../../types.js";
 import { flutterPlaybook } from "./flutter.js";
 import { nextjsPlaybook } from "./nextjs.js";
 import { webPlaybook } from "./web.js";
+import { nodePlaybook } from "./node.js";
+import { pythonPlaybook } from "./python.js";
 import { reactNativePlaybook } from "./react-native.js";
 import { swiftPlaybook } from "./swift.js";
 
@@ -20,6 +22,8 @@ export const ALL_PLAYBOOKS: Playbook[] = [
   nextjsPlaybook,
   reactNativePlaybook,
   webPlaybook,
+  nodePlaybook,
+  pythonPlaybook,
   swiftPlaybook,
 ];
 
