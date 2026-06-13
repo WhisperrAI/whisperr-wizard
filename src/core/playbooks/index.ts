@@ -4,6 +4,7 @@ import { nextjsPlaybook } from "./nextjs.js";
 import { webPlaybook } from "./web.js";
 import { nodePlaybook } from "./node.js";
 import { pythonPlaybook } from "./python.js";
+import { phpPlaybook } from "./php.js";
 import { reactNativePlaybook } from "./react-native.js";
 import { swiftPlaybook } from "./swift.js";
 
@@ -24,6 +25,7 @@ export const ALL_PLAYBOOKS: Playbook[] = [
   webPlaybook,
   nodePlaybook,
   pythonPlaybook,
+  phpPlaybook,
   swiftPlaybook,
 ];
 
