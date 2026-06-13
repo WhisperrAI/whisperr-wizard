@@ -57,6 +57,33 @@ export function revertHint(checkpoint: GitCheckpoint): string | undefined {
   return `git restore . && git clean -fd   (back to ${checkpoint.baseRef.slice(0, 7)})`;
 }
 
+/** True if the repo has no uncommitted/untracked changes. */
+export async function isWorkingTreeClean(repoPath: string): Promise<boolean> {
+  const status = await run(repoPath, ["status", "--porcelain"]);
+  return status.ok && status.stdout.trim() === "";
+}
+
+/**
+ * Undo everything the wizard did, back to the checkpoint. Because the wizard
+ * requires a clean tree before running, `reset --hard <baseRef>` + `clean -fd`
+ * restores the exact pre-wizard state.
+ */
+export async function revertToCheckpoint(
+  repoPath: string,
+  checkpoint: GitCheckpoint,
+): Promise<boolean> {
+  if (!checkpoint.isRepo) return false;
+  if (checkpoint.baseRef) {
+    const reset = await run(repoPath, ["reset", "--hard", checkpoint.baseRef]);
+    const clean = await run(repoPath, ["clean", "-fd"]);
+    return reset.ok && clean.ok;
+  }
+  // Repo with no commits yet: just drop tracked edits + untracked files.
+  const restore = await run(repoPath, ["restore", "."]);
+  const clean = await run(repoPath, ["clean", "-fd"]);
+  return restore.ok && clean.ok;
+}
+
 /**
  * A stable fingerprint for this repo, so the coverage ledger can tell apart
  * multiple codebases that belong to one Whisperr app (e.g. a Flutter app and a

@@ -11,8 +11,11 @@ import {
   takeCheckpoint,
   changedFiles,
   revertHint,
+  revertToCheckpoint,
+  isWorkingTreeClean,
   repoFingerprint,
   scanWiredEvents,
+  type GitCheckpoint,
 } from "./core/git.js";
 import { pollFirstEvent } from "./core/verify.js";
 import { postRunReport, type ReportEvent } from "./core/report.js";
@@ -96,12 +99,35 @@ export async function run(options: RunOptions): Promise<number> {
     theme.signal(`Plan for ${manifest.appName ?? manifest.appId}`),
   );
 
-  // 4. Git checkpoint so auto-applied edits are reversible.
+  // 4. Git safety. The agent auto-applies edits, so we require a clean repo:
+  //    that isolates the wizard's changes and makes a one-command revert
+  //    reliable. --force opts out of the safety net.
   const checkpoint = await takeCheckpoint(repoPath);
   if (!checkpoint.isRepo) {
+    if (!options.force) {
+      p.cancel(
+        theme.alert("Not a git repository.") +
+          " The wizard edits your code and relies on git to undo safely.\n" +
+          theme.muted("Run `git init` and commit first, or re-run with --force to proceed without a safety net."),
+      );
+      return 1;
+    }
     p.log.warn(
       theme.warn("not a git repo") +
-        theme.muted(" — edits will apply with no automatic undo."),
+        theme.muted(" — proceeding with --force; there is no automatic undo."),
+    );
+  } else if (!(await isWorkingTreeClean(repoPath))) {
+    if (!options.force) {
+      p.cancel(
+        theme.alert("Your working tree has uncommitted changes.") +
+          " Commit or stash them first so the wizard's edits stay isolated and reversible.\n" +
+          theme.muted("Or re-run with --force to proceed anyway."),
+      );
+      return 1;
+    }
+    p.log.warn(
+      theme.warn("uncommitted changes present") +
+        theme.muted(" — proceeding with --force; a revert would also drop your own changes."),
     );
   }
 
@@ -145,6 +171,7 @@ export async function run(options: RunOptions): Promise<number> {
   clearInterval(tick);
   if (!outcome) {
     spin.stop(theme.alert("Integration stopped"));
+    await maybeRevert(repoPath, checkpoint, "The run stopped before finishing.");
     return 1;
   }
 
@@ -165,6 +192,21 @@ export async function run(options: RunOptions): Promise<number> {
   if (outcome.summary.trim()) {
     p.log.message(outcome.summary.trim());
   }
+
+  // If the core (install + identify) didn't land, the integration isn't
+  // trustworthy — offer to undo rather than leaving broken/partial edits.
+  if (!outcome.coreOk) {
+    const reverted = await maybeRevert(
+      repoPath,
+      checkpoint,
+      "The core setup didn't complete, so these changes may be incomplete.",
+    );
+    if (reverted) {
+      p.outro(theme.muted("Reverted — nothing was left in your working tree."));
+      return 1;
+    }
+  }
+
   // Derive which events actually got wired (from the diff) and record coverage
   // so future runs — including on other surfaces — know what this one handled.
   const wiredMap = await scanWiredEvents(
@@ -236,6 +278,41 @@ export async function run(options: RunOptions): Promise<number> {
 }
 
 // --- helpers ---
+
+/**
+ * Offer to undo the wizard's changes when a run didn't finish cleanly. Returns
+ * true if the working tree was reverted. No-op when there's nothing to revert.
+ */
+async function maybeRevert(
+  repoPath: string,
+  checkpoint: GitCheckpoint,
+  reason: string,
+): Promise<boolean> {
+  if (!checkpoint.isRepo) return false;
+  const files = await changedFiles(repoPath, checkpoint);
+  if (files.length === 0) return false;
+
+  const doRevert = await p.confirm({
+    message: `${reason} Revert all of the wizard's changes now?`,
+    initialValue: true,
+  });
+  if (p.isCancel(doRevert) || !doRevert) {
+    const hint = revertHint(checkpoint);
+    if (hint) p.log.info(theme.muted(`Left in your working tree. Undo anytime: ${hint}`));
+    return false;
+  }
+
+  const ok = await revertToCheckpoint(repoPath, checkpoint);
+  if (ok) {
+    p.log.success(theme.success("Reverted to your pre-wizard state."));
+  } else {
+    p.log.warn(
+      theme.warn("Couldn't revert automatically — undo manually: ") +
+        (revertHint(checkpoint) ?? "git reset --hard"),
+    );
+  }
+  return ok;
+}
 
 interface Chosen {
   playbook: Playbook;

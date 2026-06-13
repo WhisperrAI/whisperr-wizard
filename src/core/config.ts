@@ -25,6 +25,8 @@ export interface CliFlags {
   offline?: boolean;
   apiBaseUrl?: string;
   model?: string;
+  /** Proceed even without a clean git working tree (no safe auto-undo). */
+  force?: boolean;
 }
 
 export function resolveConfig(flags: CliFlags = {}): WizardConfig {

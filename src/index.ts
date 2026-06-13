@@ -29,6 +29,9 @@ function parseArgs(argv: string[]): RunOptions | { help: true } | { version: tru
       case "--offline":
         opts.offline = true;
         break;
+      case "--force":
+        opts.force = true;
+        break;
       case "--api":
         opts.apiBaseUrl = args[++i];
         break;
@@ -56,6 +59,7 @@ function printHelp(): void {
       "",
       `  ${theme.bright("Options")}`,
       "    --offline         Use a demo manifest, no account/browser needed",
+      "    --force           Proceed without a clean git tree (no safe undo)",
       "    --api <url>       Override the Whisperr API base URL",
       "    --model <id>      Override the coding-agent model",
       "    -h, --help        Show this help",
