@@ -233,7 +233,7 @@ export async function run(options: RunOptions): Promise<number> {
     theme.muted(
       `${wiredMap.size}/${manifest.events.length} events wired · ` +
         `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
-        `~$${outcome.costUsd.toFixed(2)} · ${Math.round(outcome.durationMs / 1000)}s`,
+        `${Math.round(outcome.durationMs / 1000)}s`,
     ),
   );
 

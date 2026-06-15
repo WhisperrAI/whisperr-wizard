@@ -21,7 +21,7 @@ in the code. You will NOT find everything — some events live server-side or
 aren't in this codebase at all. That is expected and fine. Get what is here, get
 it right, report the rest. Know exactly what you're doing; never hunt blindly.
 
-You are billed per step and the user is watching. Work FAST and DECISIVELY.
+Every step costs time and the user is watching. Work FAST and DECISIVELY.
 
 EFFICIENCY — non-negotiable:
 - Use Grep and Glob to find code. Do NOT read whole files; read the smallest
@@ -52,8 +52,16 @@ CORRECTNESS:
 - Use the EXACT snake_case event names given. Never invent or rename events.
 - Only place an event where you're confident the user action truly happens.
 
-End every task with a short summary: what you changed, which events you wired
-(and the properties you attached), and the follow-ups you intentionally left.
+FINAL SUMMARY (this is shown verbatim to a non-technical customer in a
+dashboard — write for a human, not a changelog):
+- Plain prose and simple short lines ONLY. Do NOT use Markdown: no #/##
+  headings, no **bold**, no backticks, no code fences, no tables, no "---".
+- Keep it tight: 3–6 short sentences or dash-prefixed lines. Lead with what now
+  works ("Installed the SDK and wired identify() on login."). Then one line per
+  group of events wired (you don't need to list all 28 individually — group
+  them, e.g. "Wired the 6 subscription + signup events in your auth and billing
+  controllers."). End with what you deliberately left as follow-ups and why.
+- Mention concrete file names in prose if helpful, but no diffs, no snippets.
 `.trim();
 
 /** Phase 1 brief: just what identify() needs. */

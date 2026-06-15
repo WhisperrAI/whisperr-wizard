@@ -110,8 +110,14 @@ function normalizeRemote(url: string): string {
 
 /**
  * Determine which manifest events the agent actually wired, by scanning the
- * changed files for `track('<event_type>')` calls. Deterministic and
+ * changed files for `track(... '<event_type>' ...)` calls. Deterministic and
  * agent-cooperation-free — we read the result from the code, not a self-report.
+ *
+ * The event type can be the FIRST argument (browser/Flutter SDKs:
+ * `track('event', {...})`) or a LATER one (server SDKs take the user id first:
+ * `track(userId, 'event', {...})`), so we match the quoted event type anywhere
+ * inside the `track(` argument list — across a short, possibly multi-line span —
+ * rather than only immediately after the opening paren.
  */
 export async function scanWiredEvents(
   repoPath: string,
@@ -121,7 +127,9 @@ export async function scanWiredEvents(
   const wired = new Map<string, string>();
   const patterns = eventTypes.map((e) => ({
     eventType: e,
-    re: new RegExp(`track\\s*\\(\\s*['"\`]${escapeRegExp(e)}['"\`]`),
+    re: new RegExp(
+      `\\btrack\\s*\\(\\s*[\\s\\S]{0,160}?['"\`]${escapeRegExp(e)}['"\`]`,
+    ),
   }));
 
   for (const file of files) {
