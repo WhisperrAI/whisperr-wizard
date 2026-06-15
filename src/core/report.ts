@@ -11,6 +11,12 @@ export interface RunReport {
   target: string;
   repo_fingerprint: string;
   identify_wired: boolean;
+  /**
+   * Whether the playbook's verify command (build/lint) passed after the agent
+   * ran. `null` when the playbook has no verify command or it couldn't be run
+   * (tool missing / timed out) — i.e. "unknown", distinct from a real failure.
+   */
+  verified?: boolean | null;
   cost_usd: number;
   duration_ms: number;
   summary: string;

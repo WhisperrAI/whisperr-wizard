@@ -34,7 +34,7 @@ const systemPrompt = `
 This SDK is published on pub.dev. Integrate it as follows.
 
 1) Dependency. Add to pubspec.yaml under dependencies:
-     whisperr: ^0.2.0
+     whisperr: ^0.2.2
    Then the SDK expects \`flutter pub get\` to be run (run it via bash).
 
 2) Initialize once, early, before runApp(), in lib/main.dart:

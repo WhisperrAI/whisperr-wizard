@@ -18,6 +18,7 @@ import {
   type GitCheckpoint,
 } from "./core/git.js";
 import { pollFirstEvent } from "./core/verify.js";
+import { runVerifyCommand } from "./core/postflight.js";
 import { postRunReport, type ReportEvent } from "./core/report.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
@@ -207,6 +208,48 @@ export async function run(options: RunOptions): Promise<number> {
     }
   }
 
+  // 6b. Deterministic guardrail: run the playbook's verify command OURSELVES so
+  //     "the agent finished" is backed by "the project still compiles/lints".
+  //     The agent is told not to build or run the analyzer — we own that check
+  //     rather than trusting its self-report.
+  // null = not run / couldn't conclude; true = passed; false = failed.
+  let verified: boolean | null = null;
+  if (chosen.playbook.verifyCommand && files.length) {
+    const cmd = chosen.playbook.verifyCommand;
+    const vspin = p.spinner();
+    vspin.start(`Verifying the integration — ${theme.muted(cmd)}`);
+    const verdict = await runVerifyCommand(repoPath, cmd);
+    if (verdict.toolMissing) {
+      vspin.stop(
+        theme.warn("Couldn't verify automatically") +
+          theme.muted(` — \`${cmd}\` isn't available here. Run it yourself before committing.`),
+      );
+    } else if (verdict.timedOut) {
+      vspin.stop(
+        theme.warn(`Verification timed out — \`${cmd}\``) +
+          theme.muted(" — run it yourself before committing."),
+      );
+    } else if (verdict.ok) {
+      verified = true;
+      vspin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
+    } else {
+      verified = false;
+      vspin.stop(theme.alert(`Verification failed — ${cmd}`));
+      if (verdict.output) {
+        p.note(verdict.output, theme.warn("Verifier output"));
+      }
+      const reverted = await maybeRevert(
+        repoPath,
+        checkpoint,
+        "The integration didn't pass its build/lint check, so the edits may be broken.",
+      );
+      if (reverted) {
+        p.outro(theme.muted("Reverted — nothing was left in your working tree."));
+        return 1;
+      }
+    }
+  }
+
   // Derive which events actually got wired (from the diff) and record coverage
   // so future runs — including on other surfaces — know what this one handled.
   const wiredMap = await scanWiredEvents(
@@ -223,6 +266,7 @@ export async function run(options: RunOptions): Promise<number> {
     target: chosen.playbook.target.id,
     repo_fingerprint: fingerprint,
     identify_wired: outcome.coreOk,
+    verified,
     cost_usd: outcome.costUsd,
     duration_ms: outcome.durationMs,
     summary: outcome.summary.slice(0, 4000),
@@ -233,6 +277,7 @@ export async function run(options: RunOptions): Promise<number> {
     theme.muted(
       `${wiredMap.size}/${manifest.events.length} events wired · ` +
         `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
+        (verified === true ? "verified · " : verified === false ? "unverified · " : "") +
         `${Math.round(outcome.durationMs / 1000)}s`,
     ),
   );
