@@ -20,6 +20,20 @@ const DEFAULT_API_BASE = "https://api.whisperr.net";
 // kind of work. Override with WHISPERR_WIZARD_MODEL=claude-opus-4-8 for the
 // hardest repos.
 const DEFAULT_MODEL = "claude-sonnet-4-6";
+// Reasoning effort (pairs with adaptive thinking). "medium" is the documented
+// sweet spot for agentic, tool-heavy coding on Sonnet 4.6 — enough thinking to
+// place events at the right call sites without the latency/spend of "high".
+// Override with WHISPERR_WIZARD_EFFORT=high for the hardest repos.
+const DEFAULT_EFFORT = "medium";
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+type Effort = (typeof EFFORT_LEVELS)[number];
+
+function resolveEffort(): Effort {
+  const raw = (process.env.WHISPERR_WIZARD_EFFORT ?? "").toLowerCase();
+  return (EFFORT_LEVELS as readonly string[]).includes(raw)
+    ? (raw as Effort)
+    : DEFAULT_EFFORT;
+}
 
 export interface CliFlags {
   offline?: boolean;
@@ -54,6 +68,7 @@ export function resolveConfig(flags: CliFlags = {}): WizardConfig {
     apiBaseUrl,
     llmBaseUrl,
     model: flags.model ?? process.env.WHISPERR_WIZARD_MODEL ?? DEFAULT_MODEL,
+    effort: resolveEffort(),
     maxTurns: Number(process.env.WHISPERR_WIZARD_MAX_TURNS ?? 55),
     directAnthropicKey,
     offline,

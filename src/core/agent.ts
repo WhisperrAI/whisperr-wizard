@@ -85,6 +85,7 @@ export async function runIntegrationAgent(opts: {
     systemPrompt,
     repoPath,
     model: config.model,
+    effort: config.effort,
     maxTurns: 35,
     progress,
   });
@@ -116,6 +117,7 @@ export async function runIntegrationAgent(opts: {
       systemPrompt,
       repoPath,
       model: config.model,
+      effort: config.effort,
       maxTurns: config.maxTurns,
       progress,
     });
@@ -146,10 +148,12 @@ async function runPass(opts: {
   systemPrompt: string;
   repoPath: string;
   model: string;
+  effort: WizardConfig["effort"];
   maxTurns: number;
   progress?: AgentProgress;
 }): Promise<PassResult> {
-  const { prompt, systemPrompt, repoPath, model, maxTurns, progress } = opts;
+  const { prompt, systemPrompt, repoPath, model, effort, maxTurns, progress } =
+    opts;
 
   let summary = "";
   let costUsd = 0;
@@ -162,6 +166,11 @@ async function runPass(opts: {
       model,
       cwd: repoPath,
       systemPrompt,
+      // Adaptive thinking (Claude decides depth per step) + an explicit effort
+      // level. Sonnet 4.6 supports both; we set them rather than rely on SDK
+      // defaults so the behavior is pinned regardless of SDK version.
+      thinking: { type: "adaptive" },
+      effort,
       allowedTools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
       permissionMode: "bypassPermissions",
       maxTurns,

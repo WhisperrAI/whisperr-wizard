@@ -138,6 +138,12 @@ export interface WizardConfig {
   llmBaseUrl: string;
   /** Model id for the coding agent. */
   model: string;
+  /**
+   * Reasoning effort for the coding agent (pairs with adaptive thinking).
+   * Default "medium" — the sweet spot for agentic, tool-heavy SDK wiring on
+   * Sonnet 4.6. Bump to "high" for the hardest repos.
+   */
+  effort: "low" | "medium" | "high" | "xhigh" | "max";
   /** Max agent turns before we stop. */
   maxTurns: number;
   /**
