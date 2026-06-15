@@ -15,16 +15,17 @@ import type { WizardConfig } from "../types.js";
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
-// Coding-agent default. Sonnet is the right tool for mechanical SDK wiring:
-// fast, and ~5x cheaper output than Opus, which over-thinks/over-narrates this
-// kind of work. Override with WHISPERR_WIZARD_MODEL=claude-opus-4-8 for the
-// hardest repos.
-const DEFAULT_MODEL = "claude-sonnet-4-6";
-// Reasoning effort (pairs with adaptive thinking). "medium" is the documented
-// sweet spot for agentic, tool-heavy coding on Sonnet 4.6 — enough thinking to
-// place events at the right call sites without the latency/spend of "high".
-// Override with WHISPERR_WIZARD_EFFORT=high for the hardest repos.
-const DEFAULT_EFFORT = "medium";
+// Coding-agent default. Opus 4.8 — this work lives or dies on JUDGMENT: picking
+// the END-USER auth path over an admin/staff one, finding the real server-side
+// moment, sourcing the right properties. A mis-placed event corrupts the
+// customer's churn data, so we pay for the most capable model. Override with
+// WHISPERR_WIZARD_MODEL=claude-sonnet-4-6 for a cheaper, lighter run.
+const DEFAULT_MODEL = "claude-opus-4-8";
+// Reasoning effort (pairs with adaptive thinking). "low" keeps Opus fast/cheap
+// while still far stronger than Sonnet on placement judgment. If placements
+// still miss on a hard repo, raising effort is the most direct lever:
+// WHISPERR_WIZARD_EFFORT=medium (or high).
+const DEFAULT_EFFORT = "low";
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = (typeof EFFORT_LEVELS)[number];
 
