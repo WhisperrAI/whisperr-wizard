@@ -70,7 +70,13 @@ export function resolveConfig(flags: CliFlags = {}): WizardConfig {
     llmBaseUrl,
     model: flags.model ?? process.env.WHISPERR_WIZARD_MODEL ?? DEFAULT_MODEL,
     effort: resolveEffort(),
-    maxTurns: Number(process.env.WHISPERR_WIZARD_MAX_TURNS ?? 55),
+    // Cost is the real limiter (budgetUsd below). maxTurns is only a high safety
+    // backstop against a stuck loop — it should NOT bind on a normal run. (It
+    // used to be 55, which guillotined high-effort multi-phase runs mid-work.)
+    maxTurns: Number(process.env.WHISPERR_WIZARD_MAX_TURNS) || 200,
+    // Hard ceiling on TOTAL spend across all phases. If hit, the run stops
+    // cleanly and keeps whatever already landed. Real runs finish well under it.
+    budgetUsd: Number(process.env.WHISPERR_WIZARD_BUDGET_USD) || 10,
     directAnthropicKey,
     offline,
   };

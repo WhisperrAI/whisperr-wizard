@@ -92,15 +92,25 @@ export async function runIntegrationAgent(opts: {
     repoPath,
     model: config.model,
     effort: config.effort,
-    maxTurns: 35,
+    maxTurns: 50,
+    budgetUsd: config.budgetUsd - costUsd,
     progress,
   });
   costUsd += core.costUsd;
   if (core.summary) summaries.push(`Core setup:\n${core.summary}`);
 
   // ---- Phase 2: events (bounded, skip-fast) ----
+  // A small floor below which a pass can't do useful work — skip rather than
+  // start a query that immediately trips the budget.
+  const BUDGET_FLOOR = 0.25;
   let eventsComplete = true;
-  if (manifest.events.length > 0) {
+  if (manifest.events.length > 0 && config.budgetUsd - costUsd <= BUDGET_FLOOR) {
+    eventsComplete = false;
+    summaries.push(
+      "Events: skipped — the spend limit was reached during core setup. " +
+        "Re-run with a higher WHISPERR_WIZARD_BUDGET_USD to instrument events.",
+    );
+  } else if (manifest.events.length > 0) {
     progress?.onPhase?.("Instrumenting your events");
     const eventsPrompt = [
       `The Whisperr ${playbook.target.displayName} SDK is already installed and`,
@@ -127,6 +137,7 @@ export async function runIntegrationAgent(opts: {
       model: config.model,
       effort: config.effort,
       maxTurns: config.maxTurns,
+      budgetUsd: config.budgetUsd - costUsd,
       progress,
     });
     costUsd += events.costUsd;
@@ -138,7 +149,7 @@ export async function runIntegrationAgent(opts: {
   // Placement is where this fails, and the agent can catch its own mistakes
   // with fresh eyes on `git diff` far cheaper than a human can. Runs whenever
   // the core landed (so identify() is reviewed even with no events).
-  if (core.ok) {
+  if (core.ok && config.budgetUsd - costUsd > BUDGET_FLOOR) {
     progress?.onPhase?.("Reviewing & correcting placements");
     const reviewPrompt = [
       `You wired the Whisperr ${playbook.target.displayName} SDK into this repo.`,
@@ -170,7 +181,8 @@ export async function runIntegrationAgent(opts: {
       repoPath,
       model: config.model,
       effort: config.effort,
-      maxTurns: 25,
+      maxTurns: 40,
+      budgetUsd: config.budgetUsd - costUsd,
       progress,
     });
     costUsd += review.costUsd;
@@ -190,8 +202,14 @@ interface PassResult {
   summary: string;
   costUsd: number;
   ok: boolean;
-  /** Hit the step limit (ran out of turns) rather than finishing. */
+  /** Stopped early on a limit (turns or budget) rather than finishing cleanly. */
   maxedOut: boolean;
+}
+
+/** A thrown error that's really just a turn/budget stop, not a genuine failure. */
+function isLimitStop(err: unknown): boolean {
+  const msg = (err as Error)?.message ?? "";
+  return /max(imum)?[\s_-]*(turn|budget)|budget.*exceeded|number of turns/i.test(msg);
 }
 
 async function runPass(opts: {
@@ -201,9 +219,11 @@ async function runPass(opts: {
   model: string;
   effort: WizardConfig["effort"];
   maxTurns: number;
+  /** USD ceiling for THIS pass (remaining budget). Omit/<=0 for no cap. */
+  budgetUsd?: number;
   progress?: AgentProgress;
 }): Promise<PassResult> {
-  const { prompt, systemPrompt, repoPath, model, effort, maxTurns, progress } =
+  const { prompt, systemPrompt, repoPath, model, effort, maxTurns, budgetUsd, progress } =
     opts;
 
   let summary = "";
@@ -225,10 +245,15 @@ async function runPass(opts: {
       allowedTools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
       permissionMode: "bypassPermissions",
       maxTurns,
+      // Native SDK hard cost cap. Stops this pass with an `error_max_budget_usd`
+      // result once spend exceeds the remaining budget — this, not maxTurns, is
+      // the real limiter. Omitted when there's no positive budget left.
+      ...(budgetUsd && budgetUsd > 0 ? { maxBudgetUsd: budgetUsd } : {}),
       settingSources: [],
     },
   });
 
+  try {
   for await (const message of response as AsyncIterable<AgentMessage>) {
     if (message.type === "assistant") {
       for (const block of message.message?.content ?? []) {
@@ -240,9 +265,22 @@ async function runPass(opts: {
       }
     } else if (message.type === "result") {
       ok = message.subtype === "success";
-      maxedOut = (message.subtype ?? "").includes("max_turns");
+      // Either limit (turns or the USD budget cap) is a graceful early stop, not
+      // a failure: keep whatever landed and let the caller report partial.
+      const sub = message.subtype ?? "";
+      maxedOut = sub.includes("max_turns") || sub.includes("max_budget");
       costUsd = message.total_cost_usd ?? 0;
       summary = message.result ?? extractLastText(message) ?? summary;
+    }
+  }
+  } catch (err) {
+    // A turn/budget stop that surfaces as a throw must NOT bubble up and abort
+    // the whole integration (which would revert good work) — treat it as a
+    // graceful early stop. Genuine errors still propagate.
+    if (isLimitStop(err)) {
+      maxedOut = true;
+    } else {
+      throw err;
     }
   }
 

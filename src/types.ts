@@ -144,8 +144,10 @@ export interface WizardConfig {
    * Sonnet 4.6. Bump to "high" for the hardest repos.
    */
   effort: "low" | "medium" | "high" | "xhigh" | "max";
-  /** Max agent turns before we stop. */
+  /** Max agent turns per pass — a high safety backstop, NOT the real limiter. */
   maxTurns: number;
+  /** Hard ceiling on total USD spend across all phases (the real limiter). */
+  budgetUsd: number;
   /**
    * Local-dev escape hatch: if set, the agent talks to Anthropic directly with
    * this key instead of going through the gateway. Mirrors production exactly
