@@ -134,6 +134,49 @@ export async function runIntegrationAgent(opts: {
     if (events.summary) summaries.push(`Events:\n${events.summary}`);
   }
 
+  // ---- Phase 3: self-review (audit own placements against the diff, fix) ----
+  // Placement is where this fails, and the agent can catch its own mistakes
+  // with fresh eyes on `git diff` far cheaper than a human can. Runs whenever
+  // the core landed (so identify() is reviewed even with no events).
+  if (core.ok) {
+    progress?.onPhase?.("Reviewing & correcting placements");
+    const reviewPrompt = [
+      `You wired the Whisperr ${playbook.target.displayName} SDK into this repo.`,
+      "Now AUDIT YOUR OWN WORK and fix mistakes before finishing.",
+      `Project root: ${repoPath}`,
+      "",
+      "Run `git diff` and read the surrounding code to see exactly what you added.",
+      "For every identify() and track() call, verify — and FIX in place:",
+      "1. Subject — keys to the END USER, never an admin/staff/operator/seller.",
+      "   identify() sits on the SAME surface as account_created (same person).",
+      "2. Lifecycle — the event fires ONLY on its real moment. A 'first time'",
+      "   event (e.g. subscription_started) must NOT fire on a renewal/recurring",
+      "   path; look for RENEW_CARD / is_recurring / type branches in the SAME",
+      "   handler. If one path handles both cases, branch and emit the right",
+      "   event per case.",
+      "3. Discriminators — billing/subscription events carry the properties that",
+      "   tell cases apart when the code exposes them (charge_type / is_recurring",
+      "   / payment_source / amount / plan). Add the ones you missed.",
+      "4. Coverage — every gateway/callback path that should emit an event does;",
+      "   no recurring or secondary path left as a dead zone.",
+      "Change ONLY what is genuinely wrong or incomplete — do not churn correct",
+      "calls or re-explore the whole repo. Be surgical. End with a one-line,",
+      "plain-text note of what you corrected, or 'No corrections needed.'.",
+    ].join("\n");
+
+    const review = await runPass({
+      prompt: reviewPrompt,
+      systemPrompt,
+      repoPath,
+      model: config.model,
+      effort: config.effort,
+      maxTurns: 25,
+      progress,
+    });
+    costUsd += review.costUsd;
+    if (review.summary) summaries.push(`Review:\n${review.summary}`);
+  }
+
   return {
     summary: summaries.join("\n\n"),
     costUsd,

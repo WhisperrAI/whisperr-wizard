@@ -15,17 +15,17 @@ import type { WizardConfig } from "../types.js";
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
-// Coding-agent default. Opus 4.8 — this work lives or dies on JUDGMENT: picking
-// the END-USER auth path over an admin/staff one, finding the real server-side
-// moment, sourcing the right properties. A mis-placed event corrupts the
-// customer's churn data, so we pay for the most capable model. Override with
-// WHISPERR_WIZARD_MODEL=claude-sonnet-4-6 for a cheaper, lighter run.
-const DEFAULT_MODEL = "claude-opus-4-8";
-// Reasoning effort (pairs with adaptive thinking). "low" keeps Opus fast/cheap
-// while still far stronger than Sonnet on placement judgment. If placements
-// still miss on a hard repo, raising effort is the most direct lever:
-// WHISPERR_WIZARD_EFFORT=medium (or high).
-const DEFAULT_EFFORT = "low";
+// Coding-agent default. Sonnet 4.6 at HIGH effort. The failure mode here isn't a
+// capability ceiling — it's skimming: not reading a callback's control flow to
+// see the initial-vs-renewal branch, not sourcing the discriminator properties
+// the code already exposes. That's fixed by THINKING DEPTH (effort), not model
+// tier, and Sonnet-high reads control flow well at ~0.6x Opus's token price.
+// Override with WHISPERR_WIZARD_MODEL=claude-opus-4-8 for the hardest repos.
+const DEFAULT_MODEL = "claude-sonnet-4-6";
+// Reasoning effort (pairs with adaptive thinking). "high" — placement is a
+// reasoning task (which moment, which branch, which properties), so we give it
+// room to think. Drop to medium/low via WHISPERR_WIZARD_EFFORT for cheap runs.
+const DEFAULT_EFFORT = "high";
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = (typeof EFFORT_LEVELS)[number];
 

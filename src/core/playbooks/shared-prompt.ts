@@ -48,6 +48,31 @@ describe the SAME person, so they belong on the SAME surface. If you wired
 account_created into one controller and are about to put identify() in a
 different one, stop — that's the tell you've split the subject. Co-locate them.
 
+WHAT THE EVENT MEANS — place by SEMANTICS, not by keyword. This is where most
+mistakes happen. An event names a SPECIFIC moment, not "something happened
+nearby." For each event, before you place it:
+- Model the exact transition. \`subscription_started\` is the FIRST subscription,
+  NOT every payment — renewals, retries, and reactivations are DIFFERENT events.
+  Firing one event on a path that also handles the other cases is a real bug.
+- Read the control flow and find the branch that separates look-alike cases.
+  Payment/callback handlers routinely route initial vs recurring/renewal, success
+  vs retry, trial vs paid through ONE function. Key the event to the right branch
+  (e.g. a \`RENEW_CARD\` / \`is_recurring\` / \`type\` check), or branch yourself and
+  emit the correct event per case. Do not drop one event on the shared success
+  line and move on — open the function and see which cases it actually covers.
+- Read the codebase's own flags literally. A field like \`type: promo|standard\`
+  is pricing tier, not lifecycle — confirm what a flag means before keying on it.
+- Capture the discriminators as properties. The fields that tell cases apart —
+  charge_type, is_recurring, payment_source/gateway, amount, plan, currency — are
+  exactly what makes the event usable for churn (a failed RENEWAL is a churn
+  signal; a failed first charge is not). If the code sets such a field right
+  there (e.g. \`type => 'initial'\`), pass it. A billing event without them is
+  half-blind.
+- Cover the whole lifecycle. Two gateways each with an initial and a recurring
+  path is FOUR call sites — instrument all of them. A recurring/secondary
+  callback with no events is a churn blind spot. If you deliberately skip a path,
+  say so in the summary.
+
 Every step costs time and the user is watching. Work FAST and DECISIVELY.
 
 EFFICIENCY — non-negotiable:
