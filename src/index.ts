@@ -1,3 +1,6 @@
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { run, type RunOptions } from "./cli.js";
 import { theme } from "./ui/theme.js";
 
@@ -10,7 +13,15 @@ import { theme } from "./ui/theme.js";
  * `init` is accepted as an optional verb for readability; the wizard runs the
  * same flow with or without it.
  */
-function parseArgs(argv: string[]): RunOptions | { help: true } | { version: true } {
+const modulePath = fileURLToPath(import.meta.url);
+
+export function packageVersion(): string {
+  const packagePath = join(dirname(modulePath), "..", "package.json");
+  const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: string };
+  return pkg.version ?? "0.0.0";
+}
+
+export function parseArgs(argv: string[]): RunOptions | { help: true } | { version: true } {
   const args = [...argv];
   const opts: RunOptions = {};
 
@@ -72,7 +83,7 @@ function printHelp(): void {
   );
 }
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2));
 
   if ("help" in parsed) {
@@ -81,7 +92,7 @@ async function main(): Promise<void> {
   }
   if ("version" in parsed) {
     // eslint-disable-next-line no-console
-    console.log("0.1.12");
+    console.log(packageVersion());
     return;
   }
 
@@ -95,4 +106,15 @@ async function main(): Promise<void> {
   }
 }
 
-void main();
+function isCliEntry(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(modulePath) === realpathSync(process.argv[1]);
+  } catch {
+    return modulePath === process.argv[1];
+  }
+}
+
+if (isCliEntry()) {
+  void main();
+}
