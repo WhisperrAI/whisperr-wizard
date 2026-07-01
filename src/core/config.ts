@@ -15,13 +15,13 @@ import type { WizardConfig } from "../types.js";
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
-// Coding-agent default. Sonnet 4.6 at HIGH effort. The failure mode here isn't a
+// Coding-agent default. Sonnet 5 at HIGH effort. The failure mode here isn't a
 // capability ceiling — it's skimming: not reading a callback's control flow to
 // see the initial-vs-renewal branch, not sourcing the discriminator properties
 // the code already exposes. That's fixed by THINKING DEPTH (effort), not model
 // tier, and Sonnet-high reads control flow well at ~0.6x Opus's token price.
 // Override with WHISPERR_WIZARD_MODEL=claude-opus-4-8 for the hardest repos.
-const DEFAULT_MODEL = "claude-sonnet-4-6";
+const DEFAULT_MODEL = "claude-sonnet-5";
 // Reasoning effort (pairs with adaptive thinking). "high" — placement is a
 // reasoning task (which moment, which branch, which properties), so we give it
 // room to think. Drop to medium/low via WHISPERR_WIZARD_EFFORT for cheap runs.

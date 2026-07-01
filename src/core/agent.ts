@@ -238,7 +238,7 @@ async function runPass(opts: {
       cwd: repoPath,
       systemPrompt,
       // Adaptive thinking (Claude decides depth per step) + an explicit effort
-      // level. Sonnet 4.6 supports both; we set them rather than rely on SDK
+      // level. Sonnet 5 supports both; we set them rather than rely on SDK
       // defaults so the behavior is pinned regardless of SDK version.
       thinking: { type: "adaptive" },
       effort,

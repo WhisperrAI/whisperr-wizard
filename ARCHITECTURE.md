@@ -90,8 +90,8 @@ Anthropic key**:
   and run `--offline` to exercise the whole flow against a real model + a mock
   manifest, with no backend.
 
-Default model: `claude-opus-4-8` (override with `WHISPERR_WIZARD_MODEL`, e.g.
-`claude-sonnet-4-6`).
+Default model: `claude-sonnet-5` (override with `WHISPERR_WIZARD_MODEL`, e.g.
+`claude-opus-4-8` for the hardest repos).
 
 ## Contributing / local dev
 

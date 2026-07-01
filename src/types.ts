@@ -140,8 +140,8 @@ export interface WizardConfig {
   model: string;
   /**
    * Reasoning effort for the coding agent (pairs with adaptive thinking).
-   * Default "medium" — the sweet spot for agentic, tool-heavy SDK wiring on
-   * Sonnet 4.6. Bump to "high" for the hardest repos.
+   * Default "high" — the sweet spot for agentic, tool-heavy SDK wiring on
+   * Sonnet 5. Drop to medium/low for cheaper runs.
    */
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   /** Max agent turns per pass — a high safety backstop, NOT the real limiter. */
