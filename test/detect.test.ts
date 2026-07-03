@@ -30,6 +30,44 @@ test("detectStack recognizes Flutter and Next.js specifically", async () => {
   assert.equal((await detectStack(next))[0]?.target.id, "nextjs");
 });
 
+test("detectStack prefers React Native over generic web, for Expo and bare RN", async () => {
+  const expo = await fixture({
+    "package.json": JSON.stringify({
+      dependencies: { expo: "~51.0.0", react: "18.2.0", "react-native": "0.74.0" },
+    }),
+    "app.json": JSON.stringify({ expo: { name: "demo" } }),
+  });
+  const expoDetections = await detectStack(expo);
+  assert.equal(expoDetections[0]?.target.id, "react-native");
+  assert.ok(!expoDetections.some((d) => d.target.id === "web-js"));
+
+  const bare = await fixture({
+    "package.json": JSON.stringify({
+      dependencies: { react: "18.2.0", "react-native": "0.75.0" },
+    }),
+  });
+  assert.equal((await detectStack(bare))[0]?.target.id, "react-native");
+});
+
+test("detectStack recognizes Swift projects (SPM, Xcode, Tuist)", async () => {
+  const spm = await fixture({
+    "Package.swift": "// swift-tools-version: 5.9\n",
+    "Sources/App/main.swift": "",
+  });
+  assert.equal((await detectStack(spm))[0]?.target.id, "swift");
+
+  const xcode = await fixture({
+    "MyApp.xcodeproj/project.pbxproj": "",
+    "MyApp/AppDelegate.swift": "",
+  });
+  assert.equal((await detectStack(xcode))[0]?.target.id, "swift");
+
+  const tuist = await fixture({
+    "Project.swift": "import ProjectDescription\n",
+  });
+  assert.equal((await detectStack(tuist))[0]?.target.id, "swift");
+});
+
 async function fixture(files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "whisperr-wizard-"));
   await Promise.all(

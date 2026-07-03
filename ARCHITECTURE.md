@@ -71,10 +71,13 @@ src/
     playbooks/          ← the only SDK-aware code
       shared-prompt.ts  base wizard prompt + manifest renderer
       flutter.ts        (available)
-      web.ts            (planned)
-      nextjs.ts         (planned)
-      react-native.ts   (planned)
-      swift.ts          (planned)
+      web.ts            (available)
+      nextjs.ts         (available)
+      node.ts           (available)
+      python.ts         (available)
+      php.ts            (available)
+      react-native.ts   (available)
+      swift.ts          (available)
 ```
 
 ## Model & auth
