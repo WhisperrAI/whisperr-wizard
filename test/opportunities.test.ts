@@ -125,6 +125,29 @@ test("sanitizeOpportunities drops manifest duplicates, repeats, and junk", () =>
   );
 });
 
+test("sanitizeOpportunities dedups against the top-level intervention catalog", () => {
+  // A wizard-added intervention with no event links surfaces only in the
+  // manifest's top-level catalog, never nested under an event. The pre-filter
+  // must still treat a re-proposal of it as a duplicate.
+  const withCatalog: IntegrationManifest = {
+    ...manifest,
+    interventions: [{ code: "support_rescue", label: "Support Rescue" }],
+  };
+  const out = sanitizeOpportunities(
+    {
+      interventions: [
+        { code: "Support Rescue" }, // catalog duplicate after normalization
+        { code: "brand_new" },
+      ],
+    },
+    withCatalog,
+  );
+  assert.deepEqual(
+    out.interventions.map((i) => i.code),
+    ["brand_new"],
+  );
+});
+
 test("sanitizeOpportunities strips ANSI escapes and control chars from LLM strings", () => {
   const out = sanitizeOpportunities(
     {

@@ -89,9 +89,14 @@ export function sanitizeOpportunities(
   const doc = raw as Record<string, unknown>;
 
   const knownEvents = new Set(manifest.events.map((e) => normalizeCode(e.eventType)));
-  const knownInterventions = new Set(
-    manifest.events.flatMap((e) => e.interventions ?? []).map((i) => normalizeCode(i.code)),
-  );
+  // Interventions surface two ways: nested under the events they drive (via
+  // weights) AND in the manifest's top-level catalog, which also carries
+  // link-less interventions the per-event view misses. Union both so a
+  // wizard-added intervention with no links isn't re-proposed every run.
+  const knownInterventions = new Set([
+    ...manifest.events.flatMap((e) => e.interventions ?? []).map((i) => normalizeCode(i.code)),
+    ...(manifest.interventions ?? []).map((i) => normalizeCode(i.code)),
+  ]);
 
   const seenEvents = new Set<string>();
   for (const entry of asArray(doc.events)) {
