@@ -1,5 +1,6 @@
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { wasTrackedAtCheckpoint, type GitCheckpoint } from "./git.js";
 import type {
   IntegrationManifest,
   OpportunityEvent,
@@ -22,16 +23,19 @@ import type {
 export const OPPORTUNITIES_FILE = "whisperr-opportunities.json";
 
 /**
- * Mirrors whisperr-go's NormalizeCode (internal/onboardingimport): lowercase
- * snake_case, non-alphanumerics collapsed to single underscores. Client-side
- * it's only used to pre-filter no-op proposals; the server check is
- * authoritative.
+ * Mirrors whisperr-go's NormalizeCode (internal/onboardingimport) exactly:
+ * lowercase, then space/`-`/`.`/`/` become underscores, every other
+ * non-alphanumeric is DROPPED, and runs of underscores collapse to one.
+ * Client-side it's only used to pre-filter no-op proposals; the server check
+ * is authoritative — which is why the semantics must not drift.
  */
 export function normalizeCode(value: string): string {
   return value
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/[ \-./]/g, "_")
+    .replace(/[^a-z0-9_]/g, "")
+    .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "");
 }
 
@@ -39,12 +43,21 @@ export function normalizeCode(value: string): string {
  * Read, validate, and delete the agent's opportunities file. Returns an empty
  * set when the file is absent or unusable — opportunities are additive and
  * must never fail the run.
+ *
+ * Trust boundary: only a file the agent wrote during THIS run counts. A
+ * whisperr-opportunities.json that was already tracked at the pre-pass
+ * checkpoint is the audited repo's own content — attacker-controllable, not
+ * agent output — so it is ignored and left untouched.
  */
 export async function collectOpportunities(
   repoPath: string,
   manifest: IntegrationManifest,
+  checkpoint: GitCheckpoint,
 ): Promise<UniverseOpportunities> {
   const path = join(repoPath, OPPORTUNITIES_FILE);
+  if (await wasTrackedAtCheckpoint(repoPath, checkpoint, OPPORTUNITIES_FILE)) {
+    return { events: [], interventions: [] };
+  }
   let rawText: string;
   try {
     rawText = await readFile(path, "utf8");
@@ -101,6 +114,10 @@ export function sanitizeOpportunities(
   return out;
 }
 
+/** The additions POST does server-side merging + policy regen triggering, so
+ *  give it real headroom — but never let it hang the CLI indefinitely. */
+const SUBMIT_TIMEOUT_MS = 30_000;
+
 /**
  * Post the confirmed opportunities to whisperr-go. Unlike the coverage report
  * this is a real write the user just approved, so failures surface to the
@@ -115,6 +132,7 @@ export async function submitAdditions(
 ): Promise<UniverseAdditionsResult> {
   const res = await fetch(`${config.apiBaseUrl}/wizard/universe/additions`, {
     method: "POST",
+    signal: AbortSignal.timeout(SUBMIT_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${session.token}`,
@@ -142,7 +160,21 @@ function asArray(value: unknown): unknown[] {
 }
 
 function asString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  if (typeof value !== "string") return undefined;
+  // These strings are LLM-authored and get rendered verbatim in the terminal
+  // confirmation UI — strip ANSI escape sequences and flatten control
+  // characters (incl. newlines, which would fake extra UI lines) so they
+  // can't restyle or spoof the prompt the user approves.
+  const cleaned = value
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "") // CSI sequences (colors, cursor moves)
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "") // OSC sequences (titles, hyperlinks)
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, " ") // remaining C0 controls + DEL -> space
+    .replace(/ {2,}/g, " ")
+    .trim();
+  return cleaned ? cleaned : undefined;
 }
 
 function asConfidence(value: unknown): number | undefined {

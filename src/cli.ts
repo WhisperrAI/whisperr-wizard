@@ -200,7 +200,7 @@ export async function run(options: RunOptions): Promise<number> {
 
   // Collect any universe opportunities the review pass wrote (this also
   // removes the proposals file so it never shows up in the customer's diff).
-  const opportunities = await collectOpportunities(repoPath, manifest);
+  const opportunities = await collectOpportunities(repoPath, manifest, checkpoint);
 
   // 6. Show what changed + cost + the agent's summary.
   const files = await changedFiles(repoPath, checkpoint);
@@ -562,7 +562,24 @@ async function offerOpportunities(opts: {
   if (submitted.interventions.length) {
     lines.push(theme.muted("New interventions start paused — activate them in your dashboard."));
   }
+  // The regen leg tells us whether live decisioning will actually see the
+  // applied rows — "Universe updated" alone would overpromise when it failed.
+  if (result.policyRegen?.status === "pending") {
+    lines.push(
+      theme.muted("Runtime policy update queued — the additions go live once it completes."),
+    );
+  }
   p.note(lines.join("\n"), theme.signal("Universe updated"));
+  if (result.policyRegen?.status === "failed") {
+    p.log.warn(
+      theme.warn("Live runtime NOT updated") +
+        theme.muted(
+          " — the additions were recorded, but the runtime policy wasn't regenerated" +
+            (result.policyRegen.reason ? `: ${result.policyRegen.reason}` : "") +
+            ". They won't drive live decisions until the policy regenerates.",
+        ),
+    );
+  }
 
   const appliedEventCodes = new Set(
     result.outcomes
@@ -587,8 +604,17 @@ async function offerOpportunities(opts: {
       acceptedEvents,
       budgetUsd: opts.remainingBudgetUsd,
     });
-    spin.stop(theme.success("New events instrumented"));
-    if (pass.summary.trim()) p.log.message(pass.summary.trim());
+    if (pass.ran) {
+      spin.stop(theme.success("New events instrumented"));
+      if (pass.summary.trim()) p.log.message(pass.summary.trim());
+    } else {
+      spin.stop(
+        theme.warn("Skipped instrumenting the new events") +
+          theme.muted(
+            " — the spend limit was reached. They're in your universe; wire them on a future run.",
+          ),
+      );
+    }
   } catch (err) {
     spin.stop(
       theme.warn("Couldn't instrument the new events") +

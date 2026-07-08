@@ -57,6 +57,32 @@ export function revertHint(checkpoint: GitCheckpoint): string | undefined {
   return `git restore . && git clean -fd   (back to ${checkpoint.baseRef.slice(0, 7)})`;
 }
 
+/**
+ * True when `file` was already part of the repo at the checkpoint — committed
+ * in baseRef, or tracked in the index for a repo with no commits yet. Lets
+ * callers tell a file the wizard's agent just wrote apart from one that was
+ * in the customer's tree all along.
+ */
+export async function wasTrackedAtCheckpoint(
+  repoPath: string,
+  checkpoint: GitCheckpoint,
+  file: string,
+): Promise<boolean> {
+  if (!checkpoint.isRepo) return false;
+  if (checkpoint.baseRef) {
+    const res = await run(repoPath, [
+      "ls-tree",
+      "--name-only",
+      checkpoint.baseRef,
+      "--",
+      file,
+    ]);
+    return res.ok && res.stdout.trim() !== "";
+  }
+  const res = await run(repoPath, ["ls-files", "--", file]);
+  return res.ok && res.stdout.trim() !== "";
+}
+
 /** True if the repo has no uncommitted/untracked changes. */
 export async function isWorkingTreeClean(repoPath: string): Promise<boolean> {
   const status = await run(repoPath, ["status", "--porcelain"]);

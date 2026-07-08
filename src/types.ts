@@ -170,6 +170,23 @@ export interface AdditionOutcome {
   duplicateOf?: string;
 }
 
+/**
+ * The policy-regeneration leg of an additions request. Applied additions land
+ * in the universe tables, but live decisioning reads the derived runtime
+ * policy — which only changes once regeneration runs and the new version
+ * activates. Mirrors whisperr-go's PolicyRegenOutcome.
+ */
+export interface PolicyRegenOutcome {
+  /**
+   * "pending": regen job enqueued; the runtime updates once it completes.
+   * "skipped": nothing applied, runtime already current.
+   * "failed":  additions recorded but the live runtime was NOT updated.
+   */
+  status: "pending" | "skipped" | "failed";
+  jobId?: string;
+  reason?: string;
+}
+
 /** Response of POST /wizard/universe/additions. */
 export interface UniverseAdditionsResult {
   additionId: string;
@@ -178,6 +195,8 @@ export interface UniverseAdditionsResult {
   duplicates: number;
   invalid: number;
   outcomes: AdditionOutcome[];
+  /** Optional only for older backends; current whisperr-go always sends it. */
+  policyRegen?: PolicyRegenOutcome;
 }
 
 /** A short-lived session the CLI holds after device authorization. */

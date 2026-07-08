@@ -51,6 +51,12 @@ test("normalizeCode mirrors whisperr-go's NormalizeCode", () => {
   assert.equal(normalizeCode("  sub.cancelled/v2  "), "sub_cancelled_v2");
   assert.equal(normalizeCode("__weird--CODE__"), "weird_code");
   assert.equal(normalizeCode("---"), "");
+  // Go converts only space/-/./ slash to "_" and DROPS other
+  // non-alphanumerics — it does not turn them into underscores.
+  assert.equal(normalizeCode("user's plan"), "users_plan");
+  assert.equal(normalizeCode("a+b=c"), "abc");
+  assert.equal(normalizeCode("café latte"), "caf_latte");
+  assert.equal(normalizeCode("foo — bar"), "foo_bar");
 });
 
 test("sanitizeOpportunities keeps valid proposals and normalizes codes", () => {
@@ -119,6 +125,27 @@ test("sanitizeOpportunities drops manifest duplicates, repeats, and junk", () =>
   );
 });
 
+test("sanitizeOpportunities strips ANSI escapes and control chars from LLM strings", () => {
+  const out = sanitizeOpportunities(
+    {
+      events: [
+        {
+          code: "trial_expired",
+          description: "\x1b[32m✓ safe, already approved\x1b[0m",
+          rationale: "line one\nline two\x07\x1b]0;spoofed title\x07 end",
+        },
+      ],
+      interventions: [],
+    },
+    manifest,
+  );
+  assert.equal(out.events.length, 1);
+  const ev = out.events[0]!;
+  // No escape bytes or newlines survive to the confirmation UI.
+  assert.equal(ev.description, "✓ safe, already approved");
+  assert.equal(ev.rationale, "line one line two end");
+});
+
 test("sanitizeOpportunities tolerates a completely malformed document", () => {
   for (const doc of [null, 42, "hi", [], { events: "nope", interventions: 7 }]) {
     const out = sanitizeOpportunities(doc, manifest);
@@ -128,12 +155,13 @@ test("sanitizeOpportunities tolerates a completely malformed document", () => {
 
 test("collectOpportunities reads then deletes the proposals file", async () => {
   const dir = await mkdtemp(join(tmpdir(), "wsp-opps-"));
+  const checkpoint = await takeCheckpoint(dir);
   await writeFile(
     join(dir, OPPORTUNITIES_FILE),
     JSON.stringify({ events: [{ code: "trial_expired" }], interventions: [] }),
   );
 
-  const out = await collectOpportunities(dir, manifest);
+  const out = await collectOpportunities(dir, manifest, checkpoint);
   assert.deepEqual(
     out.events.map((e) => e.code),
     ["trial_expired"],
@@ -144,17 +172,61 @@ test("collectOpportunities reads then deletes the proposals file", async () => {
 
 test("collectOpportunities returns empty when the file is absent or invalid", async () => {
   const dir = await mkdtemp(join(tmpdir(), "wsp-opps-"));
-  assert.deepEqual(await collectOpportunities(dir, manifest), {
+  const checkpoint = await takeCheckpoint(dir);
+  assert.deepEqual(await collectOpportunities(dir, manifest, checkpoint), {
     events: [],
     interventions: [],
   });
 
   await writeFile(join(dir, OPPORTUNITIES_FILE), "not json {");
-  assert.deepEqual(await collectOpportunities(dir, manifest), {
+  assert.deepEqual(await collectOpportunities(dir, manifest, checkpoint), {
     events: [],
     interventions: [],
   });
   assert.deepEqual(await readdir(dir), []);
+});
+
+test("collectOpportunities ignores a proposals file that was already committed pre-pass", async () => {
+  // A repo shipping its own whisperr-opportunities.json is attacker-supplied
+  // input, not agent output: it must not be trusted and must not be deleted.
+  const dir = await mkdtemp(join(tmpdir(), "wsp-opps-tracked-"));
+  await git(dir, "init");
+  const payload = JSON.stringify({
+    events: [{ code: "attacker_event", rationale: "planted in the repo" }],
+    interventions: [],
+  });
+  await writeFile(join(dir, OPPORTUNITIES_FILE), payload);
+  await git(dir, "add", ".");
+  await git(dir, "commit", "-m", "repo ships a planted proposals file");
+  const checkpoint = await takeCheckpoint(dir);
+
+  assert.deepEqual(await collectOpportunities(dir, manifest, checkpoint), {
+    events: [],
+    interventions: [],
+  });
+  // The customer's own file stays exactly where it was.
+  assert.equal(await readFile(join(dir, OPPORTUNITIES_FILE), "utf8"), payload);
+});
+
+test("collectOpportunities still accepts a file the agent wrote in a git repo", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wsp-opps-untracked-"));
+  await git(dir, "init");
+  await writeFile(join(dir, "app.txt"), "app\n");
+  await git(dir, "add", ".");
+  await git(dir, "commit", "-m", "base");
+  const checkpoint = await takeCheckpoint(dir);
+
+  // Written after the checkpoint — this is genuine agent output.
+  await writeFile(
+    join(dir, OPPORTUNITIES_FILE),
+    JSON.stringify({ events: [{ code: "trial_expired" }], interventions: [] }),
+  );
+  const out = await collectOpportunities(dir, manifest, checkpoint);
+  assert.deepEqual(
+    out.events.map((e) => e.code),
+    ["trial_expired"],
+  );
+  assert.equal(await fileExists(join(dir, OPPORTUNITIES_FILE)), false);
 });
 
 test("submitAdditions posts the whisperr-go contract and returns its result", async () => {

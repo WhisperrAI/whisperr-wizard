@@ -219,10 +219,12 @@ export async function runAdditionsInstrumentationPass(opts: {
   acceptedEvents: OpportunityEvent[];
   budgetUsd: number;
   progress?: AgentProgress;
-}): Promise<{ summary: string; costUsd: number }> {
+}): Promise<{ summary: string; costUsd: number; ran: boolean }> {
   const { repoPath, config, session, playbook, acceptedEvents, budgetUsd, progress } = opts;
+  // `ran: false` = the pass never started (nothing to do / budget exhausted),
+  // so the caller must not report the events as instrumented.
   if (!acceptedEvents.length || budgetUsd <= 0) {
-    return { summary: "", costUsd: 0 };
+    return { summary: "", costUsd: 0, ran: false };
   }
 
   applyModelAuthEnv(config, session);
@@ -268,7 +270,7 @@ export async function runAdditionsInstrumentationPass(opts: {
     budgetUsd,
     progress,
   });
-  return { summary: pass.summary, costUsd: pass.costUsd };
+  return { summary: pass.summary, costUsd: pass.costUsd, ran: true };
 }
 
 interface PassResult {
