@@ -24,6 +24,17 @@ export interface VerifyResult {
   timedOut?: boolean;
 }
 
+/**
+ * Map a verify verdict onto the tri-state `verified` value the wizard reports:
+ * true = passed, false = failed, null = couldn't conclude (tool missing or
+ * timed out). Shared by the post-integration check and the re-check after the
+ * additions instrumentation pass, so both report with the same semantics.
+ */
+export function verdictToVerified(verdict: VerifyResult): boolean | null {
+  if (verdict.toolMissing || verdict.timedOut) return null;
+  return verdict.ok;
+}
+
 const MAX_OUTPUT = 4000;
 const DEFAULT_TIMEOUT_MS = 180_000;
 

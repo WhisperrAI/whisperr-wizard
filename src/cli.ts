@@ -16,10 +16,14 @@ import {
   isWorkingTreeClean,
   repoFingerprint,
   scanWiredEvents,
+  snapshotChanges,
+  snapshotsEqual,
+  restoreToSnapshot,
+  type ChangesSnapshot,
   type GitCheckpoint,
 } from "./core/git.js";
 import { pollFirstEvent } from "./core/verify.js";
-import { runVerifyCommand } from "./core/postflight.js";
+import { runVerifyCommand, verdictToVerified } from "./core/postflight.js";
 import { postRunReport, type ReportEvent } from "./core/report.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
@@ -232,6 +236,7 @@ export async function run(options: RunOptions): Promise<number> {
     const vspin = p.spinner();
     vspin.start(`Verifying the integration — ${theme.muted(cmd)}`);
     const verdict = await runVerifyCommand(repoPath, cmd);
+    verified = verdictToVerified(verdict);
     if (verdict.toolMissing) {
       vspin.stop(
         theme.warn("Couldn't verify automatically") +
@@ -243,10 +248,8 @@ export async function run(options: RunOptions): Promise<number> {
           theme.muted(" — run it yourself before committing."),
       );
     } else if (verdict.ok) {
-      verified = true;
       vspin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
     } else {
-      verified = false;
       vspin.stop(theme.alert(`Verification failed — ${cmd}`));
       if (verdict.output) {
         p.note(verdict.output, theme.warn("Verifier output"));
@@ -267,7 +270,7 @@ export async function run(options: RunOptions): Promise<number> {
   //     interventions the onboarding plan misses. The user picks which to add;
   //     whisperr-go appends them to the universe (dedupe is server-side), and
   //     accepted events get instrumented in one bounded follow-up pass.
-  const acceptedEvents = await offerOpportunities({
+  const { acceptedEvents, instrumentationSnapshot } = await offerOpportunities({
     repoPath,
     config,
     session,
@@ -275,8 +278,63 @@ export async function run(options: RunOptions): Promise<number> {
     manifest,
     opportunities,
     fingerprint,
+    checkpoint,
     remainingBudgetUsd: config.budgetUsd - outcome.costUsd,
   });
+
+  // 6d. The instrumentation pass edits code AFTER the 6b check ran, so that
+  //     verdict no longer describes the working tree. Re-run the same verify
+  //     command so the reported `verified` reflects the final state — the 6b
+  //     result must never claim "verified" for a tree a later pass then broke.
+  if (instrumentationSnapshot && chosen.playbook.verifyCommand) {
+    const cmd = chosen.playbook.verifyCommand;
+    const preInstrumentationVerified = verified;
+    const vspin = p.spinner();
+    vspin.start(`Re-verifying after instrumenting the new events — ${theme.muted(cmd)}`);
+    const verdict = await runVerifyCommand(repoPath, cmd);
+    verified = verdictToVerified(verdict);
+    if (verdict.toolMissing) {
+      vspin.stop(
+        theme.warn("Couldn't re-verify automatically") +
+          theme.muted(` — \`${cmd}\` isn't available here. Run it yourself before committing.`),
+      );
+    } else if (verdict.timedOut) {
+      vspin.stop(
+        theme.warn(`Re-verification timed out — \`${cmd}\``) +
+          theme.muted(" — run it yourself before committing."),
+      );
+    } else if (verdict.ok) {
+      vspin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
+    } else {
+      vspin.stop(theme.alert(`Verification failed after instrumenting the new events — ${cmd}`));
+      if (verdict.output) {
+        p.note(verdict.output, theme.warn("Verifier output"));
+      }
+      // Offer to undo ONLY the instrumentation pass — the integration that
+      // passed 6b stays, and the accepted events remain in the universe.
+      const doRevert = await p.confirm({
+        message:
+          "Instrumenting the new events didn't pass the build/lint check. " +
+          "Revert just those edits? (The events stay in your universe — wire them on a future run.)",
+        initialValue: true,
+      });
+      if (!p.isCancel(doRevert) && doRevert) {
+        if (await restoreToSnapshot(repoPath, checkpoint, instrumentationSnapshot)) {
+          verified = preInstrumentationVerified;
+          p.log.success(theme.success("Reverted the instrumentation edits."));
+        } else {
+          p.log.warn(
+            theme.warn("Couldn't revert automatically — undo manually: ") +
+              (revertHint(checkpoint) ?? "git reset --hard"),
+          );
+        }
+      } else {
+        p.log.info(
+          theme.muted("Left in your working tree — fix the verifier errors before committing."),
+        );
+      }
+    }
+  }
 
   // Derive which events actually got wired (from the diff) and record coverage
   // so future runs — including on other surfaces — know what this one handled.
@@ -356,11 +414,26 @@ export async function run(options: RunOptions): Promise<number> {
 
 // --- helpers ---
 
+interface AdditionsOutcome {
+  /** Events the backend actually applied to the universe. */
+  acceptedEvents: OpportunityEvent[];
+  /**
+   * Pre-instrumentation snapshot of the wizard's changes, set only when the
+   * instrumentation pass actually edited files. Non-null tells the caller the
+   * 6b verify verdict is stale and gives it the exact state to restore if the
+   * re-check fails.
+   */
+  instrumentationSnapshot: ChangesSnapshot | null;
+}
+
+const NO_ADDITIONS: AdditionsOutcome = { acceptedEvents: [], instrumentationSnapshot: null };
+
 /**
  * Present the agent's universe opportunities, submit the confirmed ones to
  * whisperr-go, and instrument the events the backend actually applied.
- * Returns the accepted (applied) events. Never throws — opportunities are
- * additive and must not fail the run.
+ * Returns the accepted (applied) events plus a snapshot for undoing the
+ * instrumentation edits. Never throws — opportunities are additive and must
+ * not fail the run.
  */
 async function offerOpportunities(opts: {
   repoPath: string;
@@ -370,11 +443,12 @@ async function offerOpportunities(opts: {
   manifest: IntegrationManifest;
   opportunities: UniverseOpportunities;
   fingerprint: string;
+  checkpoint: GitCheckpoint;
   remainingBudgetUsd: number;
-}): Promise<OpportunityEvent[]> {
+}): Promise<AdditionsOutcome> {
   const { opportunities, manifest, config, session } = opts;
   const total = opportunities.events.length + opportunities.interventions.length;
-  if (total === 0) return [];
+  if (total === 0) return NO_ADDITIONS;
 
   const describe = (kind: string, code: string, why?: string) =>
     `${theme.muted(`${kind}: `)}${theme.bright(code)}${why ? theme.muted(` — ${why}`) : ""}`;
@@ -390,13 +464,13 @@ async function offerOpportunities(opts: {
 
   if (config.offline) {
     p.log.info(theme.muted("Offline mode — proposals shown only, nothing submitted."));
-    return [];
+    return NO_ADDITIONS;
   }
   if (!process.stdout.isTTY || !process.stdin.isTTY) {
     p.log.info(
       theme.muted("Non-interactive run — proposals were not submitted. Re-run interactively to add them."),
     );
-    return [];
+    return NO_ADDITIONS;
   }
 
   const selection = await p.multiselect({
@@ -421,7 +495,7 @@ async function offerOpportunities(opts: {
   });
   if (p.isCancel(selection) || selection.length === 0) {
     p.log.info(theme.muted("Skipped — your universe is unchanged."));
-    return [];
+    return NO_ADDITIONS;
   }
 
   const chosenSet = new Set(selection as string[]);
@@ -462,7 +536,7 @@ async function offerOpportunities(opts: {
       theme.warn("Couldn't add the proposals") +
         theme.muted(` — ${(err as Error).message}. Your universe is unchanged.`),
     );
-    return [];
+    return NO_ADDITIONS;
   }
 
   const lines = result.outcomes.map((o) => {
@@ -496,10 +570,12 @@ async function offerOpportunities(opts: {
       .map((o) => o.code),
   );
   const acceptedEvents = pickedEvents.filter((e) => appliedEventCodes.has(e.code));
-  if (!acceptedEvents.length) return [];
+  if (!acceptedEvents.length) return NO_ADDITIONS;
 
   // Wire the newly accepted events now — otherwise they'd exist in the plan
-  // but never fire from this surface.
+  // but never fire from this surface. Snapshot the tree first: it's the state
+  // 6b verified, and the exact point to restore if this pass breaks the build.
+  const prePass = await snapshotChanges(opts.repoPath, opts.checkpoint);
   const spin = p.spinner();
   spin.start(theme.bright("Instrumenting the newly added events"));
   try {
@@ -519,7 +595,10 @@ async function offerOpportunities(opts: {
         theme.muted(` — ${(err as Error).message}. They're in your universe; wire them on a future run.`),
     );
   }
-  return acceptedEvents;
+  // Even a failed pass may have left partial edits behind — compare contents,
+  // not just the outcome, so the caller re-verifies exactly when needed.
+  const edited = !snapshotsEqual(prePass, await snapshotChanges(opts.repoPath, opts.checkpoint));
+  return { acceptedEvents, instrumentationSnapshot: edited ? prePass : null };
 }
 
 /**

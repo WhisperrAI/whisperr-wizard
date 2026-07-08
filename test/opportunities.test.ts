@@ -1,8 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { access, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import {
   OPPORTUNITIES_FILE,
   collectOpportunities,
@@ -10,6 +12,13 @@ import {
   sanitizeOpportunities,
   submitAdditions,
 } from "../src/core/opportunities.js";
+import {
+  takeCheckpoint,
+  snapshotChanges,
+  snapshotsEqual,
+  restoreToSnapshot,
+} from "../src/core/git.js";
+import { runVerifyCommand, verdictToVerified } from "../src/core/postflight.js";
 import type { IntegrationManifest, WizardConfig, WizardSession } from "../src/types.js";
 
 const manifest: IntegrationManifest = {
@@ -195,6 +204,83 @@ test("submitAdditions posts the whisperr-go contract and returns its result", as
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// --- post-instrumentation re-verification ---
+// The CLI must report the FINAL verify state: if the additions instrumentation
+// pass breaks the build after 6b passed, `verified` flips to false, and the
+// pre-pass snapshot restores exactly the tree that 6b verified.
+
+const gitExec = promisify(execFile);
+const git = (dir: string, ...args: string[]) =>
+  gitExec("git", ["-C", dir, "-c", "user.email=wizard@test", "-c", "user.name=wizard", ...args]);
+
+// Mimics a playbook verifyCommand: "the build" fails iff broken.txt exists.
+const VERIFY_CMD = `node -e "process.exit(require('fs').existsSync('broken.txt') ? 1 : 0)"`;
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("instrumentation pass that breaks the build makes the reported verified=false", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "wsp-reverify-"));
+  await git(dir, "init");
+  await writeFile(join(dir, "app.txt"), "original\n");
+  await writeFile(join(dir, "pristine.txt"), "pristine\n");
+  await git(dir, "add", ".");
+  await git(dir, "commit", "-m", "base");
+  const checkpoint = await takeCheckpoint(dir);
+
+  // Integration pass edits, then 6b verifies them: passes.
+  await writeFile(join(dir, "app.txt"), "integrated\n");
+  await writeFile(join(dir, "wired.txt"), "track('trial_expired')\n");
+  assert.equal(verdictToVerified(await runVerifyCommand(dir, VERIFY_CMD)), true);
+
+  // The instrumentation pass then breaks the build (and touches files both
+  // inside and outside the earlier diff).
+  const prePass = await snapshotChanges(dir, checkpoint);
+  await writeFile(join(dir, "broken.txt"), "syntax error\n");
+  await writeFile(join(dir, "wired.txt"), "track('trial_expired')\ntrack('payment_failed')\n");
+  await writeFile(join(dir, "pristine.txt"), "instrumented\n");
+
+  // The pass edited files, so the CLI re-verifies — and must now report false.
+  assert.equal(snapshotsEqual(prePass, await snapshotChanges(dir, checkpoint)), false);
+  assert.equal(verdictToVerified(await runVerifyCommand(dir, VERIFY_CMD)), false);
+
+  // The failure-path revert restores exactly the tree 6b verified: pass edits
+  // are gone, the integration edits stay.
+  assert.equal(await restoreToSnapshot(dir, checkpoint, prePass), true);
+  assert.equal(await fileExists(join(dir, "broken.txt")), false);
+  assert.equal(await readFile(join(dir, "wired.txt"), "utf8"), "track('trial_expired')\n");
+  assert.equal(await readFile(join(dir, "pristine.txt"), "utf8"), "pristine\n");
+  assert.equal(await readFile(join(dir, "app.txt"), "utf8"), "integrated\n");
+  assert.equal(verdictToVerified(await runVerifyCommand(dir, VERIFY_CMD)), true);
+  t.diagnostic("snapshot round-trip verified");
+});
+
+test("a no-op instrumentation pass leaves the snapshot equal, so no re-verify is needed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wsp-noop-"));
+  await git(dir, "init");
+  await writeFile(join(dir, "app.txt"), "original\n");
+  await git(dir, "add", ".");
+  await git(dir, "commit", "-m", "base");
+  const checkpoint = await takeCheckpoint(dir);
+
+  await writeFile(join(dir, "wired.txt"), "track('trial_expired')\n");
+  const prePass = await snapshotChanges(dir, checkpoint);
+  assert.equal(snapshotsEqual(prePass, await snapshotChanges(dir, checkpoint)), true);
+});
+
+test("verdictToVerified maps inconclusive verify runs to null", () => {
+  assert.equal(verdictToVerified({ ran: true, ok: false, output: "", toolMissing: true }), null);
+  assert.equal(verdictToVerified({ ran: true, ok: false, output: "", timedOut: true }), null);
+  assert.equal(verdictToVerified({ ran: true, ok: true, output: "" }), true);
+  assert.equal(verdictToVerified({ ran: true, ok: false, output: "" }), false);
 });
 
 test("submitAdditions surfaces backend failures", async () => {

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 /**
  * The wizard auto-applies edits (user's choice). To make that safe, we take a
@@ -82,6 +82,81 @@ export async function revertToCheckpoint(
   const restore = await run(repoPath, ["restore", "."]);
   const clean = await run(repoPath, ["clean", "-fd"]);
   return restore.ok && clean.ok;
+}
+
+/**
+ * Exact contents of every file changed since the checkpoint at one moment in
+ * time. Lets a later agent pass's edits be undone precisely — back to this
+ * snapshot — without touching the (already verified) work that came before it.
+ * `null` marks a file that was deleted from the working tree at snapshot time.
+ */
+export type ChangesSnapshot = Map<string, Buffer | null>;
+
+export async function snapshotChanges(
+  repoPath: string,
+  checkpoint: GitCheckpoint,
+): Promise<ChangesSnapshot> {
+  const snapshot: ChangesSnapshot = new Map();
+  for (const file of await changedFiles(repoPath, checkpoint)) {
+    try {
+      snapshot.set(file, await readFile(join(repoPath, file)));
+    } catch {
+      snapshot.set(file, null);
+    }
+  }
+  return snapshot;
+}
+
+/** True when the working tree's changes are byte-identical to the snapshot. */
+export function snapshotsEqual(a: ChangesSnapshot, b: ChangesSnapshot): boolean {
+  if (a.size !== b.size) return false;
+  for (const [file, content] of a) {
+    const other = b.get(file);
+    if (other === undefined) return false;
+    if (content === null || other === null) {
+      if (content !== other) return false;
+    } else if (!content.equals(other)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Return the working tree to a snapshot taken between the checkpoint and now.
+ * Files recorded in the snapshot get their exact bytes back; files that
+ * changed only after the snapshot go back to their checkpoint state (they were
+ * untouched when the snapshot was taken).
+ */
+export async function restoreToSnapshot(
+  repoPath: string,
+  checkpoint: GitCheckpoint,
+  snapshot: ChangesSnapshot,
+): Promise<boolean> {
+  try {
+    const current = await changedFiles(repoPath, checkpoint);
+    for (const file of new Set([...current, ...snapshot.keys()])) {
+      const recorded = snapshot.get(file);
+      const path = join(repoPath, file);
+      if (recorded === undefined) {
+        // Untouched at snapshot time, so its pre-snapshot state is the
+        // checkpoint's. Tracked -> check out; brand-new file -> remove.
+        if (checkpoint.baseRef) {
+          const co = await run(repoPath, ["checkout", checkpoint.baseRef, "--", file]);
+          if (co.ok) continue;
+        }
+        await rm(path, { force: true });
+      } else if (recorded === null) {
+        await rm(path, { force: true });
+      } else {
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, recorded);
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
