@@ -5,10 +5,13 @@ import type {
   WizardConfig,
   WizardSession,
 } from "../types.js";
+import type { OpportunityEvent } from "../types.js";
+import { OPPORTUNITIES_FILE } from "./opportunities.js";
 import {
   BASE_WIZARD_PROMPT,
   renderEventsBrief,
   renderIdentifyBrief,
+  renderOpportunitiesBrief,
 } from "./playbooks/shared-prompt.js";
 
 export interface AgentProgress {
@@ -171,8 +174,12 @@ export async function runIntegrationAgent(opts: {
       "4. Coverage — every gateway/callback path that should emit an event does;",
       "   no recurring or secondary path left as a dead zone.",
       "Change ONLY what is genuinely wrong or incomplete — do not churn correct",
-      "calls or re-explore the whole repo. Be surgical. End with a one-line,",
-      "plain-text note of what you corrected, or 'No corrections needed.'.",
+      "calls or re-explore the whole repo. Be surgical.",
+      "",
+      renderOpportunitiesBrief(manifest, OPPORTUNITIES_FILE),
+      "",
+      "End with a one-line, plain-text note of what you corrected (or 'No",
+      "corrections needed.'), plus one line on what you proposed, if anything.",
     ].join("\n");
 
     const review = await runPass({
@@ -196,6 +203,72 @@ export async function runIntegrationAgent(opts: {
     coreOk: core.ok,
     eventsComplete,
   };
+}
+
+/**
+ * One bounded follow-up pass: instrument the events that were just ACCEPTED
+ * into the universe as wizard additions. Without this a wizard-added event
+ * would exist in the plan but never fire. Same machinery as Phase 2, scoped to
+ * only the accepted events.
+ */
+export async function runAdditionsInstrumentationPass(opts: {
+  repoPath: string;
+  config: WizardConfig;
+  session: WizardSession;
+  playbook: Playbook;
+  acceptedEvents: OpportunityEvent[];
+  budgetUsd: number;
+  progress?: AgentProgress;
+}): Promise<{ summary: string; costUsd: number }> {
+  const { repoPath, config, session, playbook, acceptedEvents, budgetUsd, progress } = opts;
+  if (!acceptedEvents.length || budgetUsd <= 0) {
+    return { summary: "", costUsd: 0 };
+  }
+
+  applyModelAuthEnv(config, session);
+  const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt].join("\n\n");
+
+  const eventLines: string[] = [];
+  for (const e of acceptedEvents) {
+    eventLines.push("");
+    eventLines.push(`■ ${e.code}${e.label ? `  (${e.label})` : ""}`);
+    if (e.description) eventLines.push(`  ${e.description}`);
+    if (e.rationale) eventLines.push(`  where: ${e.rationale}`);
+    if (e.properties?.length) {
+      eventLines.push("  properties to capture if available:");
+      for (const prop of e.properties) {
+        eventLines.push(`    · ${prop.name}${prop.required ? " (required)" : ""}${prop.description ? ` — ${prop.description}` : ""}`);
+      }
+    }
+  }
+
+  progress?.onPhase?.("Instrumenting the newly added events");
+  const prompt = [
+    "You proposed these events as universe opportunities while reviewing this",
+    "repo, and the user just APPROVED adding them to the plan. Instrument them",
+    "now with track(), exactly like the plan's other events: place each at the",
+    "real call site (your own rationale tells you where you saw it), attach the",
+    "properties available in scope, and skip anything that turns out not to have",
+    "a clear trigger after all. The SDK is already installed and initialized.",
+    `Project root: ${repoPath}`,
+    "",
+    "----- APPROVED NEW EVENTS -----",
+    ...eventLines,
+    "",
+    "----- END -----",
+  ].join("\n");
+
+  const pass = await runPass({
+    prompt,
+    systemPrompt,
+    repoPath,
+    model: config.model,
+    effort: config.effort,
+    maxTurns: 25,
+    budgetUsd,
+    progress,
+  });
+  return { summary: pass.summary, costUsd: pass.costUsd };
 }
 
 interface PassResult {

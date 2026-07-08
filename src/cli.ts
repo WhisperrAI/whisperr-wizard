@@ -6,7 +6,8 @@ import { detectStack } from "./core/detect.js";
 import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
 import { authenticate } from "./core/auth.js";
 import { fetchManifest } from "./core/manifest.js";
-import { runIntegrationAgent } from "./core/agent.js";
+import { runIntegrationAgent, runAdditionsInstrumentationPass } from "./core/agent.js";
+import { collectOpportunities, submitAdditions } from "./core/opportunities.js";
 import {
   takeCheckpoint,
   changedFiles,
@@ -22,7 +23,15 @@ import { runVerifyCommand } from "./core/postflight.js";
 import { postRunReport, type ReportEvent } from "./core/report.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
-import type { Detection, Playbook } from "./types.js";
+import type {
+  Detection,
+  IntegrationManifest,
+  OpportunityEvent,
+  Playbook,
+  UniverseOpportunities,
+  WizardConfig,
+  WizardSession,
+} from "./types.js";
 
 export interface RunOptions extends CliFlags {
   /** Target repo (defaults to cwd). */
@@ -185,6 +194,10 @@ export async function run(options: RunOptions): Promise<number> {
         theme.muted(" — some events left as follow-ups");
   spin.stop(stopLabel);
 
+  // Collect any universe opportunities the review pass wrote (this also
+  // removes the proposals file so it never shows up in the customer's diff).
+  const opportunities = await collectOpportunities(repoPath, manifest);
+
   // 6. Show what changed + cost + the agent's summary.
   const files = await changedFiles(repoPath, checkpoint);
   if (files.length) {
@@ -250,17 +263,36 @@ export async function run(options: RunOptions): Promise<number> {
     }
   }
 
+  // 6c. Universe opportunities: the agent may have proposed events /
+  //     interventions the onboarding plan misses. The user picks which to add;
+  //     whisperr-go appends them to the universe (dedupe is server-side), and
+  //     accepted events get instrumented in one bounded follow-up pass.
+  const acceptedEvents = await offerOpportunities({
+    repoPath,
+    config,
+    session,
+    playbook: chosen.playbook,
+    manifest,
+    opportunities,
+    fingerprint,
+    remainingBudgetUsd: config.budgetUsd - outcome.costUsd,
+  });
+
   // Derive which events actually got wired (from the diff) and record coverage
   // so future runs — including on other surfaces — know what this one handled.
-  const wiredMap = await scanWiredEvents(
-    repoPath,
-    files,
-    manifest.events.map((e) => e.eventType),
-  );
-  const reportEvents: ReportEvent[] = manifest.events.map((e) => ({
-    event_type: e.eventType,
-    status: wiredMap.has(e.eventType) ? "wired" : "skipped",
-    file: wiredMap.get(e.eventType),
+  // Recompute the diff: the additions pass may have touched more files.
+  const filesForScan = acceptedEvents.length
+    ? await changedFiles(repoPath, checkpoint)
+    : files;
+  const eventTypesToScan = [
+    ...manifest.events.map((e) => e.eventType),
+    ...acceptedEvents.map((e) => e.code),
+  ];
+  const wiredMap = await scanWiredEvents(repoPath, filesForScan, eventTypesToScan);
+  const reportEvents: ReportEvent[] = eventTypesToScan.map((eventType) => ({
+    event_type: eventType,
+    status: wiredMap.has(eventType) ? "wired" : "skipped",
+    file: wiredMap.get(eventType),
   }));
   await postRunReport(config, session, {
     target: chosen.playbook.target.id,
@@ -275,7 +307,7 @@ export async function run(options: RunOptions): Promise<number> {
 
   p.log.info(
     theme.muted(
-      `${wiredMap.size}/${manifest.events.length} events wired · ` +
+      `${wiredMap.size}/${eventTypesToScan.length} events wired · ` +
         `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
         (verified === true ? "verified · " : verified === false ? "unverified · " : "") +
         `${Math.round(outcome.durationMs / 1000)}s`,
@@ -323,6 +355,172 @@ export async function run(options: RunOptions): Promise<number> {
 }
 
 // --- helpers ---
+
+/**
+ * Present the agent's universe opportunities, submit the confirmed ones to
+ * whisperr-go, and instrument the events the backend actually applied.
+ * Returns the accepted (applied) events. Never throws — opportunities are
+ * additive and must not fail the run.
+ */
+async function offerOpportunities(opts: {
+  repoPath: string;
+  config: WizardConfig;
+  session: WizardSession;
+  playbook: Playbook;
+  manifest: IntegrationManifest;
+  opportunities: UniverseOpportunities;
+  fingerprint: string;
+  remainingBudgetUsd: number;
+}): Promise<OpportunityEvent[]> {
+  const { opportunities, manifest, config, session } = opts;
+  const total = opportunities.events.length + opportunities.interventions.length;
+  if (total === 0) return [];
+
+  const describe = (kind: string, code: string, why?: string) =>
+    `${theme.muted(`${kind}: `)}${theme.bright(code)}${why ? theme.muted(` — ${why}`) : ""}`;
+  p.note(
+    [
+      ...opportunities.events.map((e) => describe("event", e.code, e.rationale ?? e.description)),
+      ...opportunities.interventions.map((i) =>
+        describe("intervention", i.code, i.rationale ?? i.description),
+      ),
+    ].join("\n"),
+    theme.signal("Opportunities found beyond your onboarding plan"),
+  );
+
+  if (config.offline) {
+    p.log.info(theme.muted("Offline mode — proposals shown only, nothing submitted."));
+    return [];
+  }
+  if (!process.stdout.isTTY || !process.stdin.isTTY) {
+    p.log.info(
+      theme.muted("Non-interactive run — proposals were not submitted. Re-run interactively to add them."),
+    );
+    return [];
+  }
+
+  const selection = await p.multiselect({
+    message: "Add these to your Whisperr universe? (new interventions start paused)",
+    options: [
+      ...opportunities.events.map((e) => ({
+        value: `e:${e.code}`,
+        label: `event · ${e.code}`,
+        hint: e.description ?? e.rationale,
+      })),
+      ...opportunities.interventions.map((i) => ({
+        value: `i:${i.code}`,
+        label: `intervention · ${i.code}`,
+        hint: i.description ?? i.rationale,
+      })),
+    ],
+    initialValues: [
+      ...opportunities.events.map((e) => `e:${e.code}`),
+      ...opportunities.interventions.map((i) => `i:${i.code}`),
+    ],
+    required: false,
+  });
+  if (p.isCancel(selection) || selection.length === 0) {
+    p.log.info(theme.muted("Skipped — your universe is unchanged."));
+    return [];
+  }
+
+  const chosenSet = new Set(selection as string[]);
+  const knownInterventionCodes = new Set(
+    manifest.events.flatMap((e) => e.interventions ?? []).map((i) => i.code),
+  );
+  const knownEventCodes = new Set(manifest.events.map((e) => e.eventType));
+  const pickedEvents = opportunities.events.filter((e) => chosenSet.has(`e:${e.code}`));
+  const pickedInterventions = opportunities.interventions.filter((i) =>
+    chosenSet.has(`i:${i.code}`),
+  );
+  // Drop links whose other end wasn't selected and doesn't already exist —
+  // the server would reject them as unknown references anyway.
+  const pickedInterventionCodes = new Set(pickedInterventions.map((i) => i.code));
+  const pickedEventCodes = new Set(pickedEvents.map((e) => e.code));
+  const submitted: UniverseOpportunities = {
+    events: pickedEvents.map((e) => ({
+      ...e,
+      links: e.links?.filter(
+        (l) => knownInterventionCodes.has(l.interventionCode) || pickedInterventionCodes.has(l.interventionCode),
+      ),
+    })),
+    interventions: pickedInterventions.map((i) => ({
+      ...i,
+      links: i.links?.filter(
+        (l) => knownEventCodes.has(l.eventCode) || pickedEventCodes.has(l.eventCode),
+      ),
+    })),
+  };
+
+  let result;
+  try {
+    result = await withSpinner("Adding to your universe", () =>
+      submitAdditions(config, session, opts.playbook.target.id, opts.fingerprint, submitted),
+    );
+  } catch (err) {
+    p.log.warn(
+      theme.warn("Couldn't add the proposals") +
+        theme.muted(` — ${(err as Error).message}. Your universe is unchanged.`),
+    );
+    return [];
+  }
+
+  const lines = result.outcomes.map((o) => {
+    const mark =
+      o.status === "applied"
+        ? theme.success("✓")
+        : o.status === "duplicate"
+          ? theme.muted("=")
+          : theme.warn("✗");
+    const detail =
+      o.status === "duplicate"
+        ? theme.muted(` (already in your universe${o.duplicateOf && o.duplicateOf !== o.code ? ` as ${o.duplicateOf}` : ""})`)
+        : o.status === "invalid" && o.reason
+          ? theme.muted(` (${o.reason})`)
+          : "";
+    return `${mark} ${o.kind} ${theme.bright(o.code)}${detail}`;
+  });
+  lines.push(
+    theme.muted(
+      `${result.applied} added · ${result.duplicates} already present · ${result.invalid} rejected`,
+    ),
+  );
+  if (submitted.interventions.length) {
+    lines.push(theme.muted("New interventions start paused — activate them in your dashboard."));
+  }
+  p.note(lines.join("\n"), theme.signal("Universe updated"));
+
+  const appliedEventCodes = new Set(
+    result.outcomes
+      .filter((o) => o.kind === "event" && o.status === "applied")
+      .map((o) => o.code),
+  );
+  const acceptedEvents = pickedEvents.filter((e) => appliedEventCodes.has(e.code));
+  if (!acceptedEvents.length) return [];
+
+  // Wire the newly accepted events now — otherwise they'd exist in the plan
+  // but never fire from this surface.
+  const spin = p.spinner();
+  spin.start(theme.bright("Instrumenting the newly added events"));
+  try {
+    const pass = await runAdditionsInstrumentationPass({
+      repoPath: opts.repoPath,
+      config,
+      session,
+      playbook: opts.playbook,
+      acceptedEvents,
+      budgetUsd: opts.remainingBudgetUsd,
+    });
+    spin.stop(theme.success("New events instrumented"));
+    if (pass.summary.trim()) p.log.message(pass.summary.trim());
+  } catch (err) {
+    spin.stop(
+      theme.warn("Couldn't instrument the new events") +
+        theme.muted(` — ${(err as Error).message}. They're in your universe; wire them on a future run.`),
+    );
+  }
+  return acceptedEvents;
+}
 
 /**
  * Offer to undo the wizard's changes when a run didn't finish cleanly. Returns

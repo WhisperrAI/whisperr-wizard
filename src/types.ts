@@ -121,6 +121,65 @@ export interface IntegrationManifest {
   supportedTargets?: string[];
 }
 
+/**
+ * Universe opportunities — new events/interventions the agent spotted while
+ * reading the customer's code that the onboarding-generated universe misses.
+ * The agent writes these to a JSON file; after the user confirms in the CLI
+ * they're posted to whisperr-go (`POST /wizard/universe/additions`), whose
+ * request/response shapes these mirror exactly.
+ */
+export interface OpportunityEvent {
+  /** snake_case canonical event code, e.g. "subscription_payment_failed". */
+  code: string;
+  label?: string;
+  description?: string;
+  /** Where the event is emitted from: "frontend" | "backend" | "either". */
+  side?: string;
+  /** Why the agent believes this belongs in the universe (code evidence). */
+  rationale?: string;
+  /** 0..1 */
+  confidence?: number;
+  properties?: Array<{ name: string; description?: string; required?: boolean }>;
+  /** Existing (or same-batch) interventions this event should feed. */
+  links?: Array<{ interventionCode: string; weight?: number }>;
+}
+
+export interface OpportunityIntervention {
+  /** snake_case intervention code, e.g. "support_rescue". */
+  code: string;
+  label?: string;
+  description?: string;
+  rationale?: string;
+  /** 0..1 */
+  confidence?: number;
+  /** Existing (or same-batch) events that should drive this intervention. */
+  links?: Array<{ eventCode: string; weight?: number }>;
+}
+
+export interface UniverseOpportunities {
+  events: OpportunityEvent[];
+  interventions: OpportunityIntervention[];
+}
+
+/** How one submitted item resolved on the backend. */
+export interface AdditionOutcome {
+  kind: "event" | "intervention" | "link";
+  code: string;
+  status: "applied" | "duplicate" | "invalid";
+  reason?: string;
+  duplicateOf?: string;
+}
+
+/** Response of POST /wizard/universe/additions. */
+export interface UniverseAdditionsResult {
+  additionId: string;
+  configVersionId: string;
+  applied: number;
+  duplicates: number;
+  invalid: number;
+  outcomes: AdditionOutcome[];
+}
+
 /** A short-lived session the CLI holds after device authorization. */
 export interface WizardSession {
   /** Opaque token; used as ANTHROPIC_AUTH_TOKEN against the LLM gateway and

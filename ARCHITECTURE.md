@@ -127,6 +127,8 @@ The wizard talks to these endpoints on the runtime API (default
 | `POST /dashboard/wizard/approve` | Supabase JWT | The whisperr-watch approval page binds a `user_code` to the user's app |
 | `GET /wizard/manifest` | wizard session | → `IntegrationManifest`: **mints the ingestion key** + events + interventions + identify |
 | `GET /wizard/first-event` | wizard session | → `{ received, event_type? }` for the activation poll |
+| `POST /wizard/report` | wizard session | Coverage ledger: per-event wired/skipped status for this surface |
+| `POST /wizard/universe/additions` | wizard session | Append user-confirmed opportunity events/interventions to the app's active universe (server-side dedupe; new interventions start paused) |
 | `POST /wizard/llm/*` | wizard session | Anthropic-compatible gateway: injects Whisperr's real key, streams the response |
 
 whisperr-go env to set:

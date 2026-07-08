@@ -199,6 +199,58 @@ export function renderEventsBrief(m: IntegrationManifest): string {
   return lines.join("\n");
 }
 
+/**
+ * Phase 3 add-on: ask the agent to surface universe OPPORTUNITIES — genuine
+ * lifecycle moments / messaging strategies this codebase supports that the
+ * onboarding plan misses — as a structured JSON file the CLI collects. This is
+ * deliberately a separate channel from instrumentation: track() calls still use
+ * ONLY the exact event names in the plan; proposals go in the file and are
+ * added to the plan (after human confirmation) rather than invented inline.
+ */
+export function renderOpportunitiesBrief(
+  m: IntegrationManifest,
+  opportunitiesFile: string,
+): string {
+  const eventCodes = m.events.map((e) => e.eventType);
+  const interventionCodes = [
+    ...new Set(m.events.flatMap((e) => e.interventions ?? []).map((i) => i.code)),
+  ];
+  return [
+    "UNIVERSE OPPORTUNITIES (do this LAST, after your corrections):",
+    "While auditing you read this app's real lifecycle. If you found churn-",
+    "relevant moments the plan does NOT cover — e.g. a recurring-payment or",
+    "cancellation path with no event, a support/refund flow worth a retention",
+    "play — record them as PROPOSALS. Do NOT add track() calls for them.",
+    `Write a single JSON file at the repo root named ${opportunitiesFile}:`,
+    "",
+    "{",
+    '  "events": [{',
+    '    "code": "snake_case_event", "label": "...", "description": "...",',
+    '    "side": "frontend|backend|either", "rationale": "what in the code shows this",',
+    '    "confidence": 0.0-1.0,',
+    '    "properties": [{"name": "...", "description": "...", "required": false}],',
+    '    "links": [{"interventionCode": "existing_or_proposed", "weight": 0.0-1.0}]',
+    "  }],",
+    '  "interventions": [{',
+    '    "code": "snake_case_strategy", "label": "...", "description": "...",',
+    '    "rationale": "...", "confidence": 0.0-1.0,',
+    '    "links": [{"eventCode": "existing_or_proposed", "weight": 0.0-1.0}]',
+    "  }]",
+    "}",
+    "",
+    "Rules:",
+    `- The plan already covers these events: ${eventCodes.join(", ") || "(none)"}.`,
+    `  And these interventions: ${interventionCodes.join(", ") || "(none)"}.`,
+    "  Propose ONLY what is genuinely missing — never re-propose or rename these.",
+    "- Every proposal needs concrete code evidence in its rationale (file/flow),",
+    "  not speculation. 0-3 events and 0-2 interventions is the normal range;",
+    "  an empty file or no file at all is a perfectly good outcome.",
+    "- Link each proposed event to the intervention(s) it should feed (existing",
+    "  codes or ones you propose in the same file).",
+    "- This file is metadata for the wizard, not app code — write it and move on.",
+  ].join("\n");
+}
+
 /** Inline coverage hint for an event, e.g. " [already wired here]". */
 function coverageNote(
   coverage?: Array<{ target: string; status: string; sameSurface: boolean }>,
