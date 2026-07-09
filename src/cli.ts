@@ -352,7 +352,7 @@ export async function run(options: RunOptions): Promise<number> {
     status: wiredMap.has(eventType) ? "wired" : "skipped",
     file: wiredMap.get(eventType),
   }));
-  await postRunReport(config, session, {
+  const reportResult = await postRunReport(config, session, {
     target: chosen.playbook.target.id,
     repo_fingerprint: fingerprint,
     identify_wired: outcome.coreOk,
@@ -362,6 +362,15 @@ export async function run(options: RunOptions): Promise<number> {
     summary: outcome.summary.slice(0, 4000),
     events: reportEvents,
   });
+  if (!reportResult.ok) {
+    p.log.warn(
+      theme.warn("Couldn't record this run's coverage on the server") +
+        theme.muted(
+          ` (${formatReportFailure(reportResult)}) — ` +
+            "future runs may re-propose events already wired here.",
+        ),
+    );
+  }
 
   p.log.info(
     theme.muted(
@@ -766,4 +775,12 @@ function summarizeManifest(m: {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatReportFailure(result: { status?: number; detail?: string }): string {
+  const detail = result.detail?.replace(/\s+/g, " ").trim();
+  if (result.status !== undefined) {
+    return `HTTP ${result.status}${detail ? `: ${detail}` : ""}`;
+  }
+  return detail || "request failed";
 }

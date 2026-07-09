@@ -211,8 +211,10 @@ function normalizeRemote(url: string): string {
 
 /**
  * Determine which manifest events the agent actually wired, by scanning the
- * changed files for `track(... '<event_type>' ...)` calls. Deterministic and
- * agent-cooperation-free — we read the result from the code, not a self-report.
+ * changed files for `track(... '<event_type>' ...)` calls first, then falling
+ * back to exact quoted event-code literals for wrapper/constant indirection.
+ * Deterministic and agent-cooperation-free — we read the result from the code,
+ * not a self-report.
  *
  * The event type can be the FIRST argument (browser/Flutter SDKs:
  * `track('event', {...})`) or a LATER one (server SDKs take the user id first:
@@ -228,25 +230,43 @@ export async function scanWiredEvents(
   const wired = new Map<string, string>();
   const patterns = eventTypes.map((e) => ({
     eventType: e,
-    re: new RegExp(
+    trackRe: new RegExp(
       `\\btrack\\s*\\(\\s*[\\s\\S]{0,160}?['"\`]${escapeRegExp(e)}['"\`]`,
     ),
+    literalRe: quotedLiteralRegExp(e),
   }));
+  const contents: Array<{ file: string; content: string }> = [];
 
   for (const file of files) {
-    let content = "";
     try {
-      content = await readFile(join(repoPath, file), "utf8");
+      contents.push({ file, content: await readFile(join(repoPath, file), "utf8") });
     } catch {
       continue;
     }
-    for (const { eventType, re } of patterns) {
-      if (!wired.has(eventType) && re.test(content)) {
+  }
+
+  for (const { file, content } of contents) {
+    for (const { eventType, trackRe } of patterns) {
+      if (!wired.has(eventType) && trackRe.test(content)) {
+        wired.set(eventType, file);
+      }
+    }
+  }
+
+  for (const { file, content } of contents) {
+    for (const { eventType, literalRe } of patterns) {
+      if (!wired.has(eventType) && literalRe.test(content)) {
         wired.set(eventType, file);
       }
     }
   }
   return wired;
+}
+
+function quotedLiteralRegExp(eventType: string): RegExp {
+  const leftBoundary = /^\w/.test(eventType) ? "\\b" : "";
+  const rightBoundary = /\w$/.test(eventType) ? "\\b" : "";
+  return new RegExp(`(['"\`])${leftBoundary}${escapeRegExp(eventType)}${rightBoundary}\\1`);
 }
 
 function escapeRegExp(s: string): string {
