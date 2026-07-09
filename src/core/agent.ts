@@ -1,4 +1,4 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
 import type {
   IntegrationManifest,
   Playbook,
@@ -14,6 +14,7 @@ import {
   renderIdentifyBrief,
   renderOpportunitiesBrief,
 } from "./playbooks/shared-prompt.js";
+import { evaluateToolUse } from "./toolPolicy.js";
 
 export interface AgentProgress {
   /** A new phase started, e.g. "Installing the SDK". */
@@ -868,8 +869,8 @@ async function runPass(opts: {
       // defaults so the behavior is pinned regardless of SDK version.
       thinking: { type: "adaptive" },
       effort,
-      allowedTools: [...allowedTools],
-      permissionMode: "bypassPermissions",
+      tools: [...allowedTools],
+      canUseTool: createToolPermissionCallback(repoPath),
       maxTurns,
       // Native SDK hard cost cap. Stops this pass with an `error_max_budget_usd`
       // result once spend exceeds the remaining budget — this, not maxTurns, is
@@ -911,6 +912,19 @@ async function runPass(opts: {
   }
 
   return { summary, costUsd, ok, maxedOut };
+}
+
+function createToolPermissionCallback(repoPath: string): CanUseTool {
+  return async (toolName, input, options) => {
+    const decision = evaluateToolUse(toolName, input, { repoPath });
+    return decision.behavior === "allow"
+      ? { behavior: "allow", toolUseID: options.toolUseID }
+      : {
+          behavior: "deny",
+          message: decision.message,
+          toolUseID: options.toolUseID,
+        };
+  };
 }
 
 /** Configure where the Agent SDK sends model calls (gateway or direct key). */

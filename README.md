@@ -22,6 +22,10 @@ review the changes, commit, and deploy.
 - Node.js 18.17+
 - A Whisperr account with onboarding completed
 
+## Security
+
+The wizard runs with a restricted agent tool policy; see [SECURITY.md](./SECURITY.md).
+
 ## Usage
 
 ```bash
