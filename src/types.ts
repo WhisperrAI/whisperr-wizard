@@ -185,11 +185,11 @@ export interface AdditionOutcome {
  */
 export interface PolicyRegenOutcome {
   /**
-   * "pending": regen job enqueued and the fresh draft WILL auto-activate (the
-   *            app had no active policy); the runtime updates once it completes.
-   * "draft":   regen job enqueued but the app already has an active policy, so a
-   *            review draft was generated instead of auto-replacing it — a human
-   *            activates it from the dashboard.
+   * "pending": regen job enqueued; the app had no active policy at trigger time,
+   *            so the draft is predicted to auto-activate once the job completes.
+   * "draft":   regen job enqueued; the app already has an active policy, so a
+   *            review draft will be queued (not auto-activated) for a human to
+   *            activate from the dashboard.
    * "skipped": nothing applied, runtime already current.
    * "failed":  additions recorded but the live runtime was NOT updated.
    */

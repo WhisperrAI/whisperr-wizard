@@ -571,7 +571,7 @@ async function offerOpportunities(opts: {
   if (result.policyRegen?.status === "draft") {
     lines.push(
       theme.muted(
-        "A reviewed policy draft was generated — activate it in your dashboard to take the additions live (your current live policy was left untouched).",
+        "A review policy draft was queued — activate it in your dashboard once it finishes generating to take the additions live (your current live policy was left untouched).",
       ),
     );
   }
