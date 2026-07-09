@@ -117,6 +117,13 @@ export interface IntegrationManifest {
   businessContext?: string;
   identify: ManifestIdentify;
   events: ManifestEvent[];
+  /**
+   * The app's full active-config intervention catalog. Events carry their own
+   * driving interventions via weights, but an intervention with no event links
+   * never surfaces there — so this list lets the dedup pre-filter see every
+   * existing intervention (link-less ones included) and avoid re-proposing them.
+   */
+  interventions?: Array<{ code: string; label?: string }>;
   /** SDK ids the backend knows about, for cross-checking detection. */
   supportedTargets?: string[];
 }
@@ -178,11 +185,15 @@ export interface AdditionOutcome {
  */
 export interface PolicyRegenOutcome {
   /**
-   * "pending": regen job enqueued; the runtime updates once it completes.
+   * "pending": regen job enqueued; the app had no active policy at trigger time,
+   *            so the draft is predicted to auto-activate once the job completes.
+   * "draft":   regen job enqueued; the app already has an active policy, so a
+   *            review draft will be queued (not auto-activated) for a human to
+   *            activate from the dashboard.
    * "skipped": nothing applied, runtime already current.
    * "failed":  additions recorded but the live runtime was NOT updated.
    */
-  status: "pending" | "skipped" | "failed";
+  status: "pending" | "draft" | "skipped" | "failed";
   jobId?: string;
   reason?: string;
 }

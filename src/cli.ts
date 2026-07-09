@@ -487,10 +487,9 @@ async function offerOpportunities(opts: {
         hint: i.description ?? i.rationale,
       })),
     ],
-    initialValues: [
-      ...opportunities.events.map((e) => `e:${e.code}`),
-      ...opportunities.interventions.map((i) => `i:${i.code}`),
-    ],
+    // Opt-in per item: nothing is pre-selected, so adding to the universe is an
+    // explicit choice rather than an opt-out the user has to notice and undo.
+    initialValues: [],
     required: false,
   });
   if (p.isCancel(selection) || selection.length === 0) {
@@ -567,6 +566,13 @@ async function offerOpportunities(opts: {
   if (result.policyRegen?.status === "pending") {
     lines.push(
       theme.muted("Runtime policy update queued — the additions go live once it completes."),
+    );
+  }
+  if (result.policyRegen?.status === "draft") {
+    lines.push(
+      theme.muted(
+        "A review policy draft was queued — activate it in your dashboard once it finishes generating to take the additions live (your current live policy was left untouched).",
+      ),
     );
   }
   p.note(lines.join("\n"), theme.signal("Universe updated"));
