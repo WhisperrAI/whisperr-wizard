@@ -23,6 +23,10 @@ export interface RunReport {
   events: ReportEvent[];
 }
 
+export type PostRunReportResult =
+  | { ok: true }
+  | { ok: false; status?: number; detail?: string };
+
 /**
  * Post the run report to whisperr-go (`POST /wizard/report`) so the coverage
  * ledger knows what this surface now handles. Best-effort — a failed report
@@ -32,10 +36,10 @@ export async function postRunReport(
   config: WizardConfig,
   session: WizardSession,
   report: RunReport,
-): Promise<void> {
-  if (config.offline) return;
+): Promise<PostRunReportResult> {
+  if (config.offline) return { ok: true };
   try {
-    await fetch(`${config.apiBaseUrl}/wizard/report`, {
+    const res = await fetch(`${config.apiBaseUrl}/wizard/report`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -43,7 +47,30 @@ export async function postRunReport(
       },
       body: JSON.stringify(report),
     });
-  } catch {
-    /* coverage is best-effort telemetry; never block on it */
+    if (res.ok) return { ok: true };
+    return {
+      ok: false,
+      status: res.status,
+      detail: await responseDetail(res),
+    };
+  } catch (err) {
+    return { ok: false, detail: detailSlice(errorMessage(err)) };
   }
+}
+
+async function responseDetail(res: Response): Promise<string | undefined> {
+  try {
+    return detailSlice(await res.text());
+  } catch (err) {
+    return detailSlice(errorMessage(err));
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function detailSlice(detail: string): string | undefined {
+  const sliced = detail.slice(0, 200).trim();
+  return sliced || undefined;
 }
