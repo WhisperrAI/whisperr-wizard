@@ -6,7 +6,12 @@ import { detectStack } from "./core/detect.js";
 import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
 import { authenticate } from "./core/auth.js";
 import { fetchManifest } from "./core/manifest.js";
-import { runIntegrationAgent, runAdditionsInstrumentationPass } from "./core/agent.js";
+import {
+  runIntegrationAgent,
+  runAdditionsInstrumentationPass,
+  runRepairPass,
+  type AgentEventOutcome,
+} from "./core/agent.js";
 import { collectOpportunities, submitAdditions } from "./core/opportunities.js";
 import {
   takeCheckpoint,
@@ -147,20 +152,30 @@ export async function run(options: RunOptions): Promise<number> {
 
   // 5. Run the coding agent.
   const spin = p.spinner();
+  const useIntegrationSpinner = Boolean(process.stdout.isTTY);
   let phaseLabel = "Integrating";
   let lastLine = "";
+  let lastActivityLine = "";
   const startedAt = Date.now();
-  spin.start(theme.bright(phaseLabel));
-  // Drive the spinner off a ticking clock so it always reads as alive, even
-  // while the agent spends 30s+ inside one set of tool calls.
-  const tick = setInterval(() => {
+  const nextIntegrationMessage = createMessageDeduper();
+  const updateIntegrationMessage = () => {
     const secs = Math.round((Date.now() - startedAt) / 1000);
-    spin.message(
+    const message =
       theme.bright(phaseLabel) +
-        theme.muted(` · ${secs}s`) +
-        (lastLine ? theme.muted(` — ${lastLine}`) : ""),
-    );
-  }, 1000);
+      theme.muted(` · ${secs}s`) +
+      (lastLine ? theme.muted(` — ${lastLine}`) : "");
+    const next = nextIntegrationMessage(message);
+    if (next) spin.message(next);
+  };
+  if (useIntegrationSpinner) {
+    spin.start(theme.bright(phaseLabel));
+  } else {
+    p.log.step(theme.bright(phaseLabel));
+  }
+  // In a TTY, keep the spinner visibly alive during long tool calls. In
+  // non-TTY output this ticker would print repeated lines, so phase changes are
+  // logged explicitly instead.
+  const tick = useIntegrationSpinner ? setInterval(updateIntegrationMessage, 1000) : undefined;
 
   const outcome = await runIntegrationAgent({
     repoPath,
@@ -172,9 +187,18 @@ export async function run(options: RunOptions): Promise<number> {
       onPhase(label) {
         phaseLabel = label;
         lastLine = "";
+        lastActivityLine = "";
+        if (useIntegrationSpinner) {
+          updateIntegrationMessage();
+        } else {
+          p.log.step(theme.bright(label));
+        }
       },
       onActivity(line) {
+        if (line === lastActivityLine) return;
+        lastActivityLine = line;
         lastLine = line;
+        if (useIntegrationSpinner) updateIntegrationMessage();
       },
     },
   }).catch((err) => {
@@ -182,9 +206,13 @@ export async function run(options: RunOptions): Promise<number> {
     return null;
   });
 
-  clearInterval(tick);
+  if (tick) clearInterval(tick);
   if (!outcome) {
-    spin.stop(theme.alert("Integration stopped"));
+    if (useIntegrationSpinner) {
+      spin.stop(theme.alert("Integration stopped"));
+    } else {
+      p.log.error(theme.alert("Integration stopped"));
+    }
     await maybeRevert(repoPath, checkpoint, "The run stopped before finishing.");
     return 1;
   }
@@ -196,19 +224,29 @@ export async function run(options: RunOptions): Promise<number> {
       ? theme.success("Integration complete")
       : theme.success("Core integration done") +
         theme.muted(" — some events left as follow-ups");
-  spin.stop(stopLabel);
+  if (useIntegrationSpinner) {
+    spin.stop(stopLabel);
+  } else if (!outcome.coreOk) {
+    p.log.warn(stopLabel);
+  } else {
+    p.log.success(stopLabel);
+  }
 
   // Collect any universe opportunities the review pass wrote (this also
   // removes the proposals file so it never shows up in the customer's diff).
   const opportunities = await collectOpportunities(repoPath, manifest, checkpoint);
 
   // 6. Show what changed + cost + the agent's summary.
-  const files = await changedFiles(repoPath, checkpoint);
+  let files = await changedFiles(repoPath, checkpoint);
   if (files.length) {
     p.note(files.map((f) => theme.muted("• ") + f).join("\n"), "Files changed");
   }
   if (outcome.summary.trim()) {
     p.log.message(outcome.summary.trim());
+  }
+  const skippedEvents = renderSkippedEventLines(outcome.eventOutcomes);
+  if (skippedEvents) {
+    p.log.message(theme.muted(skippedEvents));
   }
 
   // If the core (install + identify) didn't land, the integration isn't
@@ -235,7 +273,7 @@ export async function run(options: RunOptions): Promise<number> {
     const cmd = chosen.playbook.verifyCommand;
     const vspin = p.spinner();
     vspin.start(`Verifying the integration — ${theme.muted(cmd)}`);
-    const verdict = await runVerifyCommand(repoPath, cmd);
+    let verdict = await runVerifyCommand(repoPath, cmd);
     verified = verdictToVerified(verdict);
     if (verdict.toolMissing) {
       vspin.stop(
@@ -250,18 +288,79 @@ export async function run(options: RunOptions): Promise<number> {
     } else if (verdict.ok) {
       vspin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
     } else {
-      vspin.stop(theme.alert(`Verification failed — ${cmd}`));
-      if (verdict.output) {
-        p.note(verdict.output, theme.warn("Verifier output"));
+      const remainingBudgetUsd = config.budgetUsd - outcome.costUsd;
+      if (remainingBudgetUsd >= 0.5) {
+        vspin.stop(
+          theme.warn(`Verification failed — ${cmd}`) +
+            theme.muted(" — attempting one repair pass"),
+        );
+        const repairSpin = p.spinner();
+        repairSpin.start(`Repairing verifier failures — ${theme.muted(cmd)}`);
+        try {
+          const repair = await runRepairPass({
+            repoPath,
+            config,
+            session,
+            playbook: chosen.playbook,
+            verifyCommand: cmd,
+            verifyOutput: verdict.output.slice(-4000),
+            budgetUsd: remainingBudgetUsd,
+          });
+          outcome.costUsd += repair.costUsd;
+          if (repair.summary.trim()) {
+            outcome.summary = [outcome.summary, `Repair:\n${repair.summary}`]
+              .filter(Boolean)
+              .join("\n\n");
+            p.log.message(repair.summary.trim());
+          }
+          repairSpin.stop(theme.success("Repair pass finished"));
+        } catch (err) {
+          repairSpin.stop(
+            theme.warn("Repair pass failed") +
+              theme.muted(` — ${(err as Error).message}`),
+          );
+        }
+
+        files = await changedFiles(repoPath, checkpoint);
+        const reverifySpin = p.spinner();
+        reverifySpin.start(`Re-verifying the integration — ${theme.muted(cmd)}`);
+        verdict = await runVerifyCommand(repoPath, cmd);
+        verified = verdictToVerified(verdict);
+        if (verdict.toolMissing) {
+          reverifySpin.stop(
+            theme.warn("Couldn't verify automatically") +
+              theme.muted(` — \`${cmd}\` isn't available here. Run it yourself before committing.`),
+          );
+        } else if (verdict.timedOut) {
+          reverifySpin.stop(
+            theme.warn(`Verification timed out — \`${cmd}\``) +
+              theme.muted(" — run it yourself before committing."),
+          );
+        } else if (verdict.ok) {
+          reverifySpin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
+        } else {
+          reverifySpin.stop(theme.alert(`Verification still failed — ${cmd}`));
+        }
+      } else {
+        vspin.stop(
+          theme.alert(`Verification failed — ${cmd}`) +
+            theme.muted(" — skipped repair because less than $0.50 budget remains"),
+        );
       }
-      const reverted = await maybeRevert(
-        repoPath,
-        checkpoint,
-        "The integration didn't pass its build/lint check, so the edits may be broken.",
-      );
-      if (reverted) {
-        p.outro(theme.muted("Reverted — nothing was left in your working tree."));
-        return 1;
+
+      if (!verdict.ok && !verdict.toolMissing && !verdict.timedOut) {
+        if (verdict.output) {
+          p.note(verdict.output, theme.warn("Verifier output"));
+        }
+        const reverted = await maybeRevert(
+          repoPath,
+          checkpoint,
+          "The integration didn't pass its build/lint check, so the edits may be broken.",
+        );
+        if (reverted) {
+          p.outro(theme.muted("Reverted — nothing was left in your working tree."));
+          return 1;
+        }
       }
     }
   }
@@ -280,6 +379,7 @@ export async function run(options: RunOptions): Promise<number> {
     fingerprint,
     checkpoint,
     remainingBudgetUsd: config.budgetUsd - outcome.costUsd,
+    repoMap: outcome.repoMap,
   });
 
   // 6d. The instrumentation pass edits code AFTER the 6b check ran, so that
@@ -371,10 +471,12 @@ export async function run(options: RunOptions): Promise<number> {
         ),
     );
   }
+  const eventDenominator = manifest.universeSummary?.wireableHere ?? eventTypesToScan.length;
+  const eventStatsLabel = manifest.universeSummary ? "events wired here" : "events wired";
 
   p.log.info(
     theme.muted(
-      `${wiredMap.size}/${eventTypesToScan.length} events wired · ` +
+      `${wiredMap.size}/${eventDenominator} ${eventStatsLabel} · ` +
         `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
         (verified === true ? "verified · " : verified === false ? "unverified · " : "") +
         `${Math.round(outcome.durationMs / 1000)}s`,
@@ -454,6 +556,7 @@ async function offerOpportunities(opts: {
   fingerprint: string;
   checkpoint: GitCheckpoint;
   remainingBudgetUsd: number;
+  repoMap?: string;
 }): Promise<AdditionsOutcome> {
   const { opportunities, manifest, config, session } = opts;
   const total = opportunities.events.length + opportunities.interventions.length;
@@ -618,6 +721,7 @@ async function offerOpportunities(opts: {
       playbook: opts.playbook,
       acceptedEvents,
       budgetUsd: opts.remainingBudgetUsd,
+      repoMap: opts.repoMap,
     });
     if (pass.ran) {
       spin.stop(theme.success("New events instrumented"));
@@ -758,9 +862,32 @@ async function withSpinner<T>(label: string, fn: () => Promise<T>): Promise<T> {
   }
 }
 
-function summarizeManifest(m: {
+export function createMessageDeduper(): (message: string) => string | null {
+  let last = "";
+  return (message: string) => {
+    if (message === last) return null;
+    last = message;
+    return message;
+  };
+}
+
+function renderSkippedEventLines(outcomes: AgentEventOutcome[]): string {
+  return outcomes
+    .filter((outcome) => outcome.outcome === "skipped" && outcome.reason)
+    .slice(0, 6)
+    .map((outcome) => `Skipped: ${outcome.event} — ${outcome.reason}`)
+    .join("\n");
+}
+
+export function summarizeManifest(m: {
   events: { eventType: string; importance?: number }[];
   identify: { channels?: string[] };
+  universeSummary?: {
+    total: number;
+    wireableHere: number;
+    derived: number;
+    otherSurface: number;
+  };
 }): string {
   const events = [...m.events]
     .sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0))
@@ -768,8 +895,18 @@ function summarizeManifest(m: {
   const channels = m.identify.channels?.length
     ? theme.muted(`channels: ${m.identify.channels.join(", ")}`)
     : "";
+  const firstLine = m.universeSummary
+    ? theme.bright(`${m.universeSummary.total} events in your universe`) +
+      theme.muted(
+        ` — ${m.universeSummary.wireableHere} wireable here · ` +
+          `${m.universeSummary.derived} computed by Whisperr from your raw events · ` +
+          `${m.universeSummary.otherSurface} live on other surfaces`,
+      )
+    : theme.bright("identify()") +
+      theme.muted(" + ") +
+      theme.bright(`${m.events.length} events`);
   return [
-    theme.bright("identify()") + theme.muted(" + ") + theme.bright(`${m.events.length} events`),
+    firstLine,
     ...events,
     channels,
   ]
