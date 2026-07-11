@@ -268,7 +268,7 @@ export async function run(options: RunOptions): Promise<number> {
   // removes the proposals file so it never shows up in the customer's diff).
   const opportunities = await collectOpportunities(repoPath, manifest, checkpoint);
 
-  // 6. Show what changed + cost + the agent's summary.
+  // 6. Show what changed + the agent's summary.
   let files = await changedFiles(repoPath, checkpoint);
   if (files.length) {
     p.note(files.map((f) => theme.muted("• ") + f).join("\n"), "Files changed");
@@ -509,12 +509,14 @@ export async function run(options: RunOptions): Promise<number> {
     .map(({ phase, ms }) => `${shortPhaseLabel(phase)} ${formatDuration(ms)}`)
     .join(" · ");
 
+  // Cost is internal telemetry (it rides the run report) — never show the
+  // customer what a run costs us.
   p.log.info(
     theme.muted(
       `${wiredMap.size}/${eventDenominator} ${eventStatsLabel} · ` +
         `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
         (verified === true ? "verified · " : verified === false ? "unverified · " : "") +
-        `$${outcome.costUsd.toFixed(2)} · ${formatDuration(outcome.durationMs)}` +
+        formatDuration(outcome.durationMs) +
         (timingDetails ? ` (${timingDetails})` : ""),
     ),
   );
