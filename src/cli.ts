@@ -11,6 +11,7 @@ import {
   runAdditionsInstrumentationPass,
   runRepairPass,
   type AgentEventOutcome,
+  type EventPlanEntry,
 } from "./core/agent.js";
 import { collectOpportunities, submitAdditions } from "./core/opportunities.js";
 import {
@@ -183,6 +184,37 @@ export async function run(options: RunOptions): Promise<number> {
     session,
     playbook: chosen.playbook,
     manifest,
+    ...(process.stdout.isTTY && process.stdin.isTTY
+      ? {
+          async onPlanReady(plan: EventPlanEntry[]) {
+            if (useIntegrationSpinner) {
+              spin.stop(theme.success("Placement plan ready"));
+            }
+            p.note(renderPlacementPlan(plan), "Placement plan");
+
+            const placeEntries = plan.filter((entry) => entry.decision === "place");
+            let selectedEvents = placeEntries.map((entry) => entry.event);
+            if (placeEntries.length) {
+              const selection = await p.multiselect({
+                message: "Wire these events?",
+                options: placeEntries.map((entry) => ({
+                  value: entry.event,
+                  label: entry.event,
+                  hint: `${entry.file ?? "unknown file"}@${entry.anchor ?? "unknown anchor"}`,
+                })),
+                initialValues: selectedEvents,
+                required: false,
+              });
+              selectedEvents = p.isCancel(selection) ? [] : (selection as string[]);
+            }
+
+            if (useIntegrationSpinner) {
+              spin.start(theme.bright("Continuing integration"));
+            }
+            return filterEventPlan(plan, selectedEvents);
+          },
+        }
+      : {}),
     progress: {
       onPhase(label) {
         phaseLabel = label;
@@ -244,11 +276,6 @@ export async function run(options: RunOptions): Promise<number> {
   if (outcome.summary.trim()) {
     p.log.message(outcome.summary.trim());
   }
-  const skippedEvents = renderSkippedEventLines(outcome.eventOutcomes);
-  if (skippedEvents) {
-    p.log.message(theme.muted(skippedEvents));
-  }
-
   // If the core (install + identify) didn't land, the integration isn't
   // trustworthy — offer to undo rather than leaving broken/partial edits.
   if (!outcome.coreOk) {
@@ -471,15 +498,24 @@ export async function run(options: RunOptions): Promise<number> {
         ),
     );
   }
+
+  const eventLines = renderEventOutcomeLines(outcome.eventOutcomes, wiredMap);
+  if (eventLines) {
+    p.note(eventLines, "Events");
+  }
   const eventDenominator = manifest.universeSummary?.wireableHere ?? eventTypesToScan.length;
   const eventStatsLabel = manifest.universeSummary ? "events wired here" : "events wired";
+  const timingDetails = outcome.phaseTimings
+    .map(({ phase, ms }) => `${shortPhaseLabel(phase)} ${formatDuration(ms)}`)
+    .join(" · ");
 
   p.log.info(
     theme.muted(
       `${wiredMap.size}/${eventDenominator} ${eventStatsLabel} · ` +
         `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
         (verified === true ? "verified · " : verified === false ? "unverified · " : "") +
-        `${Math.round(outcome.durationMs / 1000)}s`,
+        `$${outcome.costUsd.toFixed(2)} · ${formatDuration(outcome.durationMs)}` +
+        (timingDetails ? ` (${timingDetails})` : ""),
     ),
   );
 
@@ -871,12 +907,84 @@ export function createMessageDeduper(): (message: string) => string | null {
   };
 }
 
-function renderSkippedEventLines(outcomes: AgentEventOutcome[]): string {
-  return outcomes
-    .filter((outcome) => outcome.outcome === "skipped" && outcome.reason)
-    .slice(0, 6)
-    .map((outcome) => `Skipped: ${outcome.event} — ${outcome.reason}`)
+export function formatDuration(ms: number): string {
+  const safeMs = Math.max(0, ms);
+  const totalSeconds = Math.round(safeMs / 1000);
+  if (safeMs < 60_000) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}m${seconds}s`;
+}
+
+export function filterEventPlan(
+  plan: EventPlanEntry[],
+  selectedEvents: readonly string[],
+): EventPlanEntry[] {
+  const selected = new Set(selectedEvents);
+  return plan.map((entry) =>
+    entry.decision === "place" && !selected.has(entry.event)
+      ? { ...entry, decision: "skip", reason: "Deselected in plan review." }
+      : entry,
+  );
+}
+
+function renderPlacementPlan(plan: EventPlanEntry[]): string {
+  return plan
+    .map((entry) => {
+      if (entry.decision === "place") {
+        return (
+          theme.success("✓ ") +
+          entry.event +
+          theme.muted(
+            ` — ${entry.file ?? "unknown file"} @ ${entry.anchor ?? "unknown anchor"}`,
+          )
+        );
+      }
+      const reason = entry.reason || "No reason provided.";
+      const line = `${entry.decision === "skip" ? "○" : "?"} ${entry.event} — ${reason}`;
+      return entry.decision === "skip" ? theme.muted(line) : theme.warn(line);
+    })
     .join("\n");
+}
+
+function renderEventOutcomeLines(
+  outcomes: AgentEventOutcome[],
+  wiredMap: Map<string, string>,
+): string {
+  const maxLines = 40;
+  const visibleCount = outcomes.length > maxLines ? maxLines - 1 : outcomes.length;
+  const lines = outcomes.slice(0, visibleCount).map((outcome) => {
+    if (outcome.outcome === "wired") {
+      const file = wiredMap.get(outcome.event);
+      return theme.success("✓ ") + outcome.event + (file ? theme.muted(` — ${file}`) : "");
+    }
+    return theme.muted(
+      `○ ${outcome.event} — ${outcome.reason || "No track() call was detected."}`,
+    );
+  });
+  const remainder = outcomes.length - visibleCount;
+  if (remainder > 0) lines.push(theme.muted(`… ${remainder} more events`));
+  return lines.join("\n");
+}
+
+function shortPhaseLabel(phase: string): string {
+  switch (phase) {
+    case "Mapping your codebase":
+      return "map";
+    case "Installing the SDK & wiring identify()":
+      return "core";
+    case "Planning event placements":
+      return "plan";
+    case "Instrumenting planned events":
+    case "Instrumenting your events":
+      return "wire";
+    case "Reconciling missed events":
+      return "reconcile";
+    case "Reviewing & correcting placements":
+      return "review";
+    default:
+      return phase;
+  }
 }
 
 export function summarizeManifest(m: {
