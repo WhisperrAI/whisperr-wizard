@@ -27,6 +27,8 @@ export interface AgentRunOutcome {
   summary: string;
   costUsd: number;
   durationMs: number;
+  /** Wall-clock time spent in each agent pass, in execution order. */
+  phaseTimings: Array<{ phase: string; ms: number }>;
   /** Core (install + identify) landed. The bar for "the integration works". */
   coreOk: boolean;
   /** Event instrumentation completed without hitting the step limit. */
@@ -64,8 +66,9 @@ export async function runIntegrationAgent(opts: {
   playbook: Playbook;
   manifest: IntegrationManifest;
   progress?: AgentProgress;
+  onPlanReady?: (plan: EventPlanEntry[]) => Promise<EventPlanEntry[] | null>;
 }): Promise<AgentRunOutcome> {
-  const { repoPath, config, session, playbook, manifest, progress } = opts;
+  const { repoPath, config, session, playbook, manifest, progress, onPlanReady } = opts;
 
   applyModelAuthEnv(config, session);
   const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt].join("\n\n");
@@ -75,14 +78,14 @@ export async function runIntegrationAgent(opts: {
   const summaries: string[] = [];
   let repoMap = "";
   let eventOutcomes: AgentEventOutcome[] = [];
+  const phaseTimings: Array<{ phase: string; ms: number }> = [];
 
   const BUDGET_FLOOR = 0.25;
 
   // ---- Pre-pass: read-only repository map ----
   if (config.budgetUsd - costUsd > BUDGET_FLOOR) {
-    progress?.onPhase?.("Mapping your codebase");
     try {
-      const map = await runPass({
+      const map = await runTimedPass("Mapping your codebase", {
         prompt: renderRepoMapPrompt(repoPath),
         systemPrompt,
         repoPath,
@@ -92,7 +95,7 @@ export async function runIntegrationAgent(opts: {
         budgetUsd: Math.min(config.budgetUsd - costUsd, config.budgetUsd * 0.15),
         allowedTools: READ_ONLY_TOOLS,
         progress,
-      });
+      }, phaseTimings);
       costUsd += map.costUsd;
       repoMap = sliceRepoMap(map.summary);
     } catch (err) {
@@ -102,7 +105,6 @@ export async function runIntegrationAgent(opts: {
   }
 
   // ---- Phase 1: core (install + initialize + identify) ----
-  progress?.onPhase?.("Installing the SDK & wiring identify()");
   const corePrompt = [
     `Integrate the Whisperr ${playbook.target.displayName} SDK — CORE SETUP ONLY.`,
     `Project root: ${repoPath}`,
@@ -133,7 +135,7 @@ export async function runIntegrationAgent(opts: {
     "----- END -----",
   ].join("\n");
 
-  const core = await runPass({
+  const core = await runTimedPass("Installing the SDK & wiring identify()", {
     prompt: corePrompt,
     systemPrompt,
     repoPath,
@@ -142,7 +144,7 @@ export async function runIntegrationAgent(opts: {
     maxTurns: 50,
     budgetUsd: config.budgetUsd - costUsd,
     progress,
-  });
+  }, phaseTimings);
   costUsd += core.costUsd;
   if (core.summary) summaries.push(`Core setup:\n${core.summary}`);
 
@@ -162,8 +164,7 @@ export async function runIntegrationAgent(opts: {
         "Re-run with a higher WHISPERR_WIZARD_BUDGET_USD to instrument events.",
     );
   } else if (manifest.events.length > 0) {
-    progress?.onPhase?.("Planning event placements");
-    const planPass = await runPass({
+    const planPass = await runTimedPass("Planning event placements", {
       prompt: renderEventPlanPrompt(repoPath, playbook, manifest, repoMap),
       systemPrompt,
       repoPath,
@@ -173,7 +174,7 @@ export async function runIntegrationAgent(opts: {
       budgetUsd: config.budgetUsd - costUsd,
       allowedTools: READ_ONLY_TOOLS,
       progress,
-    });
+    }, phaseTimings);
     costUsd += planPass.costUsd;
     const plan = parseEventPlan(planPass.summary);
 
@@ -189,20 +190,24 @@ export async function runIntegrationAgent(opts: {
         repoMap,
         budgetUsd: config.budgetUsd - costUsd,
         progress,
+        phaseTimings,
       });
       costUsd += direct.pass.costUsd;
       eventsComplete = !direct.pass.maxedOut;
       eventOutcomes = direct.eventOutcomes;
       if (direct.pass.summary) summaries.push(`Events:\n${direct.pass.summary}`);
     } else {
-      const scopedPlan = planForManifest(plan, manifest);
+      let scopedPlan = planForManifest(plan, manifest);
+      const reviewedPlan = await onPlanReady?.(scopedPlan);
+      if (reviewedPlan !== undefined && reviewedPlan !== null) {
+        scopedPlan = planForManifest(reviewedPlan, manifest);
+      }
       const placeEntries = scopedPlan.filter((entry) => entry.decision === "place");
       const unsureEntries = scopedPlan.filter((entry) => entry.decision === "unsure");
 
       let wire: PassResult | undefined;
       if (placeEntries.length && config.budgetUsd - costUsd > BUDGET_FLOOR) {
-        progress?.onPhase?.("Instrumenting planned events");
-        wire = await runPass({
+        wire = await runTimedPass("Instrumenting planned events", {
           prompt: renderEventWirePrompt(repoPath, playbook, repoMap, placeEntries),
           systemPrompt,
           repoPath,
@@ -211,7 +216,7 @@ export async function runIntegrationAgent(opts: {
           maxTurns: config.maxTurns,
           budgetUsd: config.budgetUsd - costUsd,
           progress,
-        });
+        }, phaseTimings);
         costUsd += wire.costUsd;
         if (wire.summary) summaries.push(`Events:\n${wire.summary}`);
       } else if (!placeEntries.length) {
@@ -223,8 +228,7 @@ export async function runIntegrationAgent(opts: {
       const followUpEntries = uniquePlanEntries([...missedPlaceEntries, ...unsureEntries]);
       let followUp: PassResult | undefined;
       if (followUpEntries.length && config.budgetUsd - costUsd > BUDGET_FLOOR) {
-        progress?.onPhase?.("Reconciling missed events");
-        followUp = await runPass({
+        followUp = await runTimedPass("Reconciling missed events", {
           prompt: renderEventReconcilePrompt(repoPath, playbook, repoMap, followUpEntries),
           systemPrompt,
           repoPath,
@@ -233,7 +237,7 @@ export async function runIntegrationAgent(opts: {
           maxTurns: 15,
           budgetUsd: config.budgetUsd - costUsd,
           progress,
-        });
+        }, phaseTimings);
         costUsd += followUp.costUsd;
         if (followUp.summary) summaries.push(`Event reconciliation:\n${followUp.summary}`);
         wired = await scanManifestEvents(repoPath, manifest);
@@ -252,7 +256,6 @@ export async function runIntegrationAgent(opts: {
   // with fresh eyes on `git diff` far cheaper than a human can. Runs whenever
   // the core landed (so identify() is reviewed even with no events).
   if (core.ok && config.budgetUsd - costUsd > BUDGET_FLOOR) {
-    progress?.onPhase?.("Reviewing & correcting placements");
     const reviewPrompt = [
       `You wired the Whisperr ${playbook.target.displayName} SDK into this repo.`,
       "Now AUDIT YOUR OWN WORK and fix mistakes before finishing.",
@@ -282,7 +285,7 @@ export async function runIntegrationAgent(opts: {
       "corrections needed.'), plus one line on what you proposed, if anything.",
     ].join("\n");
 
-    const review = await runPass({
+    const review = await runTimedPass("Reviewing & correcting placements", {
       prompt: reviewPrompt,
       systemPrompt,
       repoPath,
@@ -291,7 +294,7 @@ export async function runIntegrationAgent(opts: {
       maxTurns: 40,
       budgetUsd: config.budgetUsd - costUsd,
       progress,
-    });
+    }, phaseTimings);
     costUsd += review.costUsd;
     if (review.summary) summaries.push(`Review:\n${review.summary}`);
     if (manifest.events.length) {
@@ -307,6 +310,7 @@ export async function runIntegrationAgent(opts: {
     summary: summaries.join("\n\n"),
     costUsd,
     durationMs: Date.now() - started,
+    phaseTimings,
     coreOk: core.ok,
     eventsComplete,
     eventOutcomes,
@@ -649,10 +653,19 @@ async function runDirectEventsPass(opts: {
   repoMap: string;
   budgetUsd: number;
   progress?: AgentProgress;
+  phaseTimings: Array<{ phase: string; ms: number }>;
 }): Promise<{ pass: PassResult; eventOutcomes: AgentEventOutcome[] }> {
-  const { repoPath, config, systemPrompt, playbook, manifest, repoMap, budgetUsd, progress } =
-    opts;
-  progress?.onPhase?.("Instrumenting your events");
+  const {
+    repoPath,
+    config,
+    systemPrompt,
+    playbook,
+    manifest,
+    repoMap,
+    budgetUsd,
+    progress,
+    phaseTimings,
+  } = opts;
   const eventsPrompt = [
     `The Whisperr ${playbook.target.displayName} SDK is already installed and`,
     "initialized, and identify() is wired. Now instrument the product events",
@@ -672,7 +685,7 @@ async function runDirectEventsPass(opts: {
     "----- END -----",
   ].join("\n");
 
-  const pass = await runPass({
+  const pass = await runTimedPass("Instrumenting your events", {
     prompt: eventsPrompt,
     systemPrompt,
     repoPath,
@@ -681,7 +694,7 @@ async function runDirectEventsPass(opts: {
     maxTurns: config.maxTurns,
     budgetUsd,
     progress,
-  });
+  }, phaseTimings);
   const wired = await scanManifestEvents(repoPath, manifest);
   return {
     pass,
@@ -817,13 +830,7 @@ interface PassResult {
   maxedOut: boolean;
 }
 
-/** A thrown error that's really just a turn/budget stop, not a genuine failure. */
-function isLimitStop(err: unknown): boolean {
-  const msg = (err as Error)?.message ?? "";
-  return /max(imum)?[\s_-]*(turn|budget)|budget.*exceeded|number of turns/i.test(msg);
-}
-
-async function runPass(opts: {
+interface RunPassOptions {
   prompt: string;
   systemPrompt: string;
   repoPath: string;
@@ -834,7 +841,29 @@ async function runPass(opts: {
   budgetUsd?: number;
   allowedTools?: readonly string[];
   progress?: AgentProgress;
-}): Promise<PassResult> {
+}
+
+async function runTimedPass(
+  phase: string,
+  opts: RunPassOptions,
+  phaseTimings: Array<{ phase: string; ms: number }>,
+): Promise<PassResult> {
+  opts.progress?.onPhase?.(phase);
+  const started = Date.now();
+  try {
+    return await runPass(opts);
+  } finally {
+    phaseTimings.push({ phase, ms: Date.now() - started });
+  }
+}
+
+/** A thrown error that's really just a turn/budget stop, not a genuine failure. */
+function isLimitStop(err: unknown): boolean {
+  const msg = (err as Error)?.message ?? "";
+  return /max(imum)?[\s_-]*(turn|budget)|budget.*exceeded|number of turns/i.test(msg);
+}
+
+async function runPass(opts: RunPassOptions): Promise<PassResult> {
   const {
     prompt,
     systemPrompt,
