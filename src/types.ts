@@ -126,6 +126,13 @@ export interface IntegrationManifest {
   interventions?: Array<{ code: string; label?: string }>;
   /** SDK ids the backend knows about, for cross-checking detection. */
   supportedTargets?: string[];
+  /** Optional universe-level counts used for clearer terminal summaries. */
+  universeSummary?: {
+    total: number;
+    wireableHere: number;
+    derived: number;
+    otherSurface: number;
+  };
 }
 
 /**
@@ -227,6 +234,8 @@ export interface WizardConfig {
   llmBaseUrl: string;
   /** Model id for the coding agent. */
   model: string;
+  /** Model id for planning/review passes that need deeper reasoning. */
+  plannerModel: string;
   /**
    * Reasoning effort for the coding agent (pairs with adaptive thinking).
    * Default "high" — the sweet spot for agentic, tool-heavy SDK wiring on
