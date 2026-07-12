@@ -27,6 +27,18 @@ export type PostRunReportResult =
   | { ok: true }
   | { ok: false; status?: number; detail?: string };
 
+export function scrubSummary(text: string): string {
+  return scrubTerminalControls(text)
+    .replace(/sk-ant-[A-Za-z0-9_-]+/g, "[redacted]")
+    .replace(/sk-[A-Za-z0-9]{16,}/g, "[redacted]")
+    .replace(/AKIA[0-9A-Z]{16}/g, "[redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/g, "[redacted]")
+    .replace(
+      /\b(ANTHROPIC_(?:AUTH_TOKEN|API_KEY))\s*=\s*["']?[^"'\s]+["']?/gi,
+      "$1=[redacted]",
+    );
+}
+
 /**
  * Post the run report to whisperr-go (`POST /wizard/report`) so the coverage
  * ledger knows what this surface now handles. Best-effort — a failed report
@@ -73,4 +85,16 @@ function errorMessage(err: unknown): string {
 function detailSlice(detail: string): string | undefined {
   const sliced = detail.slice(0, 200).trim();
   return sliced || undefined;
+}
+
+function scrubTerminalControls(value: string): string {
+  return value
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, " ")
+    .replace(/ {2,}/g, " ")
+    .trim();
 }

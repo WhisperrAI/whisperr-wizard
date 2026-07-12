@@ -1,6 +1,6 @@
 {
   "name": "@whisperr/wizard",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Whisperr Wizard — one command to integrate the Whisperr SDK into your app. Authenticates with your onboarded account and uses an AI coding agent to wire up identify() and your business events automatically.",
   "repository": {
     "type": "git",

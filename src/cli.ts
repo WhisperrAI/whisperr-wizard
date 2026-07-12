@@ -30,7 +30,7 @@ import {
 } from "./core/git.js";
 import { pollFirstEvent } from "./core/verify.js";
 import { runVerifyCommand, verdictToVerified } from "./core/postflight.js";
-import { postRunReport, type ReportEvent } from "./core/report.js";
+import { postRunReport, scrubSummary, type ReportEvent } from "./core/report.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
 import type {
@@ -273,9 +273,7 @@ export async function run(options: RunOptions): Promise<number> {
   if (files.length) {
     p.note(files.map((f) => theme.muted("• ") + f).join("\n"), "Files changed");
   }
-  if (outcome.summary.trim()) {
-    p.log.message(outcome.summary.trim());
-  }
+  logAgentSummary(outcome.summary);
   // If the core (install + identify) didn't land, the integration isn't
   // trustworthy — offer to undo rather than leaving broken/partial edits.
   if (!outcome.coreOk) {
@@ -338,7 +336,7 @@ export async function run(options: RunOptions): Promise<number> {
             outcome.summary = [outcome.summary, `Repair:\n${repair.summary}`]
               .filter(Boolean)
               .join("\n\n");
-            p.log.message(repair.summary.trim());
+            logAgentSummary(repair.summary);
           }
           repairSpin.stop(theme.success("Repair pass finished"));
         } catch (err) {
@@ -486,7 +484,7 @@ export async function run(options: RunOptions): Promise<number> {
     verified,
     cost_usd: outcome.costUsd,
     duration_ms: outcome.durationMs,
-    summary: outcome.summary.slice(0, 4000),
+    summary: scrubSummary(outcome.summary).slice(0, 4000),
     events: reportEvents,
   });
   if (!reportResult.ok) {
@@ -763,7 +761,7 @@ async function offerOpportunities(opts: {
     });
     if (pass.ran) {
       spin.stop(theme.success("New events instrumented"));
-      if (pass.summary.trim()) p.log.message(pass.summary.trim());
+      logAgentSummary(pass.summary);
     } else {
       spin.stop(
         theme.warn("Skipped instrumenting the new events") +
@@ -967,6 +965,11 @@ function renderEventOutcomeLines(
   const remainder = outcomes.length - visibleCount;
   if (remainder > 0) lines.push(theme.muted(`… ${remainder} more events`));
   return lines.join("\n");
+}
+
+function logAgentSummary(summary: string): void {
+  const cleaned = scrubSummary(summary).trim();
+  if (cleaned) p.log.message(cleaned);
 }
 
 function shortPhaseLabel(phase: string): string {

@@ -14,6 +14,9 @@ export const SECRET_MATERIAL_DENIAL =
 const WRITE_OUTSIDE_REPO_DENIAL =
   "blocked: writes must stay inside the target repository";
 
+export const SENSITIVE_WRITE_DENIAL =
+  "blocked: refusing to write CI/git configuration";
+
 const BASH_ALLOWLIST_DENIAL =
   "blocked: command is outside the Bash allowlist - use package install/add commands, mkdir, or git status/diff/log only";
 
@@ -23,6 +26,14 @@ const CHAINED_COMMAND_DENIAL =
 const ENV_EXAMPLES = new Set([".env.example", ".env.sample", ".env.template"]);
 const SECRET_DIRECTORIES = new Set([".aws", ".ssh", ".gnupg"]);
 const SECRET_EXACT_FILES = new Set([".netrc", ".npmrc", ".pypirc"]);
+const SENSITIVE_WRITE_DIRECTORIES = new Set([".git", ".circleci", ".buildkite"]);
+const SENSITIVE_WRITE_EXACT_FILES = new Set([
+  ".gitlab-ci.yml",
+  "azure-pipelines.yml",
+  "bitbucket-pipelines.yml",
+  ".drone.yml",
+  "jenkinsfile",
+]);
 const SECRET_SUFFIXES = [
   ".pem",
   ".key",
@@ -136,6 +147,9 @@ function evaluateWrite(
   if (!isPathInsideRepo(pathValue, context.repoPath)) {
     return { behavior: "deny", message: WRITE_OUTSIDE_REPO_DENIAL };
   }
+  if (isSensitiveWritePath(pathValue, context.repoPath)) {
+    return { behavior: "deny", message: SENSITIVE_WRITE_DENIAL };
+  }
   return { behavior: "allow" };
 }
 
@@ -244,6 +258,26 @@ function firstString(input: Record<string, unknown>, keys: string[]): string | u
 
 function normalizePathLike(value: string): string {
   return stripOuterQuotes(value.trim()).replace(/\\/g, "/");
+}
+
+function repoRelativePath(pathValue: string, repoPath: string): string {
+  const repoRoot = resolve(repoPath);
+  const candidate = isAbsolute(pathValue)
+    ? resolve(pathValue)
+    : resolve(repoRoot, pathValue);
+  return normalizePathLike(relative(repoRoot, candidate));
+}
+
+function isSensitiveWritePath(pathValue: string, repoPath: string): boolean {
+  const parts = repoRelativePath(pathValue, repoPath)
+    .split("/")
+    .map((part) => stripOuterQuotes(part.trim().toLowerCase()))
+    .filter(Boolean);
+  const [first, second] = parts;
+  if (!first) return false;
+  if (SENSITIVE_WRITE_DIRECTORIES.has(first)) return true;
+  if (first === ".github" && second === "workflows") return true;
+  return parts.length === 1 && SENSITIVE_WRITE_EXACT_FILES.has(first);
 }
 
 function stripOuterQuotes(value: string): string {

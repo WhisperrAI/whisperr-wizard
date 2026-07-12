@@ -1,4 +1,8 @@
-import { query, type CanUseTool } from "@anthropic-ai/claude-agent-sdk";
+import {
+  query,
+  type CanUseTool,
+  type HookCallbackMatcher,
+} from "@anthropic-ai/claude-agent-sdk";
 import type {
   IntegrationManifest,
   Playbook,
@@ -899,6 +903,7 @@ async function runPass(opts: RunPassOptions): Promise<PassResult> {
       thinking: { type: "adaptive" },
       effort,
       tools: [...allowedTools],
+      hooks: buildToolPolicyHooks(repoPath),
       canUseTool: createToolPermissionCallback(repoPath),
       maxTurns,
       // Native SDK hard cost cap. Stops this pass with an `error_max_budget_usd`
@@ -943,7 +948,35 @@ async function runPass(opts: RunPassOptions): Promise<PassResult> {
   return { summary, costUsd, ok, maxedOut };
 }
 
-function createToolPermissionCallback(repoPath: string): CanUseTool {
+export function buildToolPolicyHooks(repoPath: string): { PreToolUse: HookCallbackMatcher[] } {
+  return {
+    PreToolUse: [
+      {
+        hooks: [
+          async (input) => {
+            if (input.hook_event_name !== "PreToolUse") return { continue: true };
+            const decision = evaluateToolUse(input.tool_name, toolInputRecord(input.tool_input), {
+              repoPath,
+            });
+            if (decision.behavior === "allow") {
+              // Keep this as a bare continue so canUseTool still runs on SDK ask-path calls.
+              return { continue: true };
+            }
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse",
+                permissionDecision: "deny",
+                permissionDecisionReason: decision.message,
+              },
+            };
+          },
+        ],
+      },
+    ],
+  };
+}
+
+export function createToolPermissionCallback(repoPath: string): CanUseTool {
   return async (toolName, input, options) => {
     const decision = evaluateToolUse(toolName, input, { repoPath });
     return decision.behavior === "allow"
@@ -954,6 +987,13 @@ function createToolPermissionCallback(repoPath: string): CanUseTool {
           toolUseID: options.toolUseID,
         };
   };
+}
+
+function toolInputRecord(input: unknown): Record<string, unknown> {
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    return input as Record<string, unknown>;
+  }
+  return {};
 }
 
 /** Configure where the Agent SDK sends model calls (gateway or direct key). */
