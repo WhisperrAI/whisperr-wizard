@@ -19,9 +19,11 @@ import { theme } from "../ui/theme.js";
  * "Approve this device" click that also binds the session to their app.
  */
 
-export interface AuthHandle {
-  /** Begin the flow; returns the URL to open + a poller. */
-  start(): Promise<{ verificationUrl: string; userCode: string; poll: () => Promise<WizardSession> }>;
+export interface DeviceAuthHandle {
+  verificationUrl: string;
+  verificationUrlComplete?: string;
+  userCode: string;
+  poll(): Promise<WizardSession>;
 }
 
 interface AuthorizeResponse {
@@ -42,50 +44,68 @@ interface TokenResponse {
 export async function authenticate(config: WizardConfig): Promise<WizardSession> {
   if (config.offline) return offlineSession();
 
+  const auth = await startDeviceAuth(config);
+  const url = auth.verificationUrlComplete ?? auth.verificationUrl;
+
+  // Preserve the best-effort browser launch for callers that use this helper
+  // directly. The CLI uses startDeviceAuth so it can print fallback details
+  // before attempting to open the page.
+  try {
+    await open(url);
+  } catch {
+    /* headless / no browser */
+  }
+
+  return auth.poll();
+}
+
+export async function startDeviceAuth(
+  config: WizardConfig,
+): Promise<DeviceAuthHandle> {
   const authorize = await fetchJson<AuthorizeResponse>(
     `${config.apiBaseUrl}/wizard/device/authorize`,
     { method: "POST", body: JSON.stringify({ client: "whisperr-wizard" }) },
   );
 
-  const url = authorize.verification_uri_complete ?? authorize.verification_uri;
   const intervalMs = (authorize.interval ?? 5) * 1000;
-  const deadline =
-    Date.now() + (authorize.expires_in ?? 600) * 1000;
+  const deadline = Date.now() + (authorize.expires_in ?? 600) * 1000;
 
-  // Open the browser (best-effort; print the URL regardless).
-  try {
-    await open(url);
-  } catch {
-    /* headless / no browser — the printed URL covers it */
-  }
-
-  // Poll for approval.
-  let wait = intervalMs;
-  while (Date.now() < deadline) {
-    await sleep(wait);
-    const res = await fetch(
-      `${config.apiBaseUrl}/wizard/device/token`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ device_code: authorize.device_code }),
-      },
-    );
-    if (res.ok) {
-      const tok = (await res.json()) as TokenResponse;
-      return { token: tok.token, appId: tok.app_id, expiresAt: tok.expires_at };
-    }
-    if (res.status === 429) {
-      wait += 2000; // slow_down
-      continue;
-    }
-    if (res.status === 428) continue; // authorization_pending
-    // 403 deny / 410 expired / anything else: stop.
-    throw new Error(
-      `Authorization failed (${res.status}). Run the wizard again to retry.`,
-    );
-  }
-  throw new Error("Authorization timed out. Run the wizard again.");
+  return {
+    verificationUrl: authorize.verification_uri,
+    verificationUrlComplete: authorize.verification_uri_complete,
+    userCode: authorize.user_code,
+    async poll(): Promise<WizardSession> {
+      // Poll for approval.
+      let wait = intervalMs;
+      while (Date.now() < deadline) {
+        await sleep(wait);
+        const res = await fetch(
+          `${config.apiBaseUrl}/wizard/device/token`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ device_code: authorize.device_code }),
+          },
+        );
+        if (res.ok) {
+          const tok = (await res.json()) as TokenResponse;
+          return { token: tok.token, appId: tok.app_id, expiresAt: tok.expires_at };
+        }
+        if (res.status === 429) {
+          wait += 2000; // slow_down
+          continue;
+        }
+        if (res.status === 428) continue; // authorization_pending
+        // 403 deny / 410 expired / anything else: stop.
+        throw new Error(
+          `Authorization failed (${res.status}). Re-run the wizard and use the printed link and code to try again.`,
+        );
+      }
+      throw new Error(
+        "Authorization timed out. Re-run the wizard and use the printed link and code to try again.",
+      );
+    },
+  };
 }
 
 /** Used in --offline mode: no backend, fixed dev app. */
