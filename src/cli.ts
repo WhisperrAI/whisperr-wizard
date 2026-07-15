@@ -1,10 +1,11 @@
 import { resolve } from "node:path";
 import * as p from "@clack/prompts";
+import open from "open";
 import type { CliFlags } from "./core/config.js";
 import { resolveConfig } from "./core/config.js";
 import { detectStack } from "./core/detect.js";
 import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
-import { authenticate } from "./core/auth.js";
+import { authenticate, startDeviceAuth } from "./core/auth.js";
 import { fetchManifest } from "./core/manifest.js";
 import {
   runIntegrationAgent,
@@ -873,10 +874,28 @@ async function withBrowserAuth(config: ReturnType<typeof resolveConfig>) {
     theme.bright("Authenticate") +
       theme.muted(" — opening your browser to approve this device…"),
   );
+  const auth = await startDeviceAuth(config);
+  p.note(
+    [
+      theme.bright(`Your code: ${auth.userCode}`),
+      `${theme.muted("Approval URL:")} ${auth.verificationUrl}`,
+      theme.muted(
+        "We tried to open your browser. If it didn't open, visit that link on any device and enter the code.",
+      ),
+    ].join("\n"),
+    theme.signal("Approve this device"),
+  );
+
+  try {
+    await open(auth.verificationUrlComplete ?? auth.verificationUrl);
+  } catch {
+    /* headless / no browser — the printed URL and code cover it */
+  }
+
   const spin = p.spinner();
   spin.start("Waiting for you to approve in the browser");
   try {
-    const session = await authenticate(config);
+    const session = await auth.poll();
     spin.stop(theme.success("Authenticated ✓"));
     return session;
   } catch (err) {
