@@ -5,6 +5,8 @@ import type {
   IntegrationManifest,
   OpportunityEvent,
   OpportunityIntervention,
+  StageResult,
+  SuggestionRecord,
   UniverseAdditionsResult,
   UniverseOpportunities,
   WizardConfig,
@@ -158,6 +160,108 @@ export async function submitAdditions(
   return (await res.json()) as UniverseAdditionsResult;
 }
 
+/**
+ * Stage confirmed opportunities for dashboard approval. A 404 means the
+ * backend predates suggestions, so the caller can use the legacy additions
+ * flow. Other failures remain visible because this is a user-approved write.
+ */
+export async function submitSuggestions(
+  config: WizardConfig,
+  session: WizardSession,
+  target: string,
+  repoFingerprint: string,
+  opportunities: UniverseOpportunities,
+): Promise<StageResult | null> {
+  const res = await fetch(`${config.apiBaseUrl}/wizard/universe/suggestions`, {
+    method: "POST",
+    signal: AbortSignal.timeout(SUBMIT_TIMEOUT_MS),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${session.token}`,
+    },
+    body: JSON.stringify({
+      target,
+      repoFingerprint,
+      events: opportunities.events,
+      interventions: opportunities.interventions,
+    }),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `Submitting universe suggestions failed (${res.status})${body ? `: ${body.slice(0, 300)}` : ""}`,
+    );
+  }
+  return (await res.json()) as StageResult;
+}
+
+/** Fetch suggestions as non-fatal run enrichment. */
+export async function fetchSuggestions(
+  config: WizardConfig,
+  session: WizardSession,
+  statuses: string[],
+): Promise<SuggestionRecord[]> {
+  if (config.offline) return [];
+  try {
+    const statusQuery = statuses.map(encodeURIComponent).join(",");
+    const url = `${config.apiBaseUrl}/wizard/universe/suggestions${statusQuery ? `?status=${statusQuery}` : ""}`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(SUBMIT_TIMEOUT_MS),
+      headers: { Authorization: `Bearer ${session.token}` },
+    });
+    if (!res.ok) return [];
+    const body: unknown = await res.json();
+    return Array.isArray(body) && body.every(isSuggestionRecord) ? body : [];
+  } catch {
+    return [];
+  }
+}
+
+function isSuggestionRecord(value: unknown): value is SuggestionRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.id === "string" &&
+    (record.kind === "event" || record.kind === "intervention") &&
+    typeof record.code === "string" &&
+    (record.status === "proposed" ||
+      record.status === "approved" ||
+      record.status === "rejected" ||
+      record.status === "integrated") &&
+    typeof record.payload === "object" &&
+    record.payload !== null
+  );
+}
+
+/** Mark one approved suggestion integrated without ever disrupting the run. */
+export async function markSuggestionIntegrated(
+  config: WizardConfig,
+  session: WizardSession,
+  id: string,
+  target: string,
+  repoFingerprint: string,
+): Promise<boolean> {
+  if (config.offline) return false;
+  try {
+    const res = await fetch(
+      `${config.apiBaseUrl}/wizard/universe/suggestions/${encodeURIComponent(id)}/integrated`,
+      {
+        method: "POST",
+        signal: AbortSignal.timeout(SUBMIT_TIMEOUT_MS),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.token}`,
+        },
+        body: JSON.stringify({ target, repoFingerprint }),
+      },
+    );
+    return res.status === 200;
+  } catch {
+    return false;
+  }
+}
+
 // --- coercion helpers (tolerant of LLM output noise) ---
 
 function asArray(value: unknown): unknown[] {
@@ -234,6 +338,7 @@ function coerceEvent(entry: unknown): OpportunityEvent | null {
     description: asString(e.description),
     ...(side ? { side } : {}),
     rationale: asString(e.rationale),
+    expectedEffect: asString(e.expectedEffect),
     confidence: asConfidence(e.confidence),
     ...(properties.length ? { properties } : {}),
     ...(links.length ? { links } : {}),
@@ -261,6 +366,7 @@ function coerceIntervention(entry: unknown): OpportunityIntervention | null {
     label: asString(i.label),
     description: asString(i.description),
     rationale: asString(i.rationale),
+    expectedEffect: asString(i.expectedEffect),
     confidence: asConfidence(i.confidence),
     ...(links.length ? { links } : {}),
   };
