@@ -5,7 +5,7 @@ import type { CliFlags } from "./core/config.js";
 import { resolveConfig } from "./core/config.js";
 import { detectStack } from "./core/detect.js";
 import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
-import { authenticate, startDeviceAuth } from "./core/auth.js";
+import { authenticate, startDeviceAuth, startSessionKeepalive } from "./core/auth.js";
 import { fetchManifest } from "./core/manifest.js";
 import {
   runIntegrationAgent,
@@ -108,6 +108,10 @@ export async function run(options: RunOptions): Promise<number> {
     p.cancel(theme.alert((err as Error).message));
     return 1;
   }
+  // Sessions slide server-side per authenticated call; this covers the gaps
+  // where the run sits on an interactive prompt with no traffic. Unref'd, so
+  // it never outlives the process.
+  startSessionKeepalive(config, session);
 
   // 3. Pull the integration manifest (events/interventions/key), telling the
   //    backend which surface this is so it can mark what's already covered.

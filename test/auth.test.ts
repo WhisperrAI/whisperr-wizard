@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { authenticate, startDeviceAuth } from "../src/core/auth.js";
+import { authenticate, startDeviceAuth, startSessionKeepalive } from "../src/core/auth.js";
 import type { WizardConfig } from "../src/types.js";
 
 const config = {
@@ -103,5 +103,55 @@ test("authenticate returns the offline session without fetching", async () => {
     assert.equal(fetched, false);
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+test("startSessionKeepalive pings on the interval and stops cleanly", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const stop = startSessionKeepalive(
+      config,
+      { token: "tok", appId: "app_1", expiresAt: 0 },
+      1_000,
+    );
+    t.mock.timers.tick(3_000);
+    assert.equal(calls, 3);
+    stop();
+    t.mock.timers.tick(3_000);
+    assert.equal(calls, 3, "no pings after stop()");
+  } finally {
+    globalThis.fetch = realFetch;
+    t.mock.timers.reset();
+  }
+});
+
+test("startSessionKeepalive is a no-op offline", (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response("{}", { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    const stop = startSessionKeepalive(
+      { ...config, offline: true } as typeof config,
+      { token: "tok", appId: "app_1", expiresAt: 0 },
+      1_000,
+    );
+    t.mock.timers.tick(5_000);
+    assert.equal(calls, 0);
+    stop();
+  } finally {
+    globalThis.fetch = realFetch;
+    t.mock.timers.reset();
   }
 });
