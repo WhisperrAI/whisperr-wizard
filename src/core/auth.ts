@@ -148,8 +148,18 @@ async function fetchJson<T>(url: string, init: RequestInit): Promise<T> {
     headers: { "content-type": "application/json", ...(init.headers ?? {}) },
   });
   if (!res.ok) {
+    const body = (await res.text().catch(() => "")).slice(0, 200).trim();
+    // A 403 here is almost never the Whisperr API itself: device authorize is
+    // public. It's edge/bot protection rejecting this machine's network —
+    // typical on CI runners, VPSes, and devcontainers. Say so, instead of
+    // leaving the user staring at a bare status code.
+    const hint =
+      res.status === 403
+        ? "\nThis network looks blocked by edge protection (common on CI/VPS/datacenter IPs). Try another network, or contact support@whisperr.net with this message."
+        : "";
     throw new Error(
-      `${theme.alert("Request failed")}: ${init.method ?? "GET"} ${url} -> ${res.status}`,
+      `${theme.alert("Request failed")}: ${init.method ?? "GET"} ${url} -> ${res.status}` +
+        `${body ? ` — ${body}` : ""}${hint}`,
     );
   }
   return (await res.json()) as T;
