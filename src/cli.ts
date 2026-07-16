@@ -39,6 +39,7 @@ import {
 import { pollFirstEvent } from "./core/verify.js";
 import { runVerifyCommand, verdictToVerified } from "./core/postflight.js";
 import { postRunReport, scrubSummary, type ReportEvent } from "./core/report.js";
+import { buildGapReport, renderGapReport } from "./core/gapreport.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
 import type {
@@ -569,6 +570,23 @@ export async function run(options: RunOptions): Promise<number> {
   const eventLines = renderEventOutcomeLines(outcome.eventOutcomes, wiredMap);
   if (eventLines) {
     p.note(eventLines, "Events");
+  }
+  const eventOutcomeByType = new Map(
+    outcome.eventOutcomes.map((event) => [event.event, event]),
+  );
+  const gapReport = buildGapReport({
+    manifest,
+    events: reportEvents.map((event) => ({
+      eventType: event.event_type,
+      status: event.status,
+      reason: eventOutcomeByType.get(event.event_type)?.reason,
+    })),
+  });
+  if (gapReport.hasContent) {
+    p.note(
+      renderGapReport(gapReport, theme),
+      theme.signal("What you could be doing"),
+    );
   }
   const eventDenominator = manifest.universeSummary?.wireableHere ?? eventTypesToScan.length;
   const eventStatsLabel = manifest.universeSummary ? "events wired here" : "events wired";
