@@ -194,6 +194,9 @@ export interface StageResult {
   duplicates: number;
   invalid: number;
   outcomes: StageOutcome[];
+  /** Dashboard approvals-queue link, server-derived; print it so proposals
+   *  never rot unseen in the queue. Absent on older backends. */
+  approvalsUrl?: string;
 }
 
 /** One proposal moving through dashboard approval and integration. */

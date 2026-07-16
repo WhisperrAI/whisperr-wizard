@@ -787,9 +787,12 @@ async function offerOpportunities(opts: {
       ),
     );
     p.note(lines.join("\n"), theme.signal("Suggestions submitted"));
+    const where = stageResult.approvalsUrl
+      ? `approve at ${theme.bright(stageResult.approvalsUrl)}`
+      : "approve them in your Whisperr dashboard";
     p.log.info(
       theme.muted(
-        "Approve them in your Whisperr dashboard — the next wizard run wires whatever you approve.",
+        `${stageResult.staged} proposal${stageResult.staged === 1 ? "" : "s"} sent — ${where}. The next wizard run wires whatever you approve.`,
       ),
     );
     return NO_ADDITIONS;
