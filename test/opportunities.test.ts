@@ -8,9 +8,12 @@ import { promisify } from "node:util";
 import {
   OPPORTUNITIES_FILE,
   collectOpportunities,
+  fetchSuggestions,
+  markSuggestionIntegrated,
   normalizeCode,
   sanitizeOpportunities,
   submitAdditions,
+  submitSuggestions,
 } from "../src/core/opportunities.js";
 import {
   takeCheckpoint,
@@ -156,9 +159,15 @@ test("sanitizeOpportunities strips ANSI escapes and control chars from LLM strin
           code: "trial_expired",
           description: "\x1b[32m✓ safe, already approved\x1b[0m",
           rationale: "line one\nline two\x07\x1b]0;spoofed title\x07 end",
+          expectedEffect: "\x1b[36mFewer\nfailed renewals\x1b[0m",
         },
       ],
-      interventions: [],
+      interventions: [
+        {
+          code: "support_rescue",
+          expectedEffect: "\x1b]8;;https://spoofed.example\x07Faster\trecovery\x1b]8;;\x07",
+        },
+      ],
     },
     manifest,
   );
@@ -167,6 +176,8 @@ test("sanitizeOpportunities strips ANSI escapes and control chars from LLM strin
   // No escape bytes or newlines survive to the confirmation UI.
   assert.equal(ev.description, "✓ safe, already approved");
   assert.equal(ev.rationale, "line one line two end");
+  assert.equal(ev.expectedEffect, "Fewer failed renewals");
+  assert.equal(out.interventions[0]!.expectedEffect, "Faster recovery");
 });
 
 test("sanitizeOpportunities tolerates a completely malformed document", () => {
@@ -296,6 +307,160 @@ test("submitAdditions posts the whisperr-go contract and returns its result", as
       ],
       interventions: [],
     });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("submitSuggestions posts the staged-suggestions contract and returns its result", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    return new Response(
+      JSON.stringify({
+        staged: 2,
+        duplicates: 0,
+        invalid: 0,
+        outcomes: [
+          { kind: "event", code: "trial_expired", status: "staged" },
+          { kind: "intervention", code: "winback", status: "staged" },
+        ],
+      }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+
+  try {
+    const result = await submitSuggestions(config, session, "nextjs", "fp-1", {
+      events: [{ code: "trial_expired", expectedEffect: "More trial conversions" }],
+      interventions: [{ code: "winback", expectedEffect: "More recovered users" }],
+    });
+    assert.equal(result?.staged, 2);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.url, "https://api.whisperr.net/wizard/universe/suggestions");
+    assert.equal(calls[0]!.init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(calls[0]!.init?.body)), {
+      target: "nextjs",
+      repoFingerprint: "fp-1",
+      events: [{ code: "trial_expired", expectedEffect: "More trial conversions" }],
+      interventions: [{ code: "winback", expectedEffect: "More recovered users" }],
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("submitSuggestions returns null when the suggestions capability is absent", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 404 })) as typeof fetch;
+  try {
+    assert.equal(
+      await submitSuggestions(config, session, "nextjs", "fp-1", {
+        events: [{ code: "trial_expired" }],
+        interventions: [],
+      }),
+      null,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("submitSuggestions surfaces non-capability backend failures", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(JSON.stringify({ error: "internal" }), { status: 500 })) as typeof fetch;
+  try {
+    await assert.rejects(
+      submitSuggestions(config, session, "nextjs", "fp-1", {
+        events: [{ code: "trial_expired" }],
+        interventions: [],
+      }),
+      /500/,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("fetchSuggestions returns matching records from the requested statuses", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const realFetch = globalThis.fetch;
+  const records = [
+    {
+      id: "wus_1",
+      kind: "event" as const,
+      code: "trial_expired",
+      status: "approved" as const,
+      payload: { code: "trial_expired", expectedEffect: "More conversions" },
+    },
+  ];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    return new Response(JSON.stringify(records), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    assert.deepEqual(
+      await fetchSuggestions(config, session, ["proposed", "approved"]),
+      records,
+    );
+    assert.equal(
+      calls[0]!.url,
+      "https://api.whisperr.net/wizard/universe/suggestions?status=proposed,approved",
+    );
+    assert.deepEqual(calls[0]!.init?.headers, { Authorization: "Bearer wzs_test" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("fetchSuggestions returns an empty list on failure", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 500 })) as typeof fetch;
+  try {
+    assert.deepEqual(await fetchSuggestions(config, session, ["approved"]), []);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("markSuggestionIntegrated sends only surface identity and returns true on 200", async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    return new Response(JSON.stringify({ status: "integrated" }), { status: 200 });
+  }) as typeof fetch;
+
+  try {
+    assert.equal(
+      await markSuggestionIntegrated(config, session, "wus_1", "nextjs", "fp-1"),
+      true,
+    );
+    assert.equal(
+      calls[0]!.url,
+      "https://api.whisperr.net/wizard/universe/suggestions/wus_1/integrated",
+    );
+    assert.equal(calls[0]!.init?.method, "POST");
+    assert.deepEqual(JSON.parse(String(calls[0]!.init?.body)), {
+      target: "nextjs",
+      repoFingerprint: "fp-1",
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("markSuggestionIntegrated returns false on conflict", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(null, { status: 409 })) as typeof fetch;
+  try {
+    assert.equal(
+      await markSuggestionIntegrated(config, session, "wus_1", "nextjs", "fp-1"),
+      false,
+    );
   } finally {
     globalThis.fetch = realFetch;
   }

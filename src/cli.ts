@@ -14,7 +14,14 @@ import {
   type AgentEventOutcome,
   type EventPlanEntry,
 } from "./core/agent.js";
-import { collectOpportunities, submitAdditions } from "./core/opportunities.js";
+import {
+  collectOpportunities,
+  fetchSuggestions,
+  markSuggestionIntegrated,
+  normalizeCode,
+  submitAdditions,
+  submitSuggestions,
+} from "./core/opportunities.js";
 import {
   takeCheckpoint,
   changedFiles,
@@ -39,6 +46,7 @@ import type {
   IntegrationManifest,
   OpportunityEvent,
   Playbook,
+  StageResult,
   UniverseOpportunities,
   WizardConfig,
   WizardSession,
@@ -119,6 +127,12 @@ export async function run(options: RunOptions): Promise<number> {
   const manifest = await withSpinner("Loading your onboarding context", () =>
     fetchManifest(config, session, chosen.playbook.target.id, fingerprint),
   );
+  // Approval immediately merges suggestions into the manifest. Fetch the
+  // approved records in parallel with the run so the end-of-run bookkeeping
+  // only has to reconcile what this surface actually wired.
+  const approvedSuggestionsPromise = config.offline
+    ? null
+    : fetchSuggestions(config, session, ["approved"]);
   p.note(
     summarizeManifest(manifest),
     theme.signal(`Plan for ${manifest.appName ?? manifest.appId}`),
@@ -396,9 +410,9 @@ export async function run(options: RunOptions): Promise<number> {
   }
 
   // 6c. Universe opportunities: the agent may have proposed events /
-  //     interventions the onboarding plan misses. The user picks which to add;
-  //     whisperr-go appends them to the universe (dedupe is server-side), and
-  //     accepted events get instrumented in one bounded follow-up pass.
+  //     interventions the onboarding plan misses. The user picks which to send
+  //     for dashboard approval. Older backends retain their additions +
+  //     bounded follow-up instrumentation behavior through capability fallback.
   const { acceptedEvents, instrumentationSnapshot } = await offerOpportunities({
     repoPath,
     config,
@@ -502,6 +516,56 @@ export async function run(options: RunOptions): Promise<number> {
     );
   }
 
+  // Approved events are already part of the normal manifest/instrumentation
+  // flow. Reconcile only after final per-event outcomes are known; this is
+  // deliberately best-effort so bookkeeping can never fail an otherwise good
+  // integration run.
+  try {
+    const approvedSuggestions = await approvedSuggestionsPromise;
+    if (approvedSuggestions?.length) {
+      const integratedEventCodes = new Set(
+        reportEvents
+          .filter((event) => event.status === "wired")
+          .map((event) => normalizeCode(event.event_type)),
+      );
+      for (const event of manifest.events) {
+        if (event.coverage?.some((entry) => entry.sameSurface && entry.status === "wired")) {
+          integratedEventCodes.add(normalizeCode(event.eventType));
+        }
+      }
+
+      const toMark = approvedSuggestions.filter(
+        (suggestion) =>
+          suggestion.status === "approved" &&
+          (suggestion.kind === "intervention" ||
+            integratedEventCodes.has(normalizeCode(suggestion.code))),
+      );
+      const marked = (
+        await Promise.all(
+          toMark.map((suggestion) =>
+            markSuggestionIntegrated(
+              config,
+              session,
+              suggestion.id,
+              chosen.playbook.target.id,
+              fingerprint,
+            ),
+          ),
+        )
+      ).filter(Boolean).length;
+      if (marked > 0) {
+        p.log.info(
+          theme.muted(
+            `${marked} approved suggestion${marked === 1 ? "" : "s"} marked integrated.`,
+          ),
+        );
+      }
+    }
+  } catch {
+    // Enrichment only: fetch/mark helpers already swallow failures, and this
+    // guard also protects the run from unexpected response-shape issues.
+  }
+
   const eventLines = renderEventOutcomeLines(outcome.eventOutcomes, wiredMap);
   if (eventLines) {
     p.note(eventLines, "Events");
@@ -581,11 +645,10 @@ interface AdditionsOutcome {
 const NO_ADDITIONS: AdditionsOutcome = { acceptedEvents: [], instrumentationSnapshot: null };
 
 /**
- * Present the agent's universe opportunities, submit the confirmed ones to
- * whisperr-go, and instrument the events the backend actually applied.
- * Returns the accepted (applied) events plus a snapshot for undoing the
- * instrumentation edits. Never throws — opportunities are additive and must
- * not fail the run.
+ * Present the agent's universe opportunities and stage the confirmed ones for
+ * dashboard approval. A backend without suggestions falls through to the
+ * legacy additions + same-run instrumentation path. Never throws —
+ * opportunities are additive and must not fail the run.
  */
 async function offerOpportunities(opts: {
   repoPath: string;
@@ -599,7 +662,22 @@ async function offerOpportunities(opts: {
   remainingBudgetUsd: number;
   repoMap?: string;
 }): Promise<AdditionsOutcome> {
-  const { opportunities, manifest, config, session } = opts;
+  const { manifest, config, session } = opts;
+  const openSuggestions = await fetchSuggestions(config, session, ["proposed", "approved"]);
+  const openSuggestionKeys = new Set(
+    openSuggestions.map(
+      (suggestion) => `${suggestion.kind}:${normalizeCode(suggestion.code)}`,
+    ),
+  );
+  const opportunities: UniverseOpportunities = {
+    events: opts.opportunities.events.filter(
+      (event) => !openSuggestionKeys.has(`event:${normalizeCode(event.code)}`),
+    ),
+    interventions: opts.opportunities.interventions.filter(
+      (intervention) =>
+        !openSuggestionKeys.has(`intervention:${normalizeCode(intervention.code)}`),
+    ),
+  };
   const total = opportunities.events.length + opportunities.interventions.length;
   if (total === 0) return NO_ADDITIONS;
 
@@ -627,7 +705,7 @@ async function offerOpportunities(opts: {
   }
 
   const selection = await p.multiselect({
-    message: "Add these to your Whisperr universe? (new interventions start paused)",
+    message: "Send these to your dashboard for approval?",
     options: [
       ...opportunities.events.map((e) => ({
         value: `e:${e.code}`,
@@ -640,8 +718,8 @@ async function offerOpportunities(opts: {
         hint: i.description ?? i.rationale,
       })),
     ],
-    // Opt-in per item: nothing is pre-selected, so adding to the universe is an
-    // explicit choice rather than an opt-out the user has to notice and undo.
+    // Opt-in per item: nothing is pre-selected, so submitting a suggestion is
+    // an explicit choice rather than an opt-out the user has to notice and undo.
     initialValues: [],
     required: false,
   });
@@ -678,6 +756,54 @@ async function offerOpportunities(opts: {
     })),
   };
 
+  let stageResult: StageResult | null;
+  try {
+    stageResult = await withSpinner("Sending suggestions for approval", () =>
+      submitSuggestions(config, session, opts.playbook.target.id, opts.fingerprint, submitted),
+    );
+  } catch (err) {
+    p.log.warn(
+      theme.warn("Couldn't send the proposals") +
+        theme.muted(` — ${(err as Error).message}. Nothing was submitted.`),
+    );
+    return NO_ADDITIONS;
+  }
+
+  if (stageResult) {
+    const lines = stageResult.outcomes.map((outcome) => {
+      const mark =
+        outcome.status === "staged"
+          ? theme.success("✓")
+          : outcome.status === "duplicate"
+            ? theme.muted("=")
+            : theme.warn("✗");
+      const reason =
+        outcome.reason ??
+        (outcome.duplicateOf && outcome.duplicateOf !== outcome.code
+          ? `already queued as ${outcome.duplicateOf}`
+          : undefined);
+      const detail = reason ? theme.muted(` (${reason})`) : "";
+      return `${mark} ${outcome.kind} ${theme.bright(outcome.code)}${detail}`;
+    });
+    lines.push(
+      theme.muted(
+        `${stageResult.staged} staged · ${stageResult.duplicates} already queued · ${stageResult.invalid} rejected`,
+      ),
+    );
+    p.note(lines.join("\n"), theme.signal("Suggestions submitted"));
+    const where = stageResult.approvalsUrl
+      ? `approve at ${theme.bright(stageResult.approvalsUrl)}`
+      : "approve them in your Whisperr dashboard";
+    p.log.info(
+      theme.muted(
+        `${stageResult.staged} proposal${stageResult.staged === 1 ? "" : "s"} sent — ${where}. The next wizard run wires whatever you approve.`,
+      ),
+    );
+    return NO_ADDITIONS;
+  }
+
+  // Capability fallback for older backends. Keep the established additions
+  // merge and same-run instrumentation behavior intact below this point.
   let result;
   try {
     result = await withSpinner("Adding to your universe", () =>

@@ -139,8 +139,8 @@ export interface IntegrationManifest {
  * Universe opportunities — new events/interventions the agent spotted while
  * reading the customer's code that the onboarding-generated universe misses.
  * The agent writes these to a JSON file; after the user confirms in the CLI
- * they're posted to whisperr-go (`POST /wizard/universe/additions`), whose
- * request/response shapes these mirror exactly.
+ * they're staged in whisperr-go for dashboard approval. Older backends fall
+ * back to the legacy additions endpoint.
  */
 export interface OpportunityEvent {
   /** snake_case canonical event code, e.g. "subscription_payment_failed". */
@@ -151,6 +151,8 @@ export interface OpportunityEvent {
   side?: string;
   /** Why the agent believes this belongs in the universe (code evidence). */
   rationale?: string;
+  /** What should improve if this event is adopted. */
+  expectedEffect?: string;
   /** 0..1 */
   confidence?: number;
   properties?: Array<{ name: string; description?: string; required?: boolean }>;
@@ -164,6 +166,8 @@ export interface OpportunityIntervention {
   label?: string;
   description?: string;
   rationale?: string;
+  /** What should improve if this intervention is adopted. */
+  expectedEffect?: string;
   /** 0..1 */
   confidence?: number;
   /** Existing (or same-batch) events that should drive this intervention. */
@@ -173,6 +177,43 @@ export interface OpportunityIntervention {
 export interface UniverseOpportunities {
   events: OpportunityEvent[];
   interventions: OpportunityIntervention[];
+}
+
+/** How one submitted suggestion resolved during staging. */
+export interface StageOutcome {
+  kind: "event" | "intervention";
+  code: string;
+  status: "staged" | "duplicate" | "invalid";
+  reason?: string;
+  duplicateOf?: string;
+}
+
+/** Response of POST /wizard/universe/suggestions. */
+export interface StageResult {
+  staged: number;
+  duplicates: number;
+  invalid: number;
+  outcomes: StageOutcome[];
+  /** Dashboard approvals-queue link, server-derived; print it so proposals
+   *  never rot unseen in the queue. Absent on older backends. */
+  approvalsUrl?: string;
+}
+
+/** One proposal moving through dashboard approval and integration. */
+export interface SuggestionRecord {
+  id: string;
+  kind: "event" | "intervention";
+  code: string;
+  status: "proposed" | "approved" | "rejected" | "integrated";
+  payload: OpportunityEvent | OpportunityIntervention;
+  target?: string;
+  repoFingerprint?: string;
+  createdAt?: string;
+  decidedAt?: string;
+  decidedBy?: string;
+  decisionNote?: string;
+  additionId?: string;
+  integratedAt?: string;
 }
 
 /** How one submitted item resolved on the backend. */
