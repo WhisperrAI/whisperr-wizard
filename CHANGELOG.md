@@ -16,6 +16,13 @@
   users can approve from any device (the browser open stays best-effort).
 - Sessions survive long runs: the server now slides the session window on
   activity, and the CLI keeps it alive while you sit on interactive prompts.
+- Discovery digs deeper: the review pass now sweeps your product's whole
+  lifecycle (auth, billing, engagement, support, expiry) instead of noticing
+  gaps incidentally — and verifies each proposal against the actual code
+  before suggesting it.
+- New end-of-run "What you could be doing" report: strategy plays blocked by
+  missing product features are framed as opportunities, with the honest
+  reason each signal isn't flowing yet.
 
 ## 0.3.1
 
