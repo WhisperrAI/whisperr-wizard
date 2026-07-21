@@ -52,9 +52,11 @@ it from. Source the real user id at each call site.
      composer require whisperr/php
 
 2) Config. Set the key in the environment (.env), never hardcoded:
-     WHISPERR_API_KEY=<INGESTION_API_KEY from manifest>
-   On Laravel the service provider + \`Whisperr\` facade auto-register (package
-   discovery). Optionally publish config: \`php artisan vendor:publish --tag=whisperr-config\`.
+     WHISPERR_API_KEY=__WHISPERR_INGESTION_KEY__
+   The host disables Composer plugins and scripts during installation. For
+   Laravel, report \`php artisan package:discover\` as a manual follow-up so the
+   included service provider and \`Whisperr\` facade are registered. Do not run
+   Artisan from the wizard.
    On non-Laravel PHP, construct one client and reuse it:
      use Whisperr\\Whisperr;
      $whisperr = new Whisperr(['api_key' => getenv('WHISPERR_API_KEY')]);

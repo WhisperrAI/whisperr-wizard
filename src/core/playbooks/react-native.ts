@@ -65,10 +65,11 @@ the SDK itself.
          setItem: (k: string, v: string) => { mmkv.set(k, v); },
          removeItem: (k: string) => { mmkv.delete(k); },
        };
-   - Neither → add async-storage. Expo: run \`npx expo install
-     @react-native-async-storage/async-storage\` via bash (installs the
-     SDK-matched version; works in Expo Go — it ships in the Go client). Bare
-     RN: \`<pm> add @react-native-async-storage/async-storage\` and note
+   - Neither → add async-storage. Expo: run
+     \`npx --no-install expo install @react-native-async-storage/async-storage\`
+     so the existing local Expo CLI selects a compatible version. It works in
+     Expo Go because the module ships in the Go client. Bare RN: run
+     \`<pm> add @react-native-async-storage/async-storage\` and note
      "run npx pod-install before the next iOS build" as a follow-up (it IS a
      native module; do not run pod install yourself).
    Never silently ship without storage — if you genuinely can't add it, say so
@@ -82,7 +83,7 @@ the SDK itself.
        export const whisperr = Whisperr.init({
          apiKey: process.env.EXPO_PUBLIC_WHISPERR_KEY!,
          storage: AsyncStorage,
-         baseUrl: '<INGESTION_BASE_URL from manifest>', // omit if it's the SDK default
+         baseUrl: '__WHISPERR_INGESTION_BASE_URL__', // omit if it's the SDK default
        });
    Import the module for its side effect from the app entry: Expo Router →
    app/_layout.tsx (root layout); bare / React Navigation → App.tsx (or
@@ -106,7 +107,7 @@ the SDK itself.
 4) identify() right after the end-user is known — on login/signup success AND
    on session restore at app startup:
        whisperr.identify(user.id, {
-         traits: { /* manifest traits sourced from the user object */ },
+         traits: { /* stable traits sourced from the user object */ },
          email: user.email,           // shortcut → opted-in email channel
          phone: user.phone,           // shortcut → sms channel
          pushToken: expoPushToken,    // shortcut → push channel, if the app
@@ -116,14 +117,14 @@ the SDK itself.
    Call whisperr.reset() on logout (already-queued events keep their user).
    ANONYMOUS EVENTS ARE FINE: track() before identify() buffers on-device and
    attributes to the user retroactively on identify() — do NOT gate track()
-   calls behind auth state, and do NOT skip pre-login manifest events.
+   calls behind auth state, and do not skip a generated event merely because it is pre-login.
 
 5) track() in event handlers / business logic (onPress, mutation onSuccess,
    store/saga/thunk actions) — never in render:
-       whisperr.track('event_type_from_manifest', { /* properties in scope */ });
+       whisperr.track('generated_event_code', { /* properties in scope */ });
    Synchronous fire-and-forget: it returns void — do NOT await it. Batching,
    retries, background flush are all internal. event_type verbatim snake_case
-   from the manifest — the SDK client-side drops invalid names.
+   from the current server model — the SDK client-side drops invalid names.
 
 Notes / gotchas:
 - Every call is sync void except flush(); the only sensible manual flush is
@@ -131,7 +132,7 @@ Notes / gotchas:
 - The SDK auto-flushes on an interval, at 20 queued events, and when the app
   backgrounds. Don't sprinkle flush() calls.
 - whisperr.screen(name) records a screen_viewed event — wire it to the
-  navigation container's state-change callback ONLY if the manifest includes a
+   navigation container's state-change callback ONLY if the generated model includes a
   screen/page-view style event; otherwise leave navigation alone.
 - Works on the New Architecture and in Expo Go by construction (no native
   code). Never suggest expo prebuild / dev-client for this SDK.

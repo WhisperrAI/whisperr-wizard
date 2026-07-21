@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Replaced the manifest-first Claude workflow with one OpenAI Agents SDK run led by Sol and supported by a read-only Terra repository explorer.
+- Generated intervention groups, interventions, events, and links are persisted to runtime immediately with host-derived idempotency keys.
+- Added runtime-authoritative resume, identifier-only local state, conversation fallback, heartbeat/error reporting, and invocation-scoped Git restore.
+- Removed the inactive manifest, opportunity, suggestion, additions, and offline flows.
+- Raised the runtime requirement to Node.js 22.
+
 ## 0.4.0
 
 - Opportunities now stage for **dashboard approval** instead of merging from

@@ -52,9 +52,9 @@ const systemPrompt = `
      'use client';
      import { useWhisperr } from '@whisperr/next';
      const whisperr = useWhisperr();
-     whisperr.track('event_type_from_manifest', { ... });
+     whisperr.track('generated_event_code', { ... });
    Do NOT call track from server components, route handlers, or getServerSideProps —
-   it is a browser client. Copy event_type verbatim (snake_case) from the manifest.
+   it is a browser client. Copy the event code verbatim from the current server model.
 
 Notes:
 - Pageviews are auto-captured via the History API (covers Next client navigation).

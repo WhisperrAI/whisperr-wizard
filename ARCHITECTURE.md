@@ -1,156 +1,94 @@
-# Whisperr Wizard
+# Whisperr Wizard Architecture
 
-> One command to integrate Whisperr into any app. The user pastes a command,
-> authenticates with their onboarded account, and an AI coding agent wires up
-> `identify()` and the exact business events Whisperr needs — then they push and
-> deploy. Inspired by the PostHog wizard, but onboarding-aware.
+The wizard is one Sol-led generation and integration workflow. Runtime is authoritative for the generated model and run lifecycle; the customer repository is authoritative for instrumentation code.
 
-Run it in your project root. No install, no setup — `npx` fetches the wizard and
-its dependencies (including the coding-agent runtime) and runs it from the
-current directory. The only thing you do is authenticate.
+## Flow
 
-```bash
-cd your-app
-npx @whisperr/wizard
+```text
+detect stack
+  -> device auth
+  -> create or resume runtime run
+  -> Git invocation snapshot
+  -> Sol workflow with read-only Terra exploration
+  -> realtime runtime item writes and repository edits
+  -> deterministic verification
+  -> runtime completion
+  -> coverage report and first-event check
 ```
 
-## What it does (the flow)
+`POST /wizard/runs` returns app context, project identity, the run, the current generated model, and ingestion credentials. The old manifest, opportunity, suggestion, and additions flows are not part of the active or compatibility path.
 
-```
-detect stack ─▶ authenticate (browser) ─▶ load manifest ─▶ git checkpoint ─▶ agent edits ─▶ verify first event
-```
+## Agent Topology
 
-1. **Detect** the repo's language/framework (Flutter, Web/JS, Next.js, React
-   Native, Swift…).
-2. **Authenticate** via an OAuth device flow — the browser opens, the user (who
-   is already logged in from onboarding) approves, and the CLI gets a short-lived
-   session token bound to their app.
-3. **Load the integration manifest** from whisperr-go: the ingestion API key, the
-   specific snake_case events to instrument, the interventions each event drives,
-   and `identify()` guidance — all derived from the user's onboarding.
-4. **Checkpoint** with git so the auto-applied edits are reversible.
-5. **Run the coding agent** (Claude Agent SDK) inside the repo: add the SDK
-   dependency, initialize it, wire `identify()`, and place `track()` calls at the
-   correct call sites for each manifest event.
-6. **Verify** by polling for the first event — the "Whisperr is receiving
-   events ✓" moment, which also lights up the dashboard.
+The OpenAI Agents SDK runs two configured agents:
 
-## Why it's better than a generic wizard
+- Sol: `gpt-5.6-sol`, `high` reasoning, `priority` service tier. It owns taxonomy, runtime writes, repository edits, and completion.
+- Terra: `gpt-5.6-terra`, `xhigh` reasoning. It is exposed to Sol as `explore_repository` and receives read, list, and search tools only.
 
-Whisperr already knows **what the app needs to track** (from onboarding), so the
-agent doesn't just install a snippet — it instruments the *specific named events*
-that drive this customer's churn interventions, at the right places in their code.
+The generation prompt is independent of legacy universe prompts. It defines four concepts, evidence requirements, anti-inflation constraints, frontend-first ownership, and completion criteria. SDK playbooks add factual installation and API guidance only.
 
-## Architecture (SDK-agnostic)
+## Host-Owned Tools
 
-The core is dumb about any specific SDK. All SDK knowledge lives in **playbooks**
-(`src/core/playbooks/`). Each playbook carries:
+Runtime tools:
 
-- a `detect()` function (how to recognize the stack),
-- the package reference,
-- an SDK-specific **system prompt** (the best-practice integration guide), and
-- an optional verify command.
+- `create_intervention_group`
+- `create_intervention`
+- `create_event`
+- `create_link`
+- `update_progress`
+- `complete_run`
 
-**Adding a new SDK = adding one playbook file** and registering it in
-`playbooks/index.ts`. Nothing else changes.
+Every item call carries a stable `idempotencyKey` and is sent immediately to `POST /wizard/runs/{runId}/items`. Runtime returns the canonical row.
 
-```
+Repository tools:
+
+- Read, bounded list, and literal search
+- Exact replacement and new-file creation
+- Host-owned ingestion environment configuration
+- Allowlisted package-manager and read-only Git commands
+
+`complete_run` invokes the playbook's deterministic verifier, when defined, before calling runtime completion. A real verification failure is returned to Sol for a focused repair in the same workflow.
+
+## Resume
+
+Runtime owns run status, phase, heartbeat, generated rows, and the model conversation ID. Local state stores only `runId` and `conversationId` in a mode-0600 file under the user state directory, keyed by API base, app ID, and repository fingerprint.
+
+Startup prefers a matching local incomplete run and otherwise lets `POST /wizard/runs` select the latest matching run. If OpenAI conversation state is missing, the wizard creates a new conversation and prompts Sol with the current runtime snapshot. Idempotent item writes prevent duplicates.
+
+Before each invocation, the wizard snapshots existing working-tree changes. Restoring a failed resumed invocation returns to that snapshot instead of resetting earlier wizard work.
+
+## Runtime Contract
+
+All routes use the wizard session bearer:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /wizard/runs` | Create or resume a project run and return its full snapshot |
+| `GET /wizard/runs/{runId}` | Fetch the authoritative resume snapshot |
+| `PATCH /wizard/runs/{runId}` | Update status, monotonic phase, activity message, model conversation, or scrubbed error; every patch refreshes the heartbeat |
+| `POST /wizard/runs/{runId}/items` | Idempotently persist one generated item |
+| `POST /wizard/runs/{runId}/complete` | Validate and complete the graph |
+| `POST /wizard/openai/v1/*` | OpenAI-compatible Sol/Terra gateway |
+
+Coverage reporting and first-event polling remain best-effort post-completion operations.
+
+## Source Map
+
+```text
 src/
-  index.ts              CLI entry + arg parsing
-  cli.ts                orchestration + terminal UX (@clack/prompts)
-  types.ts              shared contracts
-  ui/                   theme + banner (signal-blue, tasteful)
+  index.ts                 argument parsing and executable entry
+  cli.ts                   terminal flow, Git safety, heartbeat, and signals
+  types.ts                 stack, session, and model configuration contracts
   core/
-    config.ts           env/flag resolution
-    detect.ts           runs all playbook detectors
-    auth.ts             device-authorization flow (+ offline stub)
-    manifest.ts         fetch integration manifest (+ mock)
-    agent.ts            Claude Agent SDK runner (file edits)
-    git.ts              checkpoint + diff + revert hint
-    verify.ts           first-event activation poll
-    playbooks/          ← the only SDK-aware code
-      shared-prompt.ts  base wizard prompt + manifest renderer
-      flutter.ts        (available)
-      web.ts            (available)
-      nextjs.ts         (available)
-      node.ts           (available)
-      python.ts         (available)
-      php.ts            (available)
-      react-native.ts   (available)
-      swift.ts          (available)
+    agent.ts               Agents SDK provider, Sol/Terra topology, resume fallback
+    agentTools.ts          realtime runtime tools and host verification
+    generationPrompt.ts    fresh model semantics and workflow prompt
+    runtime.ts             wizard run HTTP client and contracts
+    workflow.ts            run selection and project classification
+    resumeState.ts         external identifier-only local state
+    repositoryTools.ts     bounded host filesystem and command tools
+    toolPolicy.ts          path, secret, command, Git, and CI policy
+    git.ts                 checkpoints, invocation snapshots, diff scanning
+    postflight.ts          deterministic verifier
+    playbooks/             stack detectors and factual SDK guidance
 ```
-
-## Model & auth
-
-The agent runs on Claude via the **Claude Agent SDK**. The CLI **never ships an
-Anthropic key**:
-
-- **Production:** the SDK is pointed at Whisperr's Anthropic-compatible gateway
-  via `ANTHROPIC_BASE_URL`, with the wizard session token as
-  `ANTHROPIC_AUTH_TOKEN`. The gateway injects the real key server-side and meters
-  usage per app.
-- **Local dev:** set `WHISPERR_WIZARD_DIRECT_ANTHROPIC_KEY` (or `ANTHROPIC_API_KEY`)
-  and run `--offline` to exercise the whole flow against a real model + a mock
-  manifest, with no backend.
-
-Default model: `claude-sonnet-5` (override with `WHISPERR_WIZARD_MODEL`, e.g.
-`claude-opus-4-8` for the hardest repos).
-
-## Contributing / local dev
-
-Only needed if you're working **on** the wizard (not using it). End users just
-run `npx @whisperr/wizard`.
-
-```bash
-npm install
-export ANTHROPIC_API_KEY=sk-ant-...        # local dev only
-npm run dev:local -- --offline ../some-flutter-app
-```
-
-`--offline` uses a demo manifest (trial_started, feature_activated,
-payment_failed, subscription_cancelled) so you can watch the agent integrate a
-real repo end-to-end without the backend.
-
-To publish: `npm publish` (the package is scoped `@whisperr` with restricted
-access; `prepublishOnly` runs the build). Once published, `npx @whisperr/wizard`
-works for anyone with access.
-
-## Backend (whisperr-go — IMPLEMENTED)
-
-The wizard talks to these endpoints on the runtime API (default
-`https://api.whisperr.net`), all implemented in `whisperr-go/internal/wizard/`:
-
-| Endpoint | Auth | Purpose |
-|---|---|---|
-| `POST /wizard/device/authorize` | public | Start device flow → `device_code`, `user_code`, `verification_uri` |
-| `POST /wizard/device/token` | public (polled) | → `{ token, app_id, expires_at }` once approved (`428` while pending) |
-| `POST /dashboard/wizard/approve` | Supabase JWT | The whisperr-watch approval page binds a `user_code` to the user's app |
-| `GET /wizard/manifest` | wizard session | → `IntegrationManifest`: **mints the ingestion key** + events + interventions + identify |
-| `GET /wizard/first-event` | wizard session | → `{ received, event_type? }` for the activation poll |
-| `POST /wizard/report` | wizard session | Coverage ledger: per-event wired/skipped status for this surface |
-| `POST /wizard/universe/additions` | wizard session | Append user-confirmed opportunity events/interventions to the app's active universe (server-side dedupe; new interventions start paused) |
-| `POST /wizard/llm/*` | wizard session | Anthropic-compatible gateway: injects Whisperr's real key, streams the response |
-
-whisperr-go env to set:
-- `WHISPERR_WIZARD_ANTHROPIC_API_KEY` (or `ANTHROPIC_API_KEY`) — the gateway's real key
-- `WHISPERR_WIZARD_ACTIVATE_URL` — the watch approval page (default `https://app.whisperr.net/wizard/activate`)
-- `WHISPERR_PUBLIC_API_BASE_URL` — base URL surfaced in the manifest for the SDK (default `https://api.whisperr.net`)
-- `WHISPERR_WIZARD_LLM_UPSTREAM` — Anthropic base (default `https://api.anthropic.com`)
-
-Run migration `0010_wizard_device_authorizations.sql` (`whisperr migrate up`).
-
-## Still to build
-
-- The `/wizard/activate` page in **whisperr-watch** (reuse existing Supabase
-  login; show the `user_code`, let the user pick an app, POST to
-  `/dashboard/wizard/approve`).
-- The `@whisperr/web` SDK (then flip the web/nextjs playbooks to `available`).
-
-## Status
-
-- ✅ CLI: detection, playbook registry, terminal UX, agent runner, git
-  checkpoint, offline demo manifest. Typechecks + builds; npx-standalone.
-- ✅ whisperr-go backend: device auth, manifest (with key minting), first-event,
-  LLM gateway, migration. Builds + vets clean.
-- ⏳ whisperr-watch activate page.
-- ⏳ `@whisperr/web` SDK (Flutter is the first live target — SDK on pub.dev).

@@ -8,7 +8,7 @@ import { theme } from "./ui/theme.js";
  * Entry point for `npx @whisperr/wizard`.
  *
  * Usage:
- *   npx @whisperr/wizard [init] [path] [--offline] [--api <url>] [--model <id>]
+ *   npx @whisperr/wizard [init] [path] [--api <url>] [--model <id>]
  *
  * `init` is accepted as an optional verb for readability; the wizard runs the
  * same flow with or without it.
@@ -37,9 +37,6 @@ export function parseArgs(argv: string[]): RunOptions | { help: true } | { versi
       case "-v":
       case "--version":
         return { version: true };
-      case "--offline":
-        opts.offline = true;
-        break;
       case "--force":
         opts.force = true;
         break;
@@ -69,15 +66,14 @@ function printHelp(): void {
       "    npx @whisperr/wizard [init] [path] [options]",
       "",
       `  ${theme.bright("Options")}`,
-      "    --offline         Use a demo manifest, no account/browser needed",
-      "    --force           Proceed without a clean git tree (no safe undo)",
+      "    --force           Permit existing changes and preserve them on failed-run restore",
       "    --api <url>       Override the Whisperr API base URL",
       "    --model <id>      Override the coding-agent model",
       "    -h, --help        Show this help",
       "    -v, --version     Show version",
       "",
       `  ${theme.muted("The wizard detects your stack, authenticates with your")}`,
-      `  ${theme.muted("onboarded account, and wires up identify() + your events.")}`,
+      `  ${theme.muted("onboarded account, generates its model, and wires the SDK.")}`,
       "",
     ].join("\n"),
   );

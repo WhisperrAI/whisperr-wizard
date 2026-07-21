@@ -34,6 +34,10 @@ export function scrubSummary(text: string): string {
     .replace(/AKIA[0-9A-Z]{16}/g, "[redacted]")
     .replace(/Bearer\s+[A-Za-z0-9._-]+/g, "[redacted]")
     .replace(
+      /\b(OPENAI_API_KEY|WHISPERR_WIZARD_DIRECT_OPENAI_KEY|WHISPERR_INGESTION_KEY)\s*=\s*["']?[^"'\s]+["']?/gi,
+      "$1=[redacted]",
+    )
+    .replace(
       /\b(ANTHROPIC_(?:AUTH_TOKEN|API_KEY))\s*=\s*["']?[^"'\s]+["']?/gi,
       "$1=[redacted]",
     );
@@ -42,14 +46,13 @@ export function scrubSummary(text: string): string {
 /**
  * Post the run report to whisperr-go (`POST /wizard/report`) so the coverage
  * ledger knows what this surface now handles. Best-effort — a failed report
- * must never fail the integration. Skipped in offline mode.
+ * must never fail the integration.
  */
 export async function postRunReport(
   config: WizardConfig,
   session: WizardSession,
   report: RunReport,
 ): Promise<PostRunReportResult> {
-  if (config.offline) return { ok: true };
   try {
     const res = await fetch(`${config.apiBaseUrl}/wizard/report`, {
       method: "POST",
