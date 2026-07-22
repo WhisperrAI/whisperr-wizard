@@ -42,8 +42,6 @@ interface TokenResponse {
 }
 
 export async function authenticate(config: WizardConfig): Promise<WizardSession> {
-  if (config.offline) return offlineSession();
-
   const auth = await startDeviceAuth(config);
   const url = auth.verificationUrlComplete ?? auth.verificationUrl;
 
@@ -113,7 +111,7 @@ export async function startDeviceAuth(
  * LLM gateway request the agent makes) extends the session's 30-minute idle
  * window, up to an absolute cap. Agent phases therefore keep the session
  * alive through their own traffic — the only dead zone is the user parked on
- * an interactive prompt (plan review, opportunities multiselect). This
+ * an interactive prompt or a long local tool call. This
  * keepalive covers that: a cheap authed ping every few minutes. Failures are
  * swallowed (purely best-effort) and the timer is unref'd so it never holds
  * the process open.
@@ -123,7 +121,6 @@ export function startSessionKeepalive(
   session: WizardSession,
   intervalMs = 5 * 60_000,
 ): () => void {
-  if (config.offline) return () => {};
   const timer = setInterval(() => {
     fetch(`${config.apiBaseUrl}/wizard/first-event`, {
       headers: { authorization: `Bearer ${session.token}` },
@@ -131,15 +128,6 @@ export function startSessionKeepalive(
   }, intervalMs);
   timer.unref?.();
   return () => clearInterval(timer);
-}
-
-/** Used in --offline mode: no backend, fixed dev app. */
-function offlineSession(): WizardSession {
-  return {
-    token: "offline-dev-token",
-    appId: "app_offline_dev",
-    expiresAt: Math.floor(Date.now() / 1000) + 3600,
-  };
 }
 
 async function fetchJson<T>(url: string, init: RequestInit): Promise<T> {

@@ -73,7 +73,7 @@ const systemPrompt = `
        import { Whisperr } from '@whisperr/web';
        export const whisperr = Whisperr.init({
          apiKey: import.meta.env.VITE_WHISPERR_KEY,
-         baseUrl: '<INGESTION_BASE_URL from manifest>', // omit if it's the default
+         baseUrl: '__WHISPERR_INGESTION_BASE_URL__', // omit if it's the default
        });
    - React: wrap the app root instead of a bare singleton:
        import { WhisperrProvider } from '@whisperr/react';
@@ -81,14 +81,14 @@ const systemPrompt = `
 
 3) identify(). After auth resolves (login success, and on app load if a session
    is restored):
-       whisperr.identify(user.id, { traits: { /* manifest traits */ }, email: user.email, phone: user.phone });
+       whisperr.identify(user.id, { traits: { /* stable traits in scope */ }, email: user.email, phone: user.phone });
    React: const whisperr = useWhisperr();  then whisperr.identify(...).
    Call whisperr.reset() on logout.
 
-4) track(). For each manifest event, instrument the real handler:
-       whisperr.track('event_type_from_manifest', { /* properties */ });
+4) track(). For each generated event owned by this project, instrument the real handler:
+       whisperr.track('generated_event_code', { /* properties */ });
    In React this belongs in event handlers / effects / mutation callbacks, never
-   in render. Copy event_type verbatim (snake_case) from the manifest.
+   in render. Copy the event code verbatim from the current server model.
 
 Notes:
 - The SDK batches + flushes automatically (timer + on page hide). Fire-and-forget

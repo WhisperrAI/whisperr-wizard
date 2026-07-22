@@ -1,21 +1,44 @@
 # Security
 
-The wizard reads repository code so it can install the Whisperr SDK, initialize it, and place `identify()` / `track()` calls. Code context needed by the agent leaves the machine and is sent either to Whisperr's LLM gateway or directly to Anthropic, depending on your configuration. Run reports, including wired/skipped event outcomes and verification status, are sent to the Whisperr API.
+The wizard sends repository code needed for model generation and SDK integration to OpenAI through Whisperr's authenticated gateway. A local development override can send it directly to OpenAI. Runtime receives generated entities, run progress, scrubbed terminal errors, and coverage results.
 
-Tool enforcement runs in a Claude Agent SDK `PreToolUse` hook that fires before every tool call, including calls the SDK would otherwise auto-allow. The same policy also remains wired through `canUseTool` as a second layer for permission-prompt paths.
+## Agent Boundaries
 
-Reads and searches are limited to paths inside the target repository and block likely secret material, including `.env` and `.env.*` except `.env.example`, `.env.sample`, and `.env.template`; private key stores and key files such as `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`, `*.keystore`, `id_rsa*`, `id_ecdsa*`, and `id_ed25519*`; `*credentials*`, `*.tfvars`, `.netrc`, `.npmrc`, `.pypirc`, `.aws/**`, `.ssh/**`, `.gnupg/**`, and `secrets.*`.
+Sol and Terra receive host-owned function tools, not unrestricted local execution.
 
-The agent can run only a narrow Bash allowlist: package install/add operations for `npm`, `pnpm`, `yarn`, `bun`, `pip`, `pip3`, `poetry`, `uv`, `composer`, `pod`, `flutter pub`, `dart pub`, `gem`, `bundle`, and `go`; `mkdir`; and `git status`, `git diff`, or `git log`. Chained or substituted shell commands are denied unless each segment passes the allowlist. Commands such as `env`, `printenv`, `set`, `cat`, `head`, and `ls` are not on the allowlist.
+- Terra can only read, list, and search non-secret files inside the selected repository.
+- Sol can use the same reads, exact file edits, new-file creation, ingestion environment configuration, allowlisted package operations, read-only Git commands, runtime mutations, progress, and completion.
+- Neither agent receives a runtime bearer, OpenAI key, or ingestion key as a prompt or tool argument.
+- Model tracing is disabled and sensitive trace payload collection is disabled.
 
-Write and Edit are limited to paths inside the target repository. They also refuse git and CI configuration paths, including `.git/**`, `.github/workflows/**`, `.circleci/**`, `.buildkite/**`, `.gitlab-ci.yml`, `azure-pipelines.yml`, `bitbucket-pipelines.yml`, `.drone.yml`, and `Jenkinsfile`.
+Paths are checked lexically and resolved through filesystem symlinks before access. Reads, edits, and new-file parent paths must resolve inside the selected repository.
 
-## Residual risks
+## Secret Isolation
 
-The Claude Agent SDK `env` option is process-wide for the agent subprocess that also makes model calls. The model-auth token must therefore be present in that process environment. Bash environment-dump commands are blocked by the wizard policy, but allowed package-manager installs may run lifecycle scripts with that environment, which is an inherent risk of permitting installs.
+Reads and searches block `.env` and `.env.*` except example/template files; private key stores; key and keystore suffixes; SSH key names; credentials files; `.netrc`; `.npmrc`; `.pypirc`; `.aws`; `.ssh`; `.gnupg`; and `secrets.*`.
 
-Read path checks are string-based repository containment checks. A symlink inside the repository that resolves outside the repository is not resolved to its final target before the read policy decision.
+The model may use `__WHISPERR_INGESTION_KEY__` only in example environment files. Source code reads the key from environment or the repository's existing local configuration mechanism. A dedicated host tool writes the real value only to local `.env` files without reading their contents back to the model. Repository tools substitute the non-secret ingestion base URL and redact the ingestion key from reads, searches, command output, errors, and summaries.
 
-The wizard requires a clean git working tree by default so its changes can be isolated and undone. The one-command revert shown by the wizard is `git restore . && git clean -fd`.
+The OpenAI key is passed directly to `OpenAIProvider`. It is never included in runtime payloads or local resume state. Child command environments remove OpenAI and Anthropic credential variables.
+
+## Command And Write Policy
+
+Repository commands are parsed into executable arguments without a shell on Unix; Windows uses a fixed `cmd.exe` shim command assembled only from validated tokens. Package operations can install only the SDK packages named by the active playbooks, with lifecycle scripts disabled. Dependency manifests, package-manager executable configuration, and managed dependency directories can only be changed by those approved package operations. Git access is limited to metadata-only `status` and `diff` forms. Command chaining, substitution, expansion, redirection, arbitrary packages, external install targets, environment dumps, network clients, destructive commands, commits, pushes, and resets are denied.
+
+Writes to `.git`, GitHub Actions, and common CI configuration paths are denied. The wizard does not commit or push.
+
+## Git And Resume Safety
+
+A new run requires a clean Git working tree unless `--force` is explicit. A matching incomplete run can continue with prior wizard edits present. Each invocation records the current changed-file contents, so a failed invocation can restore its own edits without discarding earlier wizard work or user changes present at invocation start.
+
+Local resume files are outside the customer repository, mode 0600, and contain only run and conversation identifiers.
+
+## Residual Risks
+
+Allowed package managers still access package registries and modify dependency manifests and lockfiles. Install only in repositories where those package managers and the approved Whisperr SDK packages are trusted.
+
+Deterministic verification invokes the static command defined by the selected playbook and can execute project tooling. Model and session credentials are removed from child environments, but local repository tooling remains a trust boundary.
+
+Run the wizard only in repositories whose dependencies and package scripts you trust. Review the resulting diff before committing.
 
 Report vulnerabilities to security@whisperr.net.

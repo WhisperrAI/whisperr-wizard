@@ -1,81 +1,73 @@
 # @whisperr/wizard
 
-Integrate [Whisperr](https://whisperr.net) into your app with one command.
+Generate and integrate a Whisperr intervention model from your actual codebase.
 
 ```bash
 npx @whisperr/wizard
 ```
 
-Run it in your project's root. The wizard detects your stack, signs you in,
-**maps your codebase, plans every event placement, shows you the plan, and
-wires it in** — then verifies the build, watches for your first event, and
-hands you a clean diff to review and commit.
+Run the command in the customer-facing frontend first. The wizard detects the stack, authenticates the app, inspects concrete product behavior, writes the generated model to Whisperr as it works, installs the SDK, and instruments the generated events.
 
-## How it works
+## How It Works
 
-The wizard is an agentic integrator with a planner/editor split:
+1. A read-only Terra agent maps repository structure, end-user paths, and concrete event call sites.
+2. The Sol primary creates only intervention groups, interventions, events, and direct intervention-event links.
+3. Each accepted item is written to runtime immediately with a stable idempotency key, so the dashboard can show live progress.
+4. Sol installs and configures the stack-specific SDK, then instruments events owned by this project.
+5. The host runs the stack's deterministic build or lint verifier when one is defined, before runtime accepts completion.
+6. An interrupted run resumes from the runtime snapshot and its OpenAI conversation. Missing conversations restart from the same server snapshot without duplicating rows.
 
-1. **Map** — a read-only pass charts your repo: entry points, end-user vs
-   admin auth flows, billing surfaces, existing analytics wrappers.
-2. **Plan** — a reasoning model decides, per event, exactly where it belongs
-   (`file @ anchor`) with the properties available in scope — or says
-   honestly that it doesn't exist on this surface.
-3. **Review the plan** — you see every placement before a single line
-   changes, and pick what gets wired.
-4. **Wire** — a fast editor model executes the approved plan mechanically.
-5. **Verify** — placements are scanned back out of the diff, your build/lint
-   command runs, and failures get one automatic repair pass. Every event ends
-   the run as `✓ wired @ file` or `○ skipped — reason`.
+For split repositories, finish the frontend run before running the wizard in backend repositories. A full-stack repository is one project.
 
-Multi-surface aware: run it in your web app, then your mobile app, then your
-backend — the wizard knows what each surface already covers and never
-re-proposes what another run wired.
+## Supported Stacks
 
-## Supported stacks
-
-Next.js · Web (JS/TS) · React Native · Flutter · Swift · Node · Python · PHP
+Next.js, Web (JavaScript/TypeScript), React Native, Flutter, Swift, Node, Python, and PHP.
 
 ## Requirements
 
-- Node.js 18.17+
-- A Whisperr account with onboarding completed (or use `--offline` to demo)
+- Node.js 22+
+- A completed Whisperr onboarding session
+- A Git repository with a clean working tree for a new run
+
+An incomplete run may resume with its existing wizard edits still in the working tree. `--force` permits other uncommitted changes; invocation-scoped restore preserves the state that existed before that invocation.
 
 ## Usage
 
 ```bash
-# in your project root
 npx @whisperr/wizard
-
-# or point it somewhere
 npx @whisperr/wizard path/to/app
 ```
 
 Options:
 
-```
---offline       Demo run with a mock manifest — no account or browser needed
---force         Proceed without a clean git tree (disables the safe undo)
---api <url>     Point at a specific Whisperr API (advanced)
---model <id>    Override the editor model (WHISPERR_WIZARD_MODEL)
+```text
+--force         Proceed without a clean Git tree
+--api <url>     Override the Whisperr API base URL
+--model <id>    Override the primary Sol model
 -h, --help      Show help
 -v, --version   Show version
 ```
 
-Environment knobs: `WHISPERR_WIZARD_PLANNER_MODEL`,
-`WHISPERR_WIZARD_BUDGET_USD` (default 25), `WHISPERR_WIZARD_EFFORT`.
+Model defaults are `gpt-5.6-sol` with `high` reasoning and the `priority` service tier, plus `gpt-5.6-terra` with `xhigh` reasoning for read-only exploration.
+
+Development overrides:
+
+- `WHISPERR_WIZARD_API_BASE`
+- `WHISPERR_WIZARD_OPENAI_BASE`
+- `WHISPERR_WIZARD_PRIMARY_MODEL`
+- `WHISPERR_WIZARD_PRIMARY_EFFORT`
+- `WHISPERR_WIZARD_SERVICE_TIER`
+- `WHISPERR_WIZARD_EXPLORER_MODEL`
+- `WHISPERR_WIZARD_EXPLORER_EFFORT`
+- `WHISPERR_WIZARD_DIRECT_OPENAI_KEY` or `OPENAI_API_KEY`
 
 ## Safety
 
-- **Clean-tree contract** — the wizard requires a clean git working tree and
-  gives you a one-command revert; your code is never uncommitted-mixed with
-  its changes.
-- **Restricted agent sandbox** — the agent cannot read secret material
-  (`.env*`, keys, credentials) and can only run an allowlisted set of package
-  -manager commands. Details in [SECURITY.md](./SECURITY.md).
-- **Nothing merges itself** — the wizard's output is a working-tree diff for
-  you to review and commit.
+- Repository tools are host-owned and restricted to the selected repository.
+- Secret files are blocked. The host writes ingestion credentials only to local environment files and redacts them from model-visible reads and command output.
+- Terra receives only read, list, and search tools.
+- Repository commands use parsed arguments without a shell and are limited to approved SDK package installation plus metadata-only Git commands.
+- Git and CI configuration writes are blocked.
+- The wizard never commits or pushes changes.
 
----
-
-Whisperr — predict churn, automate interventions, recover revenue.
-[whisperr.net](https://whisperr.net)
+See [SECURITY.md](./SECURITY.md) for the complete boundary and residual risks.

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { sanitizedChildEnv } from "./scrub.js";
 
 /**
  * Deterministic postflight: after the coding agent finishes, WE run the
@@ -26,12 +27,10 @@ export interface VerifyResult {
 
 /**
  * Map a verify verdict onto the tri-state `verified` value the wizard reports:
- * true = passed, false = failed, null = couldn't conclude (tool missing or
- * timed out). Shared by the post-integration check and the re-check after the
- * additions instrumentation pass, so both report with the same semantics.
+ * true = passed, false = failed, null = no command or couldn't conclude.
  */
 export function verdictToVerified(verdict: VerifyResult): boolean | null {
-  if (verdict.toolMissing || verdict.timedOut) return null;
+  if (!verdict.ran || verdict.toolMissing || verdict.timedOut) return null;
   return verdict.ok;
 }
 
@@ -50,7 +49,12 @@ export function runVerifyCommand(
   return new Promise((resolve) => {
     // Playbook verify commands are static, trusted strings (e.g. "flutter
     // analyze"), so a shell invocation is safe and handles `npm run x` forms.
-    const child = spawn(command, { cwd: repoPath, shell: true, env: process.env });
+    const child = spawn(command, {
+      cwd: repoPath,
+      shell: true,
+      detached: process.platform !== "win32",
+      env: sanitizedChildEnv(),
+    });
     let out = "";
     const append = (d: Buffer) => {
       out += d.toString();
@@ -61,7 +65,7 @@ export function runVerifyCommand(
     child.stderr?.on("data", append);
 
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      killProcessTree(child.pid, () => child.kill("SIGKILL"));
       resolve({ ran: true, ok: false, command, output: tail(out), timedOut: true });
     }, timeoutMs);
 
@@ -83,6 +87,35 @@ export function runVerifyCommand(
       resolve({ ran: true, ok: false, command, output: tail(out), toolMissing: true });
     });
   });
+}
+
+function killProcessTree(pid: number | undefined, fallback: () => void): void {
+  if (pid && process.platform === "win32") {
+    const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    let fellBack = false;
+    const runFallback = () => {
+      if (fellBack) return;
+      fellBack = true;
+      fallback();
+    };
+    killer.once("error", runFallback);
+    killer.once("close", (code) => {
+      if (code !== 0) runFallback();
+    });
+    return;
+  }
+  if (pid && process.platform !== "win32") {
+    try {
+      process.kill(-pid, "SIGKILL");
+      return;
+    } catch {
+      // The process may have exited between the timeout and the signal.
+    }
+  }
+  fallback();
 }
 
 function tail(s: string): string {

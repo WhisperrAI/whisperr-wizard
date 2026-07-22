@@ -33,15 +33,14 @@ const systemPrompt = `
 
 This SDK is published on pub.dev. Integrate it as follows.
 
-1) Dependency. Add to pubspec.yaml under dependencies:
-     whisperr: ^0.2.2
-   Then the SDK expects \`flutter pub get\` to be run (run it via bash).
+1) Dependency. Run \`flutter pub add whisperr\`; the package command updates
+   pubspec.yaml and resolves the lockfile without direct manifest edits.
 
 2) Initialize once, early, before runApp(), in lib/main.dart:
      import 'package:whisperr/whisperr.dart';
      await Whisperr.initialize(
-       apiKey: '<INGESTION_API_KEY from manifest>',
-       baseUrl: '<INGESTION_BASE_URL from manifest>', // omit if it equals the SDK default
+       apiKey: const String.fromEnvironment('WHISPERR_KEY'),
+       baseUrl: '__WHISPERR_INGESTION_BASE_URL__', // omit if it equals the SDK default
      );
    If main() is not async, make it async and \`await\` the initialize call, or use
    WidgetsFlutterBinding.ensureInitialized() first.
@@ -50,7 +49,7 @@ This SDK is published on pub.dev. Integrate it as follows.
    login/signup and on session restore at startup:
      await Whisperr.instance.identify(
        '<stable external user id>',
-       traits: { /* manifest traits, e.g. 'plan': user.plan */ },
+       traits: { /* stable end-user traits already available */ },
        email: user.email,        // optional shortcut -> opted-in email channel
        phone: user.phone,        // optional shortcut -> SMS channel
        pushToken: fcmToken,      // optional shortcut -> push channel
@@ -58,10 +57,10 @@ This SDK is published on pub.dev. Integrate it as follows.
    Use the app's real stable id (auth uid / customer id), never a device id.
    On logout call \`await Whisperr.instance.reset();\`.
 
-4) track(). For each manifest event, find where that user action actually
+4) track(). For each generated event owned by this project, find where it actually
    happens and add:
-     await Whisperr.instance.track('event_type_from_manifest', properties: { ... });
-   event_type must be snake_case and copied verbatim from the manifest.
+     await Whisperr.instance.track('generated_event_code', properties: { ... });
+   The event code must be copied verbatim from the current server model.
 
 Notes / gotchas:
 - The SDK queues + batches automatically; you do NOT need to await every track
@@ -69,9 +68,9 @@ Notes / gotchas:
 - Do not call track() inside build() methods or render loops — only in event
   handlers / business logic (onPressed, on success of an API call, in a bloc/
   cubit/provider action, etc.).
-- Hardcoding the API key in Dart is acceptable for a client SDK (it is an
-  ingestion key, scoped + rate-limited), but prefer --dart-define / a config
-  file if the project already uses one.
+- Never hardcode the ingestion key. Reuse the project's local configuration
+  mechanism or document the required \`--dart-define=WHISPERR_KEY=...\` build
+  setting without placing the value in tracked files.
 - Verify with \`flutter analyze\`.
 `.trim();
 

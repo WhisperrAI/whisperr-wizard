@@ -9,12 +9,11 @@ test("packageVersion reads package.json instead of drifting", async () => {
 });
 
 test("parseArgs handles init, positional path, and overrides", () => {
-  assert.deepEqual(parseArgs(["init", "demo-app", "--offline", "--force", "--api", "https://api.test", "--model", "claude-test"]), {
+  assert.deepEqual(parseArgs(["init", "demo-app", "--force", "--api", "https://api.test", "--model", "gpt-test"]), {
     path: "demo-app",
-    offline: true,
     force: true,
     apiBaseUrl: "https://api.test",
-    model: "claude-test",
+    model: "gpt-test",
   });
   assert.deepEqual(parseArgs(["--version"]), { version: true });
   assert.deepEqual(parseArgs(["--help"]), { help: true });

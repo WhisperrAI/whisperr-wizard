@@ -76,7 +76,7 @@ to infer it from. Source the real user id at each call site.
      from whisperr import Whisperr
      whisperr = Whisperr(
          api_key=os.environ["WHISPERR_API_KEY"],
-         base_url="<INGESTION_BASE_URL from manifest>",  # omit if it's the default
+         base_url="__WHISPERR_INGESTION_BASE_URL__",  # omit if it's the default
      )
    Put WHISPERR_API_KEY in the app's server config / .env (server-side secret).
 
