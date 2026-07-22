@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveConfig } from "../src/core/config.js";
+import { resolveConfig, stripTrailingSlashes } from "../src/core/config.js";
+
+test("stripTrailingSlashes handles long untrusted values in linear time", () => {
+  const prefix = "https://api.whisperr.net";
+  assert.equal(stripTrailingSlashes(`${prefix}${"/".repeat(100_000)}`), prefix);
+  assert.equal(stripTrailingSlashes(prefix), prefix);
+});
 
 test("config defaults to the locked Sol and Terra topology", () => {
   const names = [

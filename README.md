@@ -60,6 +60,13 @@ Development overrides:
 - `WHISPERR_WIZARD_EXPLORER_MODEL`
 - `WHISPERR_WIZARD_EXPLORER_EFFORT`
 - `WHISPERR_WIZARD_DIRECT_OPENAI_KEY` or `OPENAI_API_KEY`
+- `WHISPERR_WIZARD_LOG_DIR` to place private diagnostic logs in a specific directory outside the target repository
+
+## Diagnostics
+
+Each wizard invocation prints the path to one private JSONL diagnostic file. By default it is stored under the wizard state directory's `logs` folder, outside the target repository. The directory is mode `0700` and each file is mode `0600`. Filenames contain only a timestamp and random invocation ID.
+
+Diagnostics contain bounded lifecycle, progress, Git-safety, coverage, first-event, and HTTP timing/status metadata. They do not contain request or response bodies or headers, prompts, repository source, model output or reasoning, subprocess output, environment contents, authorization codes or URLs, or credentials. Known credentials are registered for exact redaction as they become available, and common token/key formats are also scrubbed.
 
 ## Safety
 

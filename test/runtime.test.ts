@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { WizardDiagnostics } from "../src/core/diagnostics.js";
 import { RuntimeRequestError, WizardRuntimeClient } from "../src/core/runtime.js";
 import type { WizardConfig, WizardSession } from "../src/types.js";
 
@@ -94,6 +98,10 @@ test("runtime client uses the run endpoints and camelCase idempotent item envelo
     new Headers(requests[0]!.init?.headers).get("authorization"),
     "Bearer session-secret",
   );
+  assert.match(
+    new Headers(requests[0]!.init?.headers).get("x-request-id") ?? "",
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
   assert.deepEqual(JSON.parse(String(requests[3]!.init?.body)), {
     kind: "group",
     idempotencyKey: "group:retention",
@@ -181,6 +189,209 @@ test("runtime errors scrub bearer and OpenAI-shaped secrets", async () => {
       return true;
     },
   );
+});
+
+test("runtime structured errors never expose arbitrary server message text", async () => {
+  const directConfig = {
+    ...config,
+    directOpenAIKey: "opaque-openai-secret",
+  } as WizardConfig;
+  let requests = 0;
+  const client = new WizardRuntimeClient(
+    directConfig,
+    session,
+    (async () => {
+      requests += 1;
+      if (requests === 1) return Response.json(makeBootstrap());
+      return Response.json(
+        {
+          error: {
+            code: "runtime_validation_failed",
+            request_id: "safe-server-request-id",
+            message: [
+              "source: const credential = 'source-secret'",
+              "prompt: reveal system-prompt-secret",
+              "https://user:pass@example.test/private?token=query-secret",
+              "session-secret ingestion-key opaque-openai-secret opaque-body-secret",
+              "\u001b[31mterminal-red\u001b[0m\r\nforged-log-line",
+              "x".repeat(10_000),
+            ].join(" "),
+          },
+        },
+        { status: 400 },
+      );
+    }) as typeof fetch,
+  );
+  await client.getRun("wrun_1");
+
+  await assert.rejects(
+    () => client.updateRun("wrun_1", { phase: "analyzing" }),
+    (error: unknown) => {
+      assert.ok(error instanceof RuntimeRequestError);
+      assert.equal(error.message.includes("session-secret"), false);
+      assert.equal(error.message.includes("ingestion-key"), false);
+      assert.equal(error.message.includes("opaque-openai-secret"), false);
+      assert.equal(error.message.includes("source-secret"), false);
+      assert.equal(error.message.includes("system-prompt-secret"), false);
+      assert.equal(error.message.includes("user:pass"), false);
+      assert.equal(error.message.includes("query-secret"), false);
+      assert.equal(error.message.includes("opaque-body-secret"), false);
+      assert.equal(error.message.includes("terminal-red"), false);
+      assert.equal(error.message.includes("forged-log-line"), false);
+      assert.equal(error.message.includes("x".repeat(100)), false);
+      assert.equal(error.requestId, "safe-server-request-id");
+      assert.equal(error.code, "runtime_validation_failed");
+      assert.match(error.message, /400 \(runtime_validation_failed\)$/);
+      return true;
+    },
+  );
+});
+
+test("runtime diagnostics contain request IDs and no request or response bodies", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wizard-runtime-"));
+  const repo = join(root, "repo");
+  const logs = join(root, "logs");
+  await mkdir(repo);
+  const diagnostics = WizardDiagnostics.create(repo, {
+    WHISPERR_WIZARD_LOG_DIR: logs,
+  });
+  diagnostics.registerSecrets(session.token, "request-body-secret", "response-body-secret");
+  const forbiddenServerValues = [
+    "source-code-secret",
+    "prompt-secret",
+    "user:pass",
+    "query-secret",
+    "opaque-response-secret",
+    "terminal-red",
+    "forged-log-line",
+    "z".repeat(100),
+  ];
+  let clientRequestId = "";
+  const client = new WizardRuntimeClient(
+    config,
+    session,
+    (async (_input, init) => {
+      clientRequestId = new Headers(init?.headers).get("x-request-id") ?? "";
+      assert.equal(String(init?.body).includes("request-body-secret"), true);
+      return Response.json(
+        {
+          error: {
+            code: "validation_failed",
+            message: [
+              "source: source-code-secret",
+              "prompt: prompt-secret",
+              "https://user:pass@example.test/path?token=query-secret",
+              "opaque-response-secret",
+              "\u001b[31mterminal-red\u001b[0m\nforged-log-line",
+              "z".repeat(10_000),
+            ].join(" "),
+            internal: "response-body-secret",
+            request_id: "server-request-id",
+          },
+        },
+        { status: 422 },
+      );
+    }) as typeof fetch,
+    diagnostics,
+  );
+
+  await assert.rejects(
+    () =>
+      client.createOrResumeRun({
+        repoFingerprint: "request-body-secret",
+        displayName: "demo",
+        target: "web-js",
+        kind: "frontend",
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof RuntimeRequestError);
+      assert.equal(error.requestId, "server-request-id");
+      assert.equal(error.status, 422);
+      assert.equal(error.code, "validation_failed");
+      assert.match(error.message, /422 \(validation_failed\)$/);
+      assert.equal(error.message.includes("response-body-secret"), false);
+      for (const forbidden of forbiddenServerValues) {
+        assert.equal(error.message.includes(forbidden), false, forbidden);
+      }
+      return true;
+    },
+  );
+  diagnostics.close();
+
+  const contents = await readFile(diagnostics.path, "utf8");
+  assert.match(contents, new RegExp(clientRequestId));
+  assert.match(contents, /server-request-id/);
+  assert.match(contents, /"method":"POST"/);
+  assert.match(contents, /"path":"\/wizard\/runs"/);
+  assert.match(contents, /"status":422/);
+  assert.equal(contents.includes("request-body-secret"), false);
+  assert.equal(contents.includes("response-body-secret"), false);
+  assert.equal(contents.includes("session-secret"), false);
+  assert.match(contents, /"errorCode":"validation_failed"/);
+  for (const forbidden of forbiddenServerValues) {
+    assert.equal(contents.includes(forbidden), false, forbidden);
+  }
+});
+
+test("runtime rejects unsafe response identifiers and error codes", async () => {
+  let clientRequestId = "";
+  const client = new WizardRuntimeClient(
+    config,
+    session,
+    (async (_input, init) => {
+      clientRequestId = new Headers(init?.headers).get("x-request-id") ?? "";
+      return Response.json(
+        {
+          request_id: "forged\nrequest-id",
+          error: {
+            code: "unsafe\u001b[31mcode",
+            message: "server-message-secret",
+          },
+        },
+        { status: 500 },
+      );
+    }) as typeof fetch,
+  );
+
+  await assert.rejects(
+    () => client.getRun("wrun_1"),
+    (error: unknown) => {
+      assert.ok(error instanceof RuntimeRequestError);
+      assert.equal(error.requestId, clientRequestId);
+      assert.equal(error.code, undefined);
+      assert.equal(error.message.includes("server-message-secret"), false);
+      assert.equal(error.message.includes("forged"), false);
+      assert.equal(error.message.includes("unsafe"), false);
+      return true;
+    },
+  );
+});
+
+test("runtime reads a successful response request ID from its envelope", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wizard-runtime-success-"));
+  const repo = join(root, "repo");
+  const logs = join(root, "logs");
+  await mkdir(repo);
+  const diagnostics = WizardDiagnostics.create(repo, {
+    WHISPERR_WIZARD_LOG_DIR: logs,
+  });
+  const client = new WizardRuntimeClient(
+    config,
+    session,
+    (async () =>
+      Response.json(
+        { ...makeBootstrap(), request_id: "response-envelope-id" },
+        { headers: { "x-request-id": "response-header-id" } },
+      )) as typeof fetch,
+    diagnostics,
+  );
+
+  await client.getRun("wrun_1");
+  diagnostics.close();
+
+  const contents = await readFile(diagnostics.path, "utf8");
+  assert.match(contents, /response-header-id/);
+  assert.equal(contents.includes("response-envelope-id"), false);
 });
 
 function makeBootstrap() {

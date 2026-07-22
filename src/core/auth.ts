@@ -59,10 +59,11 @@ export async function authenticate(config: WizardConfig): Promise<WizardSession>
 
 export async function startDeviceAuth(
   config: WizardConfig,
+  signal?: AbortSignal,
 ): Promise<DeviceAuthHandle> {
   const authorize = await fetchJson<AuthorizeResponse>(
     `${config.apiBaseUrl}/wizard/device/authorize`,
-    { method: "POST", body: JSON.stringify({ client: "whisperr-wizard" }) },
+    { method: "POST", body: JSON.stringify({ client: "whisperr-wizard" }), signal },
   );
 
   const intervalMs = (authorize.interval ?? 5) * 1000;
@@ -76,13 +77,14 @@ export async function startDeviceAuth(
       // Poll for approval.
       let wait = intervalMs;
       while (Date.now() < deadline) {
-        await sleep(wait);
+        await sleep(wait, signal);
         const res = await fetch(
           `${config.apiBaseUrl}/wizard/device/token`,
           {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ device_code: authorize.device_code }),
+            signal,
           },
         );
         if (res.ok) {
@@ -143,6 +145,20 @@ async function fetchJson<T>(url: string, init: RequestInit): Promise<T> {
   return (await res.json()) as T;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", aborted, { once: true });
+
+    function done(): void {
+      signal?.removeEventListener("abort", aborted);
+      resolve();
+    }
+
+    function aborted(): void {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    }
+  });
 }

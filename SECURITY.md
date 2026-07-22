@@ -33,6 +33,14 @@ A new run requires a clean Git working tree unless `--force` is explicit. A matc
 
 Local resume files are outside the customer repository, mode 0600, and contain only run and conversation identifiers.
 
+## Diagnostic Logs
+
+Every actual CLI invocation creates one JSONL diagnostic file outside the target repository. It uses `WHISPERR_WIZARD_LOG_DIR` when set, otherwise the wizard state root's `logs` directory. A missing log directory is created mode `0700`; an existing directory is never chmodded and is accepted only when it is a real directory owned by the current user (where the platform exposes ownership) with no group or other permission bits. Files are created exclusively mode `0600`, and filenames contain only a timestamp and random invocation ID. The CLI prints the path once.
+
+Diagnostics are metadata-only. They include lifecycle and bounded progress, selected app/project/run identifiers, Git-safety booleans, coverage and first-event outcomes, and runtime request method, sanitized path, status, duration, request IDs, and strictly allowlisted error codes. They exclude HTTP bodies and headers, server-provided error messages, prompts, source text, model output and reasoning, subprocess output, environment contents, device and user codes, complete verification URLs, and session, ingestion, or model-provider credentials. Credentials are added to an exact-match redaction registry as they become available; JWTs, common key/token assignments, private keys, URL credentials and queries, and terminal control sequences are also scrubbed. Logs remain open while graceful signal cleanup runs, then are synchronously closed once.
+
+Diagnostic creation is deliberately fail-closed. If the wizard cannot create a private log outside the target repository, it exits before authentication, runtime access, or repository edits and reports only a fixed error without exposing filesystem paths. This preserves the outside-repository and permission guarantees rather than silently running without the required audit trail.
+
 ## Residual Risks
 
 Allowed package managers still access package registries and modify dependency manifests and lockfiles. Install only in repositories where those package managers and the approved Whisperr SDK packages are trusted.
