@@ -32,19 +32,25 @@ export interface CliFlags {
   force?: boolean;
 }
 
+export function stripTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
+  return value.slice(0, end);
+}
+
 export function resolveConfig(flags: CliFlags = {}): WizardConfig {
-  const apiBaseUrl = (
+  const apiBaseUrl = stripTrailingSlashes(
     flags.apiBaseUrl ??
     process.env.WHISPERR_WIZARD_API_BASE ??
-    DEFAULT_API_BASE
-  ).replace(/\/+$/, "");
+    DEFAULT_API_BASE,
+  );
 
   const directOpenAIKey =
     process.env.WHISPERR_WIZARD_DIRECT_OPENAI_KEY ?? process.env.OPENAI_API_KEY;
-  const openAIBaseUrl = (
+  const openAIBaseUrl = stripTrailingSlashes(
     process.env.WHISPERR_WIZARD_OPENAI_BASE ??
-    (directOpenAIKey ? "https://api.openai.com/v1" : `${apiBaseUrl}/wizard/openai`)
-  ).replace(/\/+$/, "");
+    (directOpenAIKey ? "https://api.openai.com/v1" : `${apiBaseUrl}/wizard/openai`),
+  );
 
   return {
     apiBaseUrl,

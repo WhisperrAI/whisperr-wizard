@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { stripTrailingSlashes } from "./config.js";
 
 export interface LocalResumeState {
   runId: string;
@@ -28,7 +29,7 @@ export function resumeStatePath(
   const root = wizardStateRoot(env);
   const key = createHash("sha256")
     .update(
-      [identity.apiBaseUrl.replace(/\/+$/, ""), identity.appId, identity.repoFingerprint].join(
+      [stripTrailingSlashes(identity.apiBaseUrl), identity.appId, identity.repoFingerprint].join(
         "\n",
       ),
     )
