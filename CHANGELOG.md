@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1
+
+- Added private per-run JSONL diagnostics with strict secret redaction and safe lifecycle, progress, and request-correlation events.
+- Added bounded request IDs and safe runtime error reporting without recording response bodies or model and repository content.
+- Improved signal handling so interrupted runs finish cleanup and close diagnostics with conventional exit codes.
+
 ## 0.5.0
 
 - Replaced the manifest-first Claude workflow with one OpenAI Agents SDK run led by Sol and supported by a read-only Terra repository explorer.

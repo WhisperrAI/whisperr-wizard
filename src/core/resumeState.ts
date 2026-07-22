@@ -14,13 +14,18 @@ export interface ResumeStateIdentity {
   repoFingerprint: string;
 }
 
+export function wizardStateRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return (
+    env.WHISPERR_WIZARD_STATE_DIR ??
+    join(env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "whisperr-wizard")
+  );
+}
+
 export function resumeStatePath(
   identity: ResumeStateIdentity,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const root =
-    env.WHISPERR_WIZARD_STATE_DIR ??
-    join(env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "whisperr-wizard");
+  const root = wizardStateRoot(env);
   const key = createHash("sha256")
     .update(
       [identity.apiBaseUrl.replace(/\/+$/, ""), identity.appId, identity.repoFingerprint].join(
