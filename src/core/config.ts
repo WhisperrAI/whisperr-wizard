@@ -7,7 +7,7 @@ import type { WizardConfig } from "../types.js";
  * OpenAI-compatible gateway. Local development can opt into a direct OpenAI
  * key, which remains process-local.
  *
- * Local dev: set WHISPERR_WIZARD_DIRECT_OPENAI_KEY (or OPENAI_API_KEY).
+ * Local dev: set WHISPERR_WIZARD_DIRECT_OPENAI_KEY explicitly.
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
@@ -45,8 +45,7 @@ export function resolveConfig(flags: CliFlags = {}): WizardConfig {
     DEFAULT_API_BASE,
   );
 
-  const directOpenAIKey =
-    process.env.WHISPERR_WIZARD_DIRECT_OPENAI_KEY ?? process.env.OPENAI_API_KEY;
+  const directOpenAIKey = process.env.WHISPERR_WIZARD_DIRECT_OPENAI_KEY;
   const openAIBaseUrl = stripTrailingSlashes(
     process.env.WHISPERR_WIZARD_OPENAI_BASE ??
     (directOpenAIKey ? "https://api.openai.com/v1" : `${apiBaseUrl}/wizard/openai`),
