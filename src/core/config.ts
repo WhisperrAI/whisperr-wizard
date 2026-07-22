@@ -11,6 +11,8 @@ import type { WizardConfig } from "../types.js";
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
+const DEFAULT_OPENAI_GATEWAY_BASE =
+  "https://ca-whisperr-api-prod.graycliff-3f912aeb.swedencentral.azurecontainerapps.io/wizard/openai";
 export const DEFAULT_PRIMARY_MODEL = "gpt-5.6-sol";
 export const DEFAULT_EXPLORER_MODEL = "gpt-5.6-terra";
 const DEFAULT_PRIMARY_EFFORT = "high";
@@ -48,7 +50,11 @@ export function resolveConfig(flags: CliFlags = {}): WizardConfig {
   const directOpenAIKey = process.env.WHISPERR_WIZARD_DIRECT_OPENAI_KEY;
   const openAIBaseUrl = stripTrailingSlashes(
     process.env.WHISPERR_WIZARD_OPENAI_BASE ??
-    (directOpenAIKey ? "https://api.openai.com/v1" : `${apiBaseUrl}/wizard/openai`),
+    (directOpenAIKey
+      ? "https://api.openai.com/v1"
+      : apiBaseUrl === DEFAULT_API_BASE
+        ? DEFAULT_OPENAI_GATEWAY_BASE
+        : `${apiBaseUrl}/wizard/openai`),
   );
 
   return {

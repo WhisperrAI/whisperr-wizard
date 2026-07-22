@@ -29,7 +29,10 @@ test("config defaults to the locked Sol and Terra topology", () => {
     assert.equal(config.primaryServiceTier, "priority");
     assert.equal(config.explorerModel, "gpt-5.6-terra");
     assert.equal(config.explorerEffort, "xhigh");
-    assert.equal(config.openAIBaseUrl, "https://api.whisperr.net/wizard/openai");
+    assert.equal(
+      config.openAIBaseUrl,
+      "https://ca-whisperr-api-prod.graycliff-3f912aeb.swedencentral.azurecontainerapps.io/wizard/openai",
+    );
   } finally {
     for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name];
@@ -57,9 +60,17 @@ test("ambient OpenAI key does not bypass the authenticated wizard gateway", () =
   try {
     const config = resolveConfig();
     assert.equal(config.directOpenAIKey, undefined);
-    assert.equal(config.openAIBaseUrl, "https://api.whisperr.net/wizard/openai");
+    assert.equal(
+      config.openAIBaseUrl,
+      "https://ca-whisperr-api-prod.graycliff-3f912aeb.swedencentral.azurecontainerapps.io/wizard/openai",
+    );
   } finally {
     if (previous === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = previous;
   }
+});
+
+test("custom API base keeps model traffic on the custom runtime", () => {
+  const config = resolveConfig({ apiBaseUrl: "http://localhost:8080" });
+  assert.equal(config.openAIBaseUrl, "http://localhost:8080/wizard/openai");
 });

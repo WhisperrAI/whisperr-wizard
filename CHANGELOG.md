@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+- Routed authenticated production model-gateway traffic directly to the runtime origin so Cloudflare request-body inspection cannot block repository analysis.
+
 ## 0.5.2
 
 - Prevented ambient project `OPENAI_API_KEY` values from bypassing the authenticated Whisperr model gateway.
