@@ -59,7 +59,7 @@ Development overrides:
 - `WHISPERR_WIZARD_SERVICE_TIER`
 - `WHISPERR_WIZARD_EXPLORER_MODEL`
 - `WHISPERR_WIZARD_EXPLORER_EFFORT`
-- `WHISPERR_WIZARD_DIRECT_OPENAI_KEY` or `OPENAI_API_KEY`
+- `WHISPERR_WIZARD_DIRECT_OPENAI_KEY`
 - `WHISPERR_WIZARD_LOG_DIR` to place private diagnostic logs in a specific directory outside the target repository
 
 ## Diagnostics

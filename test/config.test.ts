@@ -50,3 +50,16 @@ test("direct OpenAI development key switches only the provider base", () => {
     else process.env.WHISPERR_WIZARD_DIRECT_OPENAI_KEY = previous;
   }
 });
+
+test("ambient OpenAI key does not bypass the authenticated wizard gateway", () => {
+  const previous = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "project-secret";
+  try {
+    const config = resolveConfig();
+    assert.equal(config.directOpenAIKey, undefined);
+    assert.equal(config.openAIBaseUrl, "https://api.whisperr.net/wizard/openai");
+  } finally {
+    if (previous === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previous;
+  }
+});

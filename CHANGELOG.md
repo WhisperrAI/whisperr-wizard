@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.2
+
+- Prevented ambient project `OPENAI_API_KEY` values from bypassing the authenticated Whisperr model gateway.
+- Added a safe diagnostic event identifying whether the runtime gateway or explicit direct-development transport is active.
+
 ## 0.5.1
 
 - Added private per-run JSONL diagnostics with strict secret redaction and safe lifecycle, progress, and request-correlation events.

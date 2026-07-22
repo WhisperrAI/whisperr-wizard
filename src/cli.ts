@@ -59,6 +59,9 @@ export async function run(
     { once: true },
   );
   diagnostics?.registerSecrets(config.directOpenAIKey);
+  diagnostics?.log("model_transport", {
+    transport: config.directOpenAIKey ? "direct_openai" : "runtime_gateway",
+  });
 
   // eslint-disable-next-line no-console
   console.log(banner());
