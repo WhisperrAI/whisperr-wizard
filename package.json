@@ -1,6 +1,6 @@
 {
   "name": "@whisperr/wizard",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Generate a codebase-aware Whisperr intervention model and integrate its SDK and events in one command.",
   "repository": {
     "type": "git",
