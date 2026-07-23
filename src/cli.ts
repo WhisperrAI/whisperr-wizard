@@ -1,496 +1,969 @@
-import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import * as p from "@clack/prompts";
 import open from "open";
-import { runIntegrationAgent } from "./core/agent.js";
-import { startDeviceAuth, startSessionKeepalive } from "./core/auth.js";
 import type { CliFlags } from "./core/config.js";
 import { resolveConfig } from "./core/config.js";
 import { detectStack } from "./core/detect.js";
-import { diagnosticErrorData, type WizardDiagnostics } from "./core/diagnostics.js";
+import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
+import { authenticate, startDeviceAuth, startSessionKeepalive } from "./core/auth.js";
+import { fetchManifest } from "./core/manifest.js";
 import {
+  runIntegrationAgent,
+  runAdditionsInstrumentationPass,
+  runRepairPass,
+  type AgentEventOutcome,
+  type EventPlanEntry,
+} from "./core/agent.js";
+import {
+  collectOpportunities,
+  fetchSuggestions,
+  markSuggestionIntegrated,
+  normalizeCode,
+  submitAdditions,
+  submitSuggestions,
+} from "./core/opportunities.js";
+import {
+  takeCheckpoint,
   changedFiles,
-  hasWhisperrMethodCall,
+  revertHint,
+  revertToCheckpoint,
   isWorkingTreeClean,
   repoFingerprint,
-  restoreToSnapshot,
-  revertHint,
+  scanWiredEvents,
   snapshotChanges,
   snapshotsEqual,
-  takeCheckpoint,
+  restoreToSnapshot,
   type ChangesSnapshot,
   type GitCheckpoint,
 } from "./core/git.js";
-import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
-import { verdictToVerified } from "./core/postflight.js";
-import { postRunReport, scrubSummary } from "./core/report.js";
-import { clearResumeState, saveResumeState } from "./core/resumeState.js";
-import { scrubError } from "./core/scrub.js";
-import { WizardRuntimeClient } from "./core/runtime.js";
 import { pollFirstEvent } from "./core/verify.js";
-import { selectOrCreateRun } from "./core/workflow.js";
+import { runVerifyCommand, verdictToVerified } from "./core/postflight.js";
+import { postRunReport, scrubSummary, type ReportEvent } from "./core/report.js";
+import { buildGapReport, renderGapReport } from "./core/gapreport.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
-import type { Detection, Playbook, WizardConfig, WizardSession } from "./types.js";
+import type {
+  Detection,
+  IntegrationManifest,
+  OpportunityEvent,
+  Playbook,
+  StageResult,
+  UniverseOpportunities,
+  WizardConfig,
+  WizardSession,
+} from "./types.js";
 
 export interface RunOptions extends CliFlags {
   /** Target repo (defaults to cwd). */
   path?: string;
 }
 
-export interface RunContext {
-  signal?: AbortSignal;
-}
-
-export async function run(
-  options: RunOptions,
-  diagnostics?: WizardDiagnostics,
-  context: RunContext = {},
-): Promise<number> {
+export async function run(options: RunOptions): Promise<number> {
   const repoPath = resolve(options.path ?? process.cwd());
   const config = resolveConfig(options);
-  const signal = context.signal ?? new AbortController().signal;
-  let interruptedBy = signal.aborted ? handledSignal(signal.reason) : undefined;
-  signal.addEventListener(
-    "abort",
-    () => {
-      interruptedBy = handledSignal(signal.reason);
-    },
-    { once: true },
-  );
-  diagnostics?.registerSecrets(config.directOpenAIKey);
-  diagnostics?.log("model_transport", {
-    transport: config.directOpenAIKey ? "direct_openai" : "runtime_gateway",
-  });
 
   // eslint-disable-next-line no-console
   console.log(banner());
-  p.intro(theme.signal("Let's build and wire your Whisperr intervention model."));
+  p.intro(theme.signal("Let's wire Whisperr into your app."));
 
+  if (config.offline) {
+    p.log.warn(
+      theme.warn("offline mode") +
+        theme.muted(" — using a demo manifest, no account needed."),
+    );
+  }
+
+  // 1. Detect the stack.
   const detections = await withSpinner("Scanning your repository", () =>
     detectStack(repoPath),
   );
-  if (signal.aborted) return signalExitCode(interruptedBy);
   const chosen = await chooseTarget(detections);
   if (!chosen) {
-    diagnostics?.log("run_failed", { stage: "stack_selection", reason: "cancelled" });
     p.cancel("No supported stack selected.");
     return 1;
   }
-  diagnostics?.log("stack_selected", {
-    stack: chosen.playbook.target.id,
-    detected: Boolean(chosen.detection),
-  });
+
   if (chosen.playbook.target.availability === "planned") {
-    diagnostics?.log("run_failed", { stage: "stack_selection", reason: "unavailable" });
-    p.cancel(
-      `The ${chosen.playbook.target.displayName} SDK is not available yet, so the wizard cannot safely instrument this repository.`,
-    );
-    return 1;
-  }
-  p.log.success(
-    `Detected ${theme.bright(chosen.playbook.target.displayName)} ` +
-      theme.muted(`(${chosen.detection?.evidence.join(", ") ?? "selected"})`),
-  );
-
-  let session: WizardSession;
-  try {
-    session = await withBrowserAuth(config, diagnostics, signal);
-    diagnostics?.registerSecrets(session.token);
-  } catch (error) {
-    const safeError = scrubError(error, [config.directOpenAIKey ?? ""]);
-    diagnostics?.log("run_failed", {
-      stage: "authentication",
-      ...diagnosticErrorData(error),
-    });
-    p.cancel(theme.alert(safeError));
-    return interruptedBy ? signalExitCode(interruptedBy) : 1;
-  }
-  const stopKeepalive = startSessionKeepalive(config, session);
-  const fingerprint = await repoFingerprint(repoPath);
-  const runtime = new WizardRuntimeClient(
-    config,
-    session,
-    globalThis.fetch,
-    diagnostics,
-    signal,
-  );
-
-  let selected;
-  try {
-    selected = await withSpinner("Loading your wizard run", () =>
-      selectOrCreateRun({
-        apiBaseUrl: config.apiBaseUrl,
-        repoPath,
-        repoFingerprint: fingerprint,
-        session,
-        playbook: chosen.playbook,
-        runtime,
-      }),
-    );
-  } catch (error) {
-    stopKeepalive();
-    const safeError = scrubError(error, [session.token, config.directOpenAIKey ?? ""]);
-    diagnostics?.log("run_failed", {
-      stage: "run_selection",
-      ...diagnosticErrorData(error),
-    });
-    p.cancel(theme.alert(safeError));
-    return interruptedBy ? signalExitCode(interruptedBy) : 1;
-  }
-  diagnostics?.registerSecrets(selected.snapshot.ingestion.apiKey);
-  diagnostics?.log("run_selected", {
-    resumed: selected.resumed,
-    appId: selected.snapshot.app.id,
-    projectId: selected.snapshot.project.id,
-    runId: selected.snapshot.run.id,
-  });
-
-  let phase = selected.resumed ? "resuming" : "exploring";
-  const spin = p.spinner();
-  const useSpinner = Boolean(process.stdout.isTTY);
-  let checkpoint: GitCheckpoint;
-  let invocationSnapshot: ChangesSnapshot;
-  let heartbeat: ReturnType<typeof setInterval>;
-  try {
-    checkpoint = await takeCheckpoint(repoPath);
-    invocationSnapshot = checkpoint.isRepo
-      ? await snapshotChanges(repoPath, checkpoint)
-      : new Map<string, Buffer | null>();
-    if (
-      !(await enforceGitSafety(
-        repoPath,
-        checkpoint,
-        selected.resumed,
-        options.force,
-        diagnostics,
-      ))
-    ) {
-      await runtime
-        .updateRun(selected.snapshot.run.id, {
-          status: "failed",
-          error: "Repository is not in a safe state for automatic edits.",
-          message: "Repository is not in a safe state for automatic edits.",
-        })
-        .catch(() => {});
-      stopKeepalive();
-      diagnostics?.log("run_failed", { stage: "git_safety", runId: selected.snapshot.run.id });
-      return 1;
-    }
-
     p.note(
-      [
-        `${selected.resumed ? "Resuming" : "Starting"} run ${selected.snapshot.run.id}`,
-        `Project: ${selected.snapshot.project.displayName} (${selected.snapshot.project.kind})`,
-        `Existing model: ${selected.snapshot.model.groups.length} groups, ${selected.snapshot.model.interventions.length} interventions, ${selected.snapshot.model.events.length} events, ${selected.snapshot.model.links.length} links`,
-      ].join("\n"),
-      theme.signal(selected.snapshot.app.name ?? selected.snapshot.app.id),
+      `We can detect ${theme.bright(chosen.playbook.target.displayName)} but the ` +
+        `Whisperr SDK for it isn't shipped yet.\n` +
+        `Flutter is live today; ${theme.bright(
+          chosen.playbook.target.displayName,
+        )} is next on the roadmap.`,
+      theme.warn("SDK coming soon"),
     );
-
-    if (useSpinner) spin.start(theme.bright(phase));
-    else p.log.step(theme.bright(phase));
-    diagnostics?.log("phase", { phase: safeProgressText(phase) });
-    heartbeat = setInterval(() => {
-      void runtime.updateRun(selected.snapshot.run.id, {}).catch(() => {});
-    }, 15_000);
-    heartbeat.unref?.();
-  } catch (error) {
-    const safeError = scrubError(error, [
-      session.token,
-      config.directOpenAIKey ?? "",
-      selected.snapshot.ingestion.apiKey,
-    ]);
-    await runtime
-      .updateRun(selected.snapshot.run.id, {
-        status: "failed",
-        error: safeError,
-        message: `failed during repository setup: ${safeError}`,
-      })
-      .catch(() => {});
-    stopKeepalive();
-    diagnostics?.log("run_failed", {
-      stage: "repository_setup",
-      runId: selected.snapshot.run.id,
-      interrupted: Boolean(interruptedBy),
-      ...diagnosticErrorData(error),
-    });
-    p.cancel(theme.alert(safeError));
-    return interruptedBy ? signalExitCode(interruptedBy) : 1;
-  }
-
-  let runtimeCompleted = false;
-  try {
-    const outcome = await runIntegrationAgent({
-      repoPath,
-      config,
-      session,
-      playbook: chosen.playbook,
-      snapshot: selected.snapshot,
-      runtime,
-      checkpoint,
-      conversationId: selected.snapshot.run.modelConversationId,
-      signal,
-      async saveConversationId(conversationId) {
-        await saveResumeState(selected.statePath, {
-          runId: selected.snapshot.run.id,
-          conversationId,
-        });
-      },
-      progress: {
-        onPhase(label) {
-          phase = label;
-          diagnostics?.log("phase", { phase: safeProgressText(label) });
-          if (useSpinner) spin.message(theme.bright(label));
-          else p.log.step(theme.bright(label));
-        },
-        onActivity(message) {
-          diagnostics?.log("activity", {
-            phase: safeProgressText(phase),
-            activity: activityCategory(message),
-          });
-          if (useSpinner) spin.message(`${theme.bright(phase)}${theme.muted(` - ${message}`)}`);
-        },
-      },
-    });
-    runtimeCompleted = true;
-    diagnostics?.log("integration_completed", {
-      runId: selected.snapshot.run.id,
-      durationMs: outcome.durationMs,
-      wiredEventCount: outcome.wiredEvents.filter((event) => event.status === "wired").length,
-      eventCount: outcome.wiredEvents.length,
-    });
-
-    clearInterval(heartbeat);
-    if (useSpinner) spin.stop(theme.success("Integration complete"));
-    else p.log.success(theme.success("Integration complete"));
-    await clearResumeState(selected.statePath);
-
-    const files =
-      outcome.snapshot.run.integrationEvidence?.changedFiles ??
-      (await changedFiles(repoPath, checkpoint));
-    if (files.length) {
-      p.note(files.map((file) => `${theme.muted("-")} ${file}`).join("\n"), "Files changed");
-    }
-    const summary = scrubSummary(outcome.summary).trim();
-    if (summary) p.log.message(summary);
-    if (outcome.wiredEvents.length) {
-      p.note(
-        outcome.wiredEvents
-          .map((event) =>
-            event.status === "wired"
-              ? `${theme.success("+")} ${event.code}${event.file ? theme.muted(` - ${event.file}`) : ""}`
-              : `${theme.muted("o")} ${event.code} - no call was detected in changed files`,
-          )
-          .join("\n"),
-        "Events",
-      );
-    }
-
-    const report = await postRunReport(config, session, {
-      target: chosen.playbook.target.id,
-      repo_fingerprint: fingerprint,
-      identify_wired:
-        outcome.snapshot.run.integrationEvidence?.identifyWired ??
-        (await hasIdentifyCall(repoPath, files)),
-      verified: outcome.verification
-        ? verdictToVerified(outcome.verification)
-        : null,
-      cost_usd: 0,
-      duration_ms: outcome.durationMs,
-      summary: summary.slice(0, 4000),
-      events: outcome.wiredEvents.map((event) => ({
-        event_type: event.code,
-        status: event.status,
-        file: event.file,
-      })),
-    });
-    if (!report.ok) {
-      p.log.warn(theme.warn("The integration completed, but coverage reporting failed."));
-    }
-    diagnostics?.log("coverage_report", { ok: report.ok });
-
-    p.log.step(
-      theme.bright("Run your app once") +
-        theme.muted(" and trigger a tracked action so Whisperr can confirm ingestion."),
-    );
-    const first = await pollFirstEvent(config, session, {
-      timeoutMs: 120_000,
-      signal,
-    });
-    if (interruptedBy) {
-      diagnostics?.log("first_event", { outcome: "interrupted" });
-      p.log.info(theme.muted("The integration is complete; first-event polling was interrupted."));
-      return signalExitCode(interruptedBy);
-    }
-    if (first.received) {
-      diagnostics?.log("first_event", {
-        outcome: "received",
-        eventTypePresent: Boolean(first.eventType),
-      });
-      p.log.success(
-        theme.success("Whisperr is receiving events") +
-          (first.eventType ? theme.muted(` (${first.eventType})`) : ""),
-      );
-    } else {
-      diagnostics?.log("first_event", { outcome: "not_received" });
-      p.log.info(theme.muted("No event received yet; events will flow when the app runs."));
-    }
-
-    const undo = invocationSnapshot.size === 0 ? revertHint(checkpoint) : undefined;
-    p.note(
-      [
-        "1. Review the diff.",
-        "2. Run or rebuild the app.",
-        "3. Commit and deploy the integration.",
-        undo ? `Undo the wizard changes: ${undo}` : "",
-        !undo && checkpoint.isRepo
-          ? "Pre-existing changes were preserved; review the diff to undo wizard edits selectively."
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-      "Next",
-    );
-    p.outro(theme.signal("Whisperr is wired in."));
-    return 0;
-  } catch (error) {
-    clearInterval(heartbeat);
-    const safeError = scrubError(error, [
-      session.token,
-      config.directOpenAIKey ?? "",
-      selected.snapshot.ingestion.apiKey,
-    ]);
-    const failurePhase = interruptedBy ? "interrupted" : "failed";
-    diagnostics?.log("run_failed", {
-      stage: safeProgressText(phase),
-      runId: selected.snapshot.run.id,
-      interrupted: Boolean(interruptedBy),
-      runtimeCompleted,
-      ...diagnosticErrorData(error),
-    });
-    if (!runtimeCompleted) {
-      const authoritative = await runtime
-        .getRun(selected.snapshot.run.id)
-        .catch(() => null);
-      if (authoritative?.run.status === "completed") {
-        runtimeCompleted = true;
-        await clearResumeState(selected.statePath);
-      }
-    }
-    if (runtimeCompleted) {
-      p.log.error(
-        theme.alert("The integration completed, but final reporting stopped: ") + safeError,
-      );
-      return interruptedBy ? signalExitCode(interruptedBy) : 1;
-    }
-    await runtime
-      .updateRun(selected.snapshot.run.id, {
-        status: "failed",
-        error: safeError,
-        message: `${failurePhase}: ${safeError}`,
-      })
-      .catch(() => {});
-    if (useSpinner) spin.stop(theme.alert(interruptedBy ? "Integration interrupted" : "Integration stopped"));
-    else p.log.error(theme.alert(interruptedBy ? "Integration interrupted" : "Integration stopped"));
-    p.log.error(safeError);
-    if (!interruptedBy) {
-      await maybeRestoreInvocation(
-        repoPath,
-        checkpoint,
-        invocationSnapshot,
-        "This invocation stopped before completion.",
-      );
-    } else {
-      p.log.info(theme.muted("Generated rows and repository edits were preserved for resume."));
-    }
-    return interruptedBy ? signalExitCode(interruptedBy) : 1;
-  } finally {
-    clearInterval(heartbeat);
-    stopKeepalive();
-  }
-}
-
-async function enforceGitSafety(
-  repoPath: string,
-  checkpoint: GitCheckpoint,
-  resumed: boolean,
-  force = false,
-  diagnostics?: WizardDiagnostics,
-): Promise<boolean> {
-  if (!checkpoint.isRepo) {
-    if (!force) {
-      logGitSafety(diagnostics, checkpoint, resumed, force, false, false);
-      p.cancel(
-        "Not a git repository. Run `git init` and commit first, or use --force without automatic undo.",
-      );
-      return false;
-    }
-    logGitSafety(diagnostics, checkpoint, resumed, force, false, true);
-    p.log.warn("Not a git repository; automatic undo is unavailable.");
-    return true;
-  }
-  const clean = await isWorkingTreeClean(repoPath);
-  if (clean) {
-    logGitSafety(diagnostics, checkpoint, resumed, force, clean, true);
-    return true;
-  }
-  if (force) {
-    logGitSafety(diagnostics, checkpoint, resumed, force, clean, true);
-    p.log.warn(
-      theme.warn("Uncommitted changes present") +
-        theme.muted("; this invocation will preserve them if it is reverted."),
-    );
-    return true;
-  }
-  if (resumed) {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) {
-      logGitSafety(diagnostics, checkpoint, resumed, force, clean, false);
-      p.cancel(
-        "The resumed repository has uncommitted changes. Re-run with --force after confirming they are safe to edit.",
-      );
-      return false;
-    }
-    const confirmed = await p.confirm({
-      message:
-        "This resumed repository has uncommitted changes. Confirm they are the wizard edits you want to continue.",
+    const cont = await p.confirm({
+      message: "Continue anyway and let the agent scaffold against the planned SDK?",
       initialValue: false,
     });
-    if (p.isCancel(confirmed) || !confirmed) {
-      logGitSafety(diagnostics, checkpoint, resumed, force, clean, false);
-      return false;
+    if (p.isCancel(cont) || !cont) {
+      p.outro(theme.muted("No problem — come back when the SDK lands."));
+      return 0;
     }
-    logGitSafety(diagnostics, checkpoint, resumed, force, clean, true);
-    return true;
+  } else {
+    p.log.success(
+      `Detected ${theme.bright(chosen.playbook.target.displayName)} ` +
+        theme.muted(`(${chosen.detection?.evidence.join(", ") ?? "selected"})`),
+    );
   }
-  logGitSafety(diagnostics, checkpoint, resumed, force, clean, false);
-  p.cancel(
-    "Your working tree has uncommitted changes. Commit or stash them first, or use --force.",
+
+  // 2. Authenticate (device flow opens the browser).
+  let session;
+  try {
+    session = config.offline
+      ? await authenticate(config)
+      : await withBrowserAuth(config);
+  } catch (err) {
+    p.cancel(theme.alert((err as Error).message));
+    return 1;
+  }
+  // Sessions slide server-side per authenticated call; this covers the gaps
+  // where the run sits on an interactive prompt with no traffic. Unref'd, so
+  // it never outlives the process.
+  startSessionKeepalive(config, session);
+
+  // 3. Pull the integration manifest (events/interventions/key), telling the
+  //    backend which surface this is so it can mark what's already covered.
+  const fingerprint = await repoFingerprint(repoPath);
+  const manifest = await withSpinner("Loading your onboarding context", () =>
+    fetchManifest(config, session, chosen.playbook.target.id, fingerprint),
   );
-  return false;
+  // Approval immediately merges suggestions into the manifest. Fetch the
+  // approved records in parallel with the run so the end-of-run bookkeeping
+  // only has to reconcile what this surface actually wired.
+  const approvedSuggestionsPromise = config.offline
+    ? null
+    : fetchSuggestions(config, session, ["approved"]);
+  p.note(
+    summarizeManifest(manifest),
+    theme.signal(`Plan for ${manifest.appName ?? manifest.appId}`),
+  );
+
+  // 4. Git safety. The agent auto-applies edits, so we require a clean repo:
+  //    that isolates the wizard's changes and makes a one-command revert
+  //    reliable. --force opts out of the safety net.
+  const checkpoint = await takeCheckpoint(repoPath);
+  if (!checkpoint.isRepo) {
+    if (!options.force) {
+      p.cancel(
+        theme.alert("Not a git repository.") +
+          " The wizard edits your code and relies on git to undo safely.\n" +
+          theme.muted("Run `git init` and commit first, or re-run with --force to proceed without a safety net."),
+      );
+      return 1;
+    }
+    p.log.warn(
+      theme.warn("not a git repo") +
+        theme.muted(" — proceeding with --force; there is no automatic undo."),
+    );
+  } else if (!(await isWorkingTreeClean(repoPath))) {
+    if (!options.force) {
+      p.cancel(
+        theme.alert("Your working tree has uncommitted changes.") +
+          " Commit or stash them first so the wizard's edits stay isolated and reversible.\n" +
+          theme.muted("Or re-run with --force to proceed anyway."),
+      );
+      return 1;
+    }
+    p.log.warn(
+      theme.warn("uncommitted changes present") +
+        theme.muted(" — proceeding with --force; a revert would also drop your own changes."),
+    );
+  }
+
+  // 5. Run the coding agent.
+  const spin = p.spinner();
+  const useIntegrationSpinner = Boolean(process.stdout.isTTY);
+  let phaseLabel = "Integrating";
+  let lastLine = "";
+  let lastActivityLine = "";
+  const startedAt = Date.now();
+  const nextIntegrationMessage = createMessageDeduper();
+  const updateIntegrationMessage = () => {
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    const message =
+      theme.bright(phaseLabel) +
+      theme.muted(` · ${secs}s`) +
+      (lastLine ? theme.muted(` — ${lastLine}`) : "");
+    const next = nextIntegrationMessage(message);
+    if (next) spin.message(next);
+  };
+  if (useIntegrationSpinner) {
+    spin.start(theme.bright(phaseLabel));
+  } else {
+    p.log.step(theme.bright(phaseLabel));
+  }
+  // In a TTY, keep the spinner visibly alive during long tool calls. In
+  // non-TTY output this ticker would print repeated lines, so phase changes are
+  // logged explicitly instead.
+  const tick = useIntegrationSpinner ? setInterval(updateIntegrationMessage, 1000) : undefined;
+
+  const outcome = await runIntegrationAgent({
+    repoPath,
+    config,
+    session,
+    playbook: chosen.playbook,
+    manifest,
+    ...(process.stdout.isTTY && process.stdin.isTTY
+      ? {
+          async onPlanReady(plan: EventPlanEntry[]) {
+            if (useIntegrationSpinner) {
+              spin.stop(theme.success("Placement plan ready"));
+            }
+            p.note(renderPlacementPlan(plan), "Placement plan");
+
+            const placeEntries = plan.filter((entry) => entry.decision === "place");
+            let selectedEvents = placeEntries.map((entry) => entry.event);
+            if (placeEntries.length) {
+              const selection = await p.multiselect({
+                message: "Wire these events?",
+                options: placeEntries.map((entry) => ({
+                  value: entry.event,
+                  label: entry.event,
+                  hint: `${entry.file ?? "unknown file"}@${entry.anchor ?? "unknown anchor"}`,
+                })),
+                initialValues: selectedEvents,
+                required: false,
+              });
+              selectedEvents = p.isCancel(selection) ? [] : (selection as string[]);
+            }
+
+            if (useIntegrationSpinner) {
+              spin.start(theme.bright("Continuing integration"));
+            }
+            return filterEventPlan(plan, selectedEvents);
+          },
+        }
+      : {}),
+    progress: {
+      onPhase(label) {
+        phaseLabel = label;
+        lastLine = "";
+        lastActivityLine = "";
+        if (useIntegrationSpinner) {
+          updateIntegrationMessage();
+        } else {
+          p.log.step(theme.bright(label));
+        }
+      },
+      onActivity(line) {
+        if (line === lastActivityLine) return;
+        lastActivityLine = line;
+        lastLine = line;
+        if (useIntegrationSpinner) updateIntegrationMessage();
+      },
+    },
+  }).catch((err) => {
+    p.log.error((err as Error).message);
+    return null;
+  });
+
+  if (tick) clearInterval(tick);
+  if (!outcome) {
+    if (useIntegrationSpinner) {
+      spin.stop(theme.alert("Integration stopped"));
+    } else {
+      p.log.error(theme.alert("Integration stopped"));
+    }
+    await maybeRevert(repoPath, checkpoint, "The run stopped before finishing.");
+    return 1;
+  }
+
+  // Honest stop label: the core landing is the bar; events may be partial.
+  const stopLabel = !outcome.coreOk
+    ? theme.warn("Stopped early — partial setup is in your working tree")
+    : outcome.eventsComplete
+      ? theme.success("Integration complete")
+      : theme.success("Core integration done") +
+        theme.muted(" — some events left as follow-ups");
+  if (useIntegrationSpinner) {
+    spin.stop(stopLabel);
+  } else if (!outcome.coreOk) {
+    p.log.warn(stopLabel);
+  } else {
+    p.log.success(stopLabel);
+  }
+
+  // Collect any universe opportunities the review pass wrote (this also
+  // removes the proposals file so it never shows up in the customer's diff).
+  const opportunities = await collectOpportunities(repoPath, manifest, checkpoint);
+
+  // 6. Show what changed + the agent's summary.
+  let files = await changedFiles(repoPath, checkpoint);
+  if (files.length) {
+    p.note(files.map((f) => theme.muted("• ") + f).join("\n"), "Files changed");
+  }
+  logAgentSummary(outcome.summary);
+  // If the core (install + identify) didn't land, the integration isn't
+  // trustworthy — offer to undo rather than leaving broken/partial edits.
+  if (!outcome.coreOk) {
+    const reverted = await maybeRevert(
+      repoPath,
+      checkpoint,
+      "The core setup didn't complete, so these changes may be incomplete.",
+    );
+    if (reverted) {
+      p.outro(theme.muted("Reverted — nothing was left in your working tree."));
+      return 1;
+    }
+  }
+
+  // 6b. Deterministic guardrail: run the playbook's verify command OURSELVES so
+  //     "the agent finished" is backed by "the project still compiles/lints".
+  //     The agent is told not to build or run the analyzer — we own that check
+  //     rather than trusting its self-report.
+  // null = not run / couldn't conclude; true = passed; false = failed.
+  let verified: boolean | null = null;
+  if (chosen.playbook.verifyCommand && files.length) {
+    const cmd = chosen.playbook.verifyCommand;
+    const vspin = p.spinner();
+    vspin.start(`Verifying the integration — ${theme.muted(cmd)}`);
+    let verdict = await runVerifyCommand(repoPath, cmd);
+    verified = verdictToVerified(verdict);
+    if (verdict.toolMissing) {
+      vspin.stop(
+        theme.warn("Couldn't verify automatically") +
+          theme.muted(` — \`${cmd}\` isn't available here. Run it yourself before committing.`),
+      );
+    } else if (verdict.timedOut) {
+      vspin.stop(
+        theme.warn(`Verification timed out — \`${cmd}\``) +
+          theme.muted(" — run it yourself before committing."),
+      );
+    } else if (verdict.ok) {
+      vspin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
+    } else {
+      const remainingBudgetUsd = config.budgetUsd - outcome.costUsd;
+      if (remainingBudgetUsd >= 0.5) {
+        vspin.stop(
+          theme.warn(`Verification failed — ${cmd}`) +
+            theme.muted(" — attempting one repair pass"),
+        );
+        const repairSpin = p.spinner();
+        repairSpin.start(`Repairing verifier failures — ${theme.muted(cmd)}`);
+        try {
+          const repair = await runRepairPass({
+            repoPath,
+            config,
+            session,
+            playbook: chosen.playbook,
+            verifyCommand: cmd,
+            verifyOutput: verdict.output.slice(-4000),
+            budgetUsd: remainingBudgetUsd,
+          });
+          outcome.costUsd += repair.costUsd;
+          if (repair.summary.trim()) {
+            outcome.summary = [outcome.summary, `Repair:\n${repair.summary}`]
+              .filter(Boolean)
+              .join("\n\n");
+            logAgentSummary(repair.summary);
+          }
+          repairSpin.stop(theme.success("Repair pass finished"));
+        } catch (err) {
+          repairSpin.stop(
+            theme.warn("Repair pass failed") +
+              theme.muted(` — ${(err as Error).message}`),
+          );
+        }
+
+        files = await changedFiles(repoPath, checkpoint);
+        const reverifySpin = p.spinner();
+        reverifySpin.start(`Re-verifying the integration — ${theme.muted(cmd)}`);
+        verdict = await runVerifyCommand(repoPath, cmd);
+        verified = verdictToVerified(verdict);
+        if (verdict.toolMissing) {
+          reverifySpin.stop(
+            theme.warn("Couldn't verify automatically") +
+              theme.muted(` — \`${cmd}\` isn't available here. Run it yourself before committing.`),
+          );
+        } else if (verdict.timedOut) {
+          reverifySpin.stop(
+            theme.warn(`Verification timed out — \`${cmd}\``) +
+              theme.muted(" — run it yourself before committing."),
+          );
+        } else if (verdict.ok) {
+          reverifySpin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
+        } else {
+          reverifySpin.stop(theme.alert(`Verification still failed — ${cmd}`));
+        }
+      } else {
+        vspin.stop(
+          theme.alert(`Verification failed — ${cmd}`) +
+            theme.muted(" — skipped repair because less than $0.50 budget remains"),
+        );
+      }
+
+      if (!verdict.ok && !verdict.toolMissing && !verdict.timedOut) {
+        if (verdict.output) {
+          p.note(verdict.output, theme.warn("Verifier output"));
+        }
+        const reverted = await maybeRevert(
+          repoPath,
+          checkpoint,
+          "The integration didn't pass its build/lint check, so the edits may be broken.",
+        );
+        if (reverted) {
+          p.outro(theme.muted("Reverted — nothing was left in your working tree."));
+          return 1;
+        }
+      }
+    }
+  }
+
+  // 6c. Universe opportunities: the agent may have proposed events /
+  //     interventions the onboarding plan misses. The user picks which to send
+  //     for dashboard approval. Older backends retain their additions +
+  //     bounded follow-up instrumentation behavior through capability fallback.
+  const { acceptedEvents, instrumentationSnapshot } = await offerOpportunities({
+    repoPath,
+    config,
+    session,
+    playbook: chosen.playbook,
+    manifest,
+    opportunities,
+    fingerprint,
+    checkpoint,
+    remainingBudgetUsd: config.budgetUsd - outcome.costUsd,
+    repoMap: outcome.repoMap,
+  });
+
+  // 6d. The instrumentation pass edits code AFTER the 6b check ran, so that
+  //     verdict no longer describes the working tree. Re-run the same verify
+  //     command so the reported `verified` reflects the final state — the 6b
+  //     result must never claim "verified" for a tree a later pass then broke.
+  if (instrumentationSnapshot && chosen.playbook.verifyCommand) {
+    const cmd = chosen.playbook.verifyCommand;
+    const preInstrumentationVerified = verified;
+    const vspin = p.spinner();
+    vspin.start(`Re-verifying after instrumenting the new events — ${theme.muted(cmd)}`);
+    const verdict = await runVerifyCommand(repoPath, cmd);
+    verified = verdictToVerified(verdict);
+    if (verdict.toolMissing) {
+      vspin.stop(
+        theme.warn("Couldn't re-verify automatically") +
+          theme.muted(` — \`${cmd}\` isn't available here. Run it yourself before committing.`),
+      );
+    } else if (verdict.timedOut) {
+      vspin.stop(
+        theme.warn(`Re-verification timed out — \`${cmd}\``) +
+          theme.muted(" — run it yourself before committing."),
+      );
+    } else if (verdict.ok) {
+      vspin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
+    } else {
+      vspin.stop(theme.alert(`Verification failed after instrumenting the new events — ${cmd}`));
+      if (verdict.output) {
+        p.note(verdict.output, theme.warn("Verifier output"));
+      }
+      // Offer to undo ONLY the instrumentation pass — the integration that
+      // passed 6b stays, and the accepted events remain in the universe.
+      const doRevert = await p.confirm({
+        message:
+          "Instrumenting the new events didn't pass the build/lint check. " +
+          "Revert just those edits? (The events stay in your universe — wire them on a future run.)",
+        initialValue: true,
+      });
+      if (!p.isCancel(doRevert) && doRevert) {
+        if (await restoreToSnapshot(repoPath, checkpoint, instrumentationSnapshot)) {
+          verified = preInstrumentationVerified;
+          p.log.success(theme.success("Reverted the instrumentation edits."));
+        } else {
+          p.log.warn(
+            theme.warn("Couldn't revert automatically — undo manually: ") +
+              (revertHint(checkpoint) ?? "git reset --hard"),
+          );
+        }
+      } else {
+        p.log.info(
+          theme.muted("Left in your working tree — fix the verifier errors before committing."),
+        );
+      }
+    }
+  }
+
+  // Derive which events actually got wired (from the diff) and record coverage
+  // so future runs — including on other surfaces — know what this one handled.
+  // Recompute the diff: the additions pass may have touched more files.
+  const filesForScan = acceptedEvents.length
+    ? await changedFiles(repoPath, checkpoint)
+    : files;
+  const eventTypesToScan = [
+    ...manifest.events.map((e) => e.eventType),
+    ...acceptedEvents.map((e) => e.code),
+  ];
+  const wiredMap = await scanWiredEvents(repoPath, filesForScan, eventTypesToScan);
+  const reportEvents: ReportEvent[] = eventTypesToScan.map((eventType) => ({
+    event_type: eventType,
+    status: wiredMap.has(eventType) ? "wired" : "skipped",
+    file: wiredMap.get(eventType),
+  }));
+  const reportResult = await postRunReport(config, session, {
+    target: chosen.playbook.target.id,
+    repo_fingerprint: fingerprint,
+    identify_wired: outcome.coreOk,
+    verified,
+    cost_usd: outcome.costUsd,
+    duration_ms: outcome.durationMs,
+    summary: scrubSummary(outcome.summary).slice(0, 4000),
+    events: reportEvents,
+  });
+  if (!reportResult.ok) {
+    p.log.warn(
+      theme.warn("Couldn't record this run's coverage on the server") +
+        theme.muted(
+          ` (${formatReportFailure(reportResult)}) — ` +
+            "future runs may re-propose events already wired here.",
+        ),
+    );
+  }
+
+  // Approved events are already part of the normal manifest/instrumentation
+  // flow. Reconcile only after final per-event outcomes are known; this is
+  // deliberately best-effort so bookkeeping can never fail an otherwise good
+  // integration run.
+  try {
+    const approvedSuggestions = await approvedSuggestionsPromise;
+    if (approvedSuggestions?.length) {
+      const integratedEventCodes = new Set(
+        reportEvents
+          .filter((event) => event.status === "wired")
+          .map((event) => normalizeCode(event.event_type)),
+      );
+      for (const event of manifest.events) {
+        if (event.coverage?.some((entry) => entry.sameSurface && entry.status === "wired")) {
+          integratedEventCodes.add(normalizeCode(event.eventType));
+        }
+      }
+
+      const toMark = approvedSuggestions.filter(
+        (suggestion) =>
+          suggestion.status === "approved" &&
+          (suggestion.kind === "intervention" ||
+            integratedEventCodes.has(normalizeCode(suggestion.code))),
+      );
+      const marked = (
+        await Promise.all(
+          toMark.map((suggestion) =>
+            markSuggestionIntegrated(
+              config,
+              session,
+              suggestion.id,
+              chosen.playbook.target.id,
+              fingerprint,
+            ),
+          ),
+        )
+      ).filter(Boolean).length;
+      if (marked > 0) {
+        p.log.info(
+          theme.muted(
+            `${marked} approved suggestion${marked === 1 ? "" : "s"} marked integrated.`,
+          ),
+        );
+      }
+    }
+  } catch {
+    // Enrichment only: fetch/mark helpers already swallow failures, and this
+    // guard also protects the run from unexpected response-shape issues.
+  }
+
+  const eventLines = renderEventOutcomeLines(outcome.eventOutcomes, wiredMap);
+  if (eventLines) {
+    p.note(eventLines, "Events");
+  }
+  const eventOutcomeByType = new Map(
+    outcome.eventOutcomes.map((event) => [event.event, event]),
+  );
+  const gapReport = buildGapReport({
+    manifest,
+    events: reportEvents.map((event) => ({
+      eventType: event.event_type,
+      status: event.status,
+      reason: eventOutcomeByType.get(event.event_type)?.reason,
+    })),
+  });
+  if (gapReport.hasContent) {
+    p.note(
+      renderGapReport(gapReport, theme),
+      theme.signal("What you could be doing"),
+    );
+  }
+  const eventDenominator = manifest.universeSummary?.wireableHere ?? eventTypesToScan.length;
+  const eventStatsLabel = manifest.universeSummary ? "events wired here" : "events wired";
+  const timingDetails = outcome.phaseTimings
+    .map(({ phase, ms }) => `${shortPhaseLabel(phase)} ${formatDuration(ms)}`)
+    .join(" · ");
+
+  // Cost is internal telemetry (it rides the run report) — never show the
+  // customer what a run costs us.
+  p.log.info(
+    theme.muted(
+      `${wiredMap.size}/${eventDenominator} ${eventStatsLabel} · ` +
+        `${files.length} file${files.length === 1 ? "" : "s"} changed · ` +
+        (verified === true ? "verified · " : verified === false ? "unverified · " : "") +
+        formatDuration(outcome.durationMs) +
+        (timingDetails ? ` (${timingDetails})` : ""),
+    ),
+  );
+
+  // 7. Activation: wait for the first event (skipped offline).
+  if (!config.offline) {
+    p.log.step(
+      theme.bright("Run your app once") +
+        theme.muted(" and trigger any tracked action — I'll watch for the first event."),
+    );
+    const verifySpin = p.spinner();
+    verifySpin.start("Waiting for the first event from your app");
+    const first = await pollFirstEvent(config, session, { timeoutMs: 120_000 });
+    if (first.received) {
+      verifySpin.stop(
+        theme.success(
+          `Whisperr is receiving events ✓` +
+            (first.eventType ? theme.muted(`  (first: ${first.eventType})`) : ""),
+        ),
+      );
+    } else {
+      verifySpin.stop(
+        theme.warn(
+          "No events yet — that's fine. They'll flow once you run the app with the changes.",
+        ),
+      );
+    }
+  }
+
+  // 8. Outro with next steps + undo.
+  const undo = revertHint(checkpoint);
+  const nextSteps = [
+    `${theme.signal("1.")} Review the diff above.`,
+    `${theme.signal("2.")} Run / rebuild your app to start sending events.`,
+    `${theme.signal("3.")} Commit & deploy — Whisperr starts working on real users.`,
+    undo ? theme.muted(`Undo everything: ${undo}`) : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  p.note(nextSteps, theme.bright("Next"));
+  p.outro(theme.signal("⌁ ") + theme.bright("Whisperr is wired in."));
+  return 0;
 }
 
-async function maybeRestoreInvocation(
+// --- helpers ---
+
+interface AdditionsOutcome {
+  /** Events the backend actually applied to the universe. */
+  acceptedEvents: OpportunityEvent[];
+  /**
+   * Pre-instrumentation snapshot of the wizard's changes, set only when the
+   * instrumentation pass actually edited files. Non-null tells the caller the
+   * 6b verify verdict is stale and gives it the exact state to restore if the
+   * re-check fails.
+   */
+  instrumentationSnapshot: ChangesSnapshot | null;
+}
+
+const NO_ADDITIONS: AdditionsOutcome = { acceptedEvents: [], instrumentationSnapshot: null };
+
+/**
+ * Present the agent's universe opportunities and stage the confirmed ones for
+ * dashboard approval. A backend without suggestions falls through to the
+ * legacy additions + same-run instrumentation path. Never throws —
+ * opportunities are additive and must not fail the run.
+ */
+async function offerOpportunities(opts: {
+  repoPath: string;
+  config: WizardConfig;
+  session: WizardSession;
+  playbook: Playbook;
+  manifest: IntegrationManifest;
+  opportunities: UniverseOpportunities;
+  fingerprint: string;
+  checkpoint: GitCheckpoint;
+  remainingBudgetUsd: number;
+  repoMap?: string;
+}): Promise<AdditionsOutcome> {
+  const { manifest, config, session } = opts;
+  const openSuggestions = await fetchSuggestions(config, session, ["proposed", "approved"]);
+  const openSuggestionKeys = new Set(
+    openSuggestions.map(
+      (suggestion) => `${suggestion.kind}:${normalizeCode(suggestion.code)}`,
+    ),
+  );
+  const opportunities: UniverseOpportunities = {
+    events: opts.opportunities.events.filter(
+      (event) => !openSuggestionKeys.has(`event:${normalizeCode(event.code)}`),
+    ),
+    interventions: opts.opportunities.interventions.filter(
+      (intervention) =>
+        !openSuggestionKeys.has(`intervention:${normalizeCode(intervention.code)}`),
+    ),
+  };
+  const total = opportunities.events.length + opportunities.interventions.length;
+  if (total === 0) return NO_ADDITIONS;
+
+  const describe = (kind: string, code: string, why?: string) =>
+    `${theme.muted(`${kind}: `)}${theme.bright(code)}${why ? theme.muted(` — ${why}`) : ""}`;
+  p.note(
+    [
+      ...opportunities.events.map((e) => describe("event", e.code, e.rationale ?? e.description)),
+      ...opportunities.interventions.map((i) =>
+        describe("intervention", i.code, i.rationale ?? i.description),
+      ),
+    ].join("\n"),
+    theme.signal("Opportunities found beyond your onboarding plan"),
+  );
+
+  if (config.offline) {
+    p.log.info(theme.muted("Offline mode — proposals shown only, nothing submitted."));
+    return NO_ADDITIONS;
+  }
+  if (!process.stdout.isTTY || !process.stdin.isTTY) {
+    p.log.info(
+      theme.muted("Non-interactive run — proposals were not submitted. Re-run interactively to add them."),
+    );
+    return NO_ADDITIONS;
+  }
+
+  const selection = await p.multiselect({
+    message: "Send these to your dashboard for approval?",
+    options: [
+      ...opportunities.events.map((e) => ({
+        value: `e:${e.code}`,
+        label: `event · ${e.code}`,
+        hint: e.description ?? e.rationale,
+      })),
+      ...opportunities.interventions.map((i) => ({
+        value: `i:${i.code}`,
+        label: `intervention · ${i.code}`,
+        hint: i.description ?? i.rationale,
+      })),
+    ],
+    // Opt-in per item: nothing is pre-selected, so submitting a suggestion is
+    // an explicit choice rather than an opt-out the user has to notice and undo.
+    initialValues: [],
+    required: false,
+  });
+  if (p.isCancel(selection) || selection.length === 0) {
+    p.log.info(theme.muted("Skipped — your universe is unchanged."));
+    return NO_ADDITIONS;
+  }
+
+  const chosenSet = new Set(selection as string[]);
+  const knownInterventionCodes = new Set(
+    manifest.events.flatMap((e) => e.interventions ?? []).map((i) => i.code),
+  );
+  const knownEventCodes = new Set(manifest.events.map((e) => e.eventType));
+  const pickedEvents = opportunities.events.filter((e) => chosenSet.has(`e:${e.code}`));
+  const pickedInterventions = opportunities.interventions.filter((i) =>
+    chosenSet.has(`i:${i.code}`),
+  );
+  // Drop links whose other end wasn't selected and doesn't already exist —
+  // the server would reject them as unknown references anyway.
+  const pickedInterventionCodes = new Set(pickedInterventions.map((i) => i.code));
+  const pickedEventCodes = new Set(pickedEvents.map((e) => e.code));
+  const submitted: UniverseOpportunities = {
+    events: pickedEvents.map((e) => ({
+      ...e,
+      links: e.links?.filter(
+        (l) => knownInterventionCodes.has(l.interventionCode) || pickedInterventionCodes.has(l.interventionCode),
+      ),
+    })),
+    interventions: pickedInterventions.map((i) => ({
+      ...i,
+      links: i.links?.filter(
+        (l) => knownEventCodes.has(l.eventCode) || pickedEventCodes.has(l.eventCode),
+      ),
+    })),
+  };
+
+  let stageResult: StageResult | null;
+  try {
+    stageResult = await withSpinner("Sending suggestions for approval", () =>
+      submitSuggestions(config, session, opts.playbook.target.id, opts.fingerprint, submitted),
+    );
+  } catch (err) {
+    p.log.warn(
+      theme.warn("Couldn't send the proposals") +
+        theme.muted(` — ${(err as Error).message}. Nothing was submitted.`),
+    );
+    return NO_ADDITIONS;
+  }
+
+  if (stageResult) {
+    const lines = stageResult.outcomes.map((outcome) => {
+      const mark =
+        outcome.status === "staged"
+          ? theme.success("✓")
+          : outcome.status === "duplicate"
+            ? theme.muted("=")
+            : theme.warn("✗");
+      const reason =
+        outcome.reason ??
+        (outcome.duplicateOf && outcome.duplicateOf !== outcome.code
+          ? `already queued as ${outcome.duplicateOf}`
+          : undefined);
+      const detail = reason ? theme.muted(` (${reason})`) : "";
+      return `${mark} ${outcome.kind} ${theme.bright(outcome.code)}${detail}`;
+    });
+    lines.push(
+      theme.muted(
+        `${stageResult.staged} staged · ${stageResult.duplicates} already queued · ${stageResult.invalid} rejected`,
+      ),
+    );
+    p.note(lines.join("\n"), theme.signal("Suggestions submitted"));
+    const where = stageResult.approvalsUrl
+      ? `approve at ${theme.bright(stageResult.approvalsUrl)}`
+      : "approve them in your Whisperr dashboard";
+    p.log.info(
+      theme.muted(
+        `${stageResult.staged} proposal${stageResult.staged === 1 ? "" : "s"} sent — ${where}. The next wizard run wires whatever you approve.`,
+      ),
+    );
+    return NO_ADDITIONS;
+  }
+
+  // Capability fallback for older backends. Keep the established additions
+  // merge and same-run instrumentation behavior intact below this point.
+  let result;
+  try {
+    result = await withSpinner("Adding to your universe", () =>
+      submitAdditions(config, session, opts.playbook.target.id, opts.fingerprint, submitted),
+    );
+  } catch (err) {
+    p.log.warn(
+      theme.warn("Couldn't add the proposals") +
+        theme.muted(` — ${(err as Error).message}. Your universe is unchanged.`),
+    );
+    return NO_ADDITIONS;
+  }
+
+  const lines = result.outcomes.map((o) => {
+    const mark =
+      o.status === "applied"
+        ? theme.success("✓")
+        : o.status === "duplicate"
+          ? theme.muted("=")
+          : theme.warn("✗");
+    const detail =
+      o.status === "duplicate"
+        ? theme.muted(` (already in your universe${o.duplicateOf && o.duplicateOf !== o.code ? ` as ${o.duplicateOf}` : ""})`)
+        : o.status === "invalid" && o.reason
+          ? theme.muted(` (${o.reason})`)
+          : "";
+    return `${mark} ${o.kind} ${theme.bright(o.code)}${detail}`;
+  });
+  lines.push(
+    theme.muted(
+      `${result.applied} added · ${result.duplicates} already present · ${result.invalid} rejected`,
+    ),
+  );
+  if (submitted.interventions.length) {
+    lines.push(theme.muted("New interventions start paused — activate them in your dashboard."));
+  }
+  // The regen leg tells us whether live decisioning will actually see the
+  // applied rows — "Universe updated" alone would overpromise when it failed.
+  if (result.policyRegen?.status === "pending") {
+    lines.push(
+      theme.muted("Runtime policy update queued — the additions go live once it completes."),
+    );
+  }
+  if (result.policyRegen?.status === "draft") {
+    lines.push(
+      theme.muted(
+        "A review policy draft was queued — activate it in your dashboard once it finishes generating to take the additions live (your current live policy was left untouched).",
+      ),
+    );
+  }
+  p.note(lines.join("\n"), theme.signal("Universe updated"));
+  if (result.policyRegen?.status === "failed") {
+    p.log.warn(
+      theme.warn("Live runtime NOT updated") +
+        theme.muted(
+          " — the additions were recorded, but the runtime policy wasn't regenerated" +
+            (result.policyRegen.reason ? `: ${result.policyRegen.reason}` : "") +
+            ". They won't drive live decisions until the policy regenerates.",
+        ),
+    );
+  }
+
+  const appliedEventCodes = new Set(
+    result.outcomes
+      .filter((o) => o.kind === "event" && o.status === "applied")
+      .map((o) => o.code),
+  );
+  const acceptedEvents = pickedEvents.filter((e) => appliedEventCodes.has(e.code));
+  if (!acceptedEvents.length) return NO_ADDITIONS;
+
+  // Wire the newly accepted events now — otherwise they'd exist in the plan
+  // but never fire from this surface. Snapshot the tree first: it's the state
+  // 6b verified, and the exact point to restore if this pass breaks the build.
+  const prePass = await snapshotChanges(opts.repoPath, opts.checkpoint);
+  const spin = p.spinner();
+  spin.start(theme.bright("Instrumenting the newly added events"));
+  try {
+    const pass = await runAdditionsInstrumentationPass({
+      repoPath: opts.repoPath,
+      config,
+      session,
+      playbook: opts.playbook,
+      acceptedEvents,
+      budgetUsd: opts.remainingBudgetUsd,
+      repoMap: opts.repoMap,
+    });
+    if (pass.ran) {
+      spin.stop(theme.success("New events instrumented"));
+      logAgentSummary(pass.summary);
+    } else {
+      spin.stop(
+        theme.warn("Skipped instrumenting the new events") +
+          theme.muted(
+            " — the spend limit was reached. They're in your universe; wire them on a future run.",
+          ),
+      );
+    }
+  } catch (err) {
+    spin.stop(
+      theme.warn("Couldn't instrument the new events") +
+        theme.muted(` — ${(err as Error).message}. They're in your universe; wire them on a future run.`),
+    );
+  }
+  // Even a failed pass may have left partial edits behind — compare contents,
+  // not just the outcome, so the caller re-verifies exactly when needed.
+  const edited = !snapshotsEqual(prePass, await snapshotChanges(opts.repoPath, opts.checkpoint));
+  return { acceptedEvents, instrumentationSnapshot: edited ? prePass : null };
+}
+
+/**
+ * Offer to undo the wizard's changes when a run didn't finish cleanly. Returns
+ * true if the working tree was reverted. No-op when there's nothing to revert.
+ */
+async function maybeRevert(
   repoPath: string,
   checkpoint: GitCheckpoint,
-  before: ChangesSnapshot,
   reason: string,
 ): Promise<boolean> {
   if (!checkpoint.isRepo) return false;
-  const current = await snapshotChanges(repoPath, checkpoint);
-  if (snapshotsEqual(before, current)) return false;
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    p.log.info(theme.muted("Partial edits were preserved for resume."));
+  const files = await changedFiles(repoPath, checkpoint);
+  if (files.length === 0) return false;
+
+  const doRevert = await p.confirm({
+    message: `${reason} Revert all of the wizard's changes now?`,
+    initialValue: true,
+  });
+  if (p.isCancel(doRevert) || !doRevert) {
+    const hint = revertHint(checkpoint);
+    if (hint) p.log.info(theme.muted(`Left in your working tree. Undo anytime: ${hint}`));
     return false;
   }
-  const answer = await p.confirm({
-    message: `${reason} Revert only the edits made by this invocation?`,
-    initialValue: false,
-  });
-  if (p.isCancel(answer) || !answer) return false;
-  const restored = await restoreToSnapshot(repoPath, checkpoint, before);
-  if (restored) p.log.success("Restored the repository to its pre-invocation state.");
-  else p.log.warn("Automatic restore failed; inspect the working tree manually.");
-  return restored;
+
+  const ok = await revertToCheckpoint(repoPath, checkpoint);
+  if (ok) {
+    p.log.success(theme.success("Reverted to your pre-wizard state."));
+  } else {
+    p.log.warn(
+      theme.warn("Couldn't revert automatically — undo manually: ") +
+        (revertHint(checkpoint) ?? "git reset --hard"),
+    );
+  }
+  return ok;
 }
 
 interface Chosen {
@@ -500,160 +973,231 @@ interface Chosen {
 
 async function chooseTarget(detections: Detection[]): Promise<Chosen | null> {
   const top = detections[0];
+  // Strong single match -> auto-pick.
   if (top && (detections.length === 1 || top.confidence >= 0.9)) {
     const playbook = playbookByTargetId(top.target.id);
     if (playbook) return { playbook, detection: top };
   }
+
+  // Ambiguous or none -> ask, seeded by detections then all targets.
   const seen = new Set<string>();
-  const choices: Array<{ value: string; label: string; hint?: string }> = [];
-  for (const detection of detections) {
-    if (seen.has(detection.target.id)) continue;
-    seen.add(detection.target.id);
-    choices.push({
-      value: detection.target.id,
-      label: detection.target.displayName,
-      hint: `${Math.round(detection.confidence * 100)}% match`,
+  const options: { value: string; label: string; hint?: string }[] = [];
+  for (const d of detections) {
+    if (seen.has(d.target.id)) continue;
+    seen.add(d.target.id);
+    options.push({
+      value: d.target.id,
+      label: d.target.displayName,
+      hint:
+        (d.target.availability === "available" ? "" : "coming soon · ") +
+        `${Math.round(d.confidence * 100)}% match`,
     });
   }
-  for (const playbook of ALL_PLAYBOOKS) {
-    if (seen.has(playbook.target.id)) continue;
-    choices.push({
-      value: playbook.target.id,
-      label: playbook.target.displayName,
-      hint: playbook.target.availability === "available" ? undefined : "coming soon",
+  for (const pb of ALL_PLAYBOOKS) {
+    if (seen.has(pb.target.id)) continue;
+    options.push({
+      value: pb.target.id,
+      label: pb.target.displayName,
+      hint: pb.target.availability === "available" ? undefined : "coming soon",
     });
   }
+
   const answer = await p.select({
     message: detections.length
-      ? "Which detected stack should Whisperr integrate?"
-      : "Which stack should Whisperr integrate?",
-    options: choices,
+      ? "I found more than one possible stack — which should I integrate?"
+      : "I couldn't auto-detect your stack. Which are you using?",
+    options,
   });
   if (p.isCancel(answer)) return null;
   const playbook = playbookByTargetId(answer as string);
-  return playbook
-    ? { playbook, detection: detections.find((item) => item.target.id === answer) }
-    : null;
+  if (!playbook) return null;
+  return {
+    playbook,
+    detection: detections.find((d) => d.target.id === answer),
+  };
 }
 
-async function withBrowserAuth(
-  config: WizardConfig,
-  diagnostics?: WizardDiagnostics,
-  signal?: AbortSignal,
-): Promise<WizardSession> {
-  diagnostics?.log("auth_stage", { stage: "authorization_started" });
-  p.log.step(theme.bright("Authenticate") + theme.muted(" - opening device approval"));
-  const auth = await startDeviceAuth(config, signal);
-  diagnostics?.registerSecrets(
-    auth.userCode,
-    auth.verificationUrl,
-    auth.verificationUrlComplete,
+async function withBrowserAuth(config: ReturnType<typeof resolveConfig>) {
+  p.log.step(
+    theme.bright("Authenticate") +
+      theme.muted(" — opening your browser to approve this device…"),
   );
-  diagnostics?.log("auth_stage", { stage: "device_authorization_created" });
+  const auth = await startDeviceAuth(config);
   p.note(
     [
-      `Code: ${auth.userCode}`,
-      `Approval URL: ${auth.verificationUrl}`,
-      "Use the URL and code if the browser does not open.",
+      theme.bright(`Your code: ${auth.userCode}`),
+      `${theme.muted("Approval URL:")} ${auth.verificationUrl}`,
+      theme.muted(
+        "We tried to open your browser. If it didn't open, visit that link on any device and enter the code.",
+      ),
     ].join("\n"),
-    "Approve this device",
+    theme.signal("Approve this device"),
   );
+
   try {
     await open(auth.verificationUrlComplete ?? auth.verificationUrl);
-    diagnostics?.log("auth_stage", { stage: "browser_opened" });
   } catch {
-    diagnostics?.log("auth_stage", { stage: "browser_open_failed" });
-    // The printed URL supports headless environments.
+    /* headless / no browser — the printed URL and code cover it */
   }
+
   const spin = p.spinner();
-  spin.start("Waiting for browser approval");
+  spin.start("Waiting for you to approve in the browser");
   try {
     const session = await auth.poll();
-    diagnostics?.registerSecrets(session.token);
-    diagnostics?.log("auth_stage", { stage: "approved" });
-    spin.stop(theme.success("Authenticated"));
+    spin.stop(theme.success("Authenticated ✓"));
     return session;
-  } catch (error) {
-    diagnostics?.log("auth_stage", {
-      stage: "failed",
-      ...diagnosticErrorData(error),
-    });
+  } catch (err) {
     spin.stop(theme.alert("Authentication failed"));
-    throw error;
+    throw err;
   }
 }
 
-function handledSignal(value: unknown): "SIGINT" | "SIGTERM" | undefined {
-  return value === "SIGINT" || value === "SIGTERM" ? value : undefined;
-}
-
-function signalExitCode(signal: "SIGINT" | "SIGTERM" | undefined): 130 | 143 {
-  return signal === "SIGTERM" ? 143 : 130;
-}
-
-function logGitSafety(
-  diagnostics: WizardDiagnostics | undefined,
-  checkpoint: GitCheckpoint,
-  resumed: boolean,
-  force: boolean,
-  clean: boolean,
-  allowed: boolean,
-): void {
-  diagnostics?.log("git_safety", {
-    isRepository: checkpoint.isRepo,
-    clean,
-    forced: force,
-    resumed,
-    allowed,
-    automaticUndo: checkpoint.isRepo,
-  });
-}
-
-function safeProgressText(value: string): string {
-  return scrubError(value).replace(/\s+/g, " ").slice(0, 160);
-}
-
-function activityCategory(value: string): string {
-  const categories: Array<[string, string]> = [
-    ["Edited ", "repository_edit"],
-    ["Created ", "repository_create"],
-    ["Configured ", "ingestion_configured"],
-    ["Running ", "command_started"],
-    ["Reading ", "repository_read"],
-    ["Scanning ", "repository_scan"],
-    ["Searching ", "repository_search"],
-    ["Persisted ", "model_item_persisted"],
-    ["Verification failed", "verification_failed"],
-    ["The stable end-user identity", "identity_wiring_pending"],
-    ["Generated events", "event_wiring_pending"],
-    ["Runtime model", "runtime_completed"],
-    ["The previous model conversation", "conversation_restarted"],
-  ];
-  return categories.find(([prefix]) => value.startsWith(prefix))?.[1] ?? "progress_update";
-}
-
-async function withSpinner<T>(label: string, action: () => Promise<T>): Promise<T> {
+async function withSpinner<T>(label: string, fn: () => Promise<T>): Promise<T> {
   const spin = p.spinner();
   spin.start(label);
   try {
-    const result = await action();
-    spin.stop(`${label} ${theme.success("ok")}`);
+    const result = await fn();
+    spin.stop(theme.muted(label) + " " + theme.success("✓"));
     return result;
-  } catch (error) {
-    spin.stop(theme.alert(`${label} failed`));
-    throw error;
+  } catch (err) {
+    spin.stop(theme.alert(`${label} — failed`));
+    throw err;
   }
 }
 
-async function hasIdentifyCall(repoPath: string, files: string[]): Promise<boolean> {
-  for (const file of files) {
-    try {
-      if (hasWhisperrMethodCall(await readFile(join(repoPath, file), "utf8"), "identify")) {
-        return true;
+export function createMessageDeduper(): (message: string) => string | null {
+  let last = "";
+  return (message: string) => {
+    if (message === last) return null;
+    last = message;
+    return message;
+  };
+}
+
+export function formatDuration(ms: number): string {
+  const safeMs = Math.max(0, ms);
+  const totalSeconds = Math.round(safeMs / 1000);
+  if (safeMs < 60_000) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}m${seconds}s`;
+}
+
+export function filterEventPlan(
+  plan: EventPlanEntry[],
+  selectedEvents: readonly string[],
+): EventPlanEntry[] {
+  const selected = new Set(selectedEvents);
+  return plan.map((entry) =>
+    entry.decision === "place" && !selected.has(entry.event)
+      ? { ...entry, decision: "skip", reason: "Deselected in plan review." }
+      : entry,
+  );
+}
+
+function renderPlacementPlan(plan: EventPlanEntry[]): string {
+  return plan
+    .map((entry) => {
+      if (entry.decision === "place") {
+        return (
+          theme.success("✓ ") +
+          entry.event +
+          theme.muted(
+            ` — ${entry.file ?? "unknown file"} @ ${entry.anchor ?? "unknown anchor"}`,
+          )
+        );
       }
-    } catch {
-      // Ignore binary, deleted, or concurrently changed files.
+      const reason = entry.reason || "No reason provided.";
+      const line = `${entry.decision === "skip" ? "○" : "?"} ${entry.event} — ${reason}`;
+      return entry.decision === "skip" ? theme.muted(line) : theme.warn(line);
+    })
+    .join("\n");
+}
+
+function renderEventOutcomeLines(
+  outcomes: AgentEventOutcome[],
+  wiredMap: Map<string, string>,
+): string {
+  const maxLines = 40;
+  const visibleCount = outcomes.length > maxLines ? maxLines - 1 : outcomes.length;
+  const lines = outcomes.slice(0, visibleCount).map((outcome) => {
+    if (outcome.outcome === "wired") {
+      const file = wiredMap.get(outcome.event);
+      return theme.success("✓ ") + outcome.event + (file ? theme.muted(` — ${file}`) : "");
     }
+    return theme.muted(
+      `○ ${outcome.event} — ${outcome.reason || "No track() call was detected."}`,
+    );
+  });
+  const remainder = outcomes.length - visibleCount;
+  if (remainder > 0) lines.push(theme.muted(`… ${remainder} more events`));
+  return lines.join("\n");
+}
+
+function logAgentSummary(summary: string): void {
+  const cleaned = scrubSummary(summary).trim();
+  if (cleaned) p.log.message(cleaned);
+}
+
+function shortPhaseLabel(phase: string): string {
+  switch (phase) {
+    case "Mapping your codebase":
+      return "map";
+    case "Installing the SDK & wiring identify()":
+      return "core";
+    case "Planning event placements":
+      return "plan";
+    case "Instrumenting planned events":
+    case "Instrumenting your events":
+      return "wire";
+    case "Reconciling missed events":
+      return "reconcile";
+    case "Reviewing & correcting placements":
+      return "review";
+    default:
+      return phase;
   }
-  return false;
+}
+
+export function summarizeManifest(m: {
+  events: { eventType: string; importance?: number }[];
+  identify: { channels?: string[] };
+  universeSummary?: {
+    total: number;
+    wireableHere: number;
+    derived: number;
+    otherSurface: number;
+  };
+}): string {
+  const events = [...m.events]
+    .sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0))
+    .map((e) => theme.muted("• ") + e.eventType);
+  const channels = m.identify.channels?.length
+    ? theme.muted(`channels: ${m.identify.channels.join(", ")}`)
+    : "";
+  const firstLine = m.universeSummary
+    ? theme.bright(`${m.universeSummary.total} events in your universe`) +
+      theme.muted(
+        ` — ${m.universeSummary.wireableHere} wireable here · ` +
+          `${m.universeSummary.derived} computed by Whisperr from your raw events · ` +
+          `${m.universeSummary.otherSurface} live on other surfaces`,
+      )
+    : theme.bright("identify()") +
+      theme.muted(" + ") +
+      theme.bright(`${m.events.length} events`);
+  return [
+    firstLine,
+    ...events,
+    channels,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatReportFailure(result: { status?: number; detail?: string }): string {
+  const detail = result.detail?.replace(/\s+/g, " ").trim();
+  if (result.status !== undefined) {
+    return `HTTP ${result.status}${detail ? `: ${detail}` : ""}`;
+  }
+  return detail || "request failed";
 }

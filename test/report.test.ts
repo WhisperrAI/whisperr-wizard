@@ -5,6 +5,7 @@ import type { WizardConfig, WizardSession } from "../src/types.js";
 
 const config = {
   apiBaseUrl: "https://example.invalid",
+  offline: false,
 } as WizardConfig;
 
 const session: WizardSession = {

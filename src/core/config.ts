@@ -3,82 +3,85 @@ import type { WizardConfig } from "../types.js";
 /**
  * Resolve wizard configuration from env + flags.
  *
- * Production uses the short-lived wizard token against runtime's
- * OpenAI-compatible gateway. Local development can opt into a direct OpenAI
- * key, which remains process-local.
+ * Production: the CLI never carries an Anthropic key. It authenticates the user
+ * (device flow), receives a short-lived wizard token, and points the Agent SDK
+ * at Whisperr's Anthropic-compatible gateway via ANTHROPIC_BASE_URL +
+ * ANTHROPIC_AUTH_TOKEN. The gateway injects the real key server-side and meters
+ * usage per app.
  *
- * Local dev: set WHISPERR_WIZARD_DIRECT_OPENAI_KEY explicitly.
+ * Local dev: set WHISPERR_WIZARD_DIRECT_ANTHROPIC_KEY (or ANTHROPIC_API_KEY) and
+ * --offline to run the whole flow against a real model + a mock manifest, with
+ * no backend required.
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
-const DEFAULT_OPENAI_GATEWAY_BASE =
-  "https://ca-whisperr-api-prod.graycliff-3f912aeb.swedencentral.azurecontainerapps.io/wizard/openai";
-export const DEFAULT_PRIMARY_MODEL = "gpt-5.6-sol";
-export const DEFAULT_EXPLORER_MODEL = "gpt-5.6-terra";
-const DEFAULT_PRIMARY_EFFORT = "high";
-const DEFAULT_EXPLORER_EFFORT = "xhigh";
+// Two-tier agent design:
+// - plannerModel (Opus by default) thinks: map the repo, choose event placement
+//   sites, and review the resulting diff with deeper reasoning.
+// - model (Sonnet by default) types: perform the mechanical SDK wiring at the
+//   already-planned sites quickly and cheaply.
+// Override the editor with WHISPERR_WIZARD_MODEL or --model. Override the
+// planner with WHISPERR_WIZARD_PLANNER_MODEL.
+const DEFAULT_MODEL = "claude-sonnet-5";
+const DEFAULT_PLANNER_MODEL = "claude-opus-4-8";
+// Reasoning effort (pairs with adaptive thinking). "high" — placement is a
+// reasoning task (which moment, which branch, which properties), so we give it
+// room to think. Drop to medium/low via WHISPERR_WIZARD_EFFORT for cheap runs.
+const DEFAULT_EFFORT = "high";
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = (typeof EFFORT_LEVELS)[number];
 
-function resolveEffort(value: string | undefined, fallback: Effort): Effort {
-  const raw = (value ?? "").toLowerCase();
+function resolveEffort(): Effort {
+  const raw = (process.env.WHISPERR_WIZARD_EFFORT ?? "").toLowerCase();
   return (EFFORT_LEVELS as readonly string[]).includes(raw)
     ? (raw as Effort)
-    : fallback;
+    : DEFAULT_EFFORT;
 }
 
 export interface CliFlags {
+  offline?: boolean;
   apiBaseUrl?: string;
   model?: string;
-  /** Proceed with existing changes; failed-invocation restore preserves them. */
+  /** Proceed even without a clean git working tree (no safe auto-undo). */
   force?: boolean;
 }
 
-export function stripTrailingSlashes(value: string): string {
-  let end = value.length;
-  while (end > 0 && value.charCodeAt(end - 1) === 47) end -= 1;
-  return value.slice(0, end);
-}
-
 export function resolveConfig(flags: CliFlags = {}): WizardConfig {
-  const apiBaseUrl = stripTrailingSlashes(
+  const apiBaseUrl = (
     flags.apiBaseUrl ??
     process.env.WHISPERR_WIZARD_API_BASE ??
-    DEFAULT_API_BASE,
-  );
+    DEFAULT_API_BASE
+  ).replace(/\/+$/, "");
 
-  const directOpenAIKey = process.env.WHISPERR_WIZARD_DIRECT_OPENAI_KEY;
-  const openAIBaseUrl = stripTrailingSlashes(
-    process.env.WHISPERR_WIZARD_OPENAI_BASE ??
-    (directOpenAIKey
-      ? "https://api.openai.com/v1"
-      : apiBaseUrl === DEFAULT_API_BASE
-        ? DEFAULT_OPENAI_GATEWAY_BASE
-        : `${apiBaseUrl}/wizard/openai`),
-  );
+  const llmBaseUrl = (
+    process.env.WHISPERR_WIZARD_LLM_BASE ?? `${apiBaseUrl}/wizard/llm`
+  ).replace(/\/+$/, "");
+
+  const directAnthropicKey =
+    process.env.WHISPERR_WIZARD_DIRECT_ANTHROPIC_KEY ??
+    process.env.ANTHROPIC_API_KEY;
+
+  const offline =
+    flags.offline ??
+    ["1", "true", "yes"].includes(
+      (process.env.WHISPERR_WIZARD_OFFLINE ?? "").toLowerCase(),
+    );
 
   return {
     apiBaseUrl,
-    openAIBaseUrl,
-    primaryModel:
-      flags.model ??
-      process.env.WHISPERR_WIZARD_PRIMARY_MODEL ??
-      DEFAULT_PRIMARY_MODEL,
-    primaryEffort: resolveEffort(
-      process.env.WHISPERR_WIZARD_PRIMARY_EFFORT,
-      DEFAULT_PRIMARY_EFFORT,
-    ),
-    primaryServiceTier:
-      process.env.WHISPERR_WIZARD_SERVICE_TIER === "default"
-        ? "default"
-        : "priority",
-    explorerModel:
-      process.env.WHISPERR_WIZARD_EXPLORER_MODEL ?? DEFAULT_EXPLORER_MODEL,
-    explorerEffort: resolveEffort(
-      process.env.WHISPERR_WIZARD_EXPLORER_EFFORT,
-      DEFAULT_EXPLORER_EFFORT,
-    ),
+    llmBaseUrl,
+    model: flags.model ?? process.env.WHISPERR_WIZARD_MODEL ?? DEFAULT_MODEL,
+    plannerModel:
+      process.env.WHISPERR_WIZARD_PLANNER_MODEL ?? DEFAULT_PLANNER_MODEL,
+    effort: resolveEffort(),
+    // Cost is the real limiter (budgetUsd below). maxTurns is only a high safety
+    // backstop against a stuck loop — it should NOT bind on a normal run. (It
+    // used to be 55, which guillotined high-effort multi-phase runs mid-work.)
     maxTurns: Number(process.env.WHISPERR_WIZARD_MAX_TURNS) || 200,
-    directOpenAIKey,
+    // Hard ceiling on TOTAL spend across all phases. If hit, the run stops
+    // cleanly and keeps whatever already landed. Real runs finish well under it.
+    budgetUsd: Number(process.env.WHISPERR_WIZARD_BUDGET_USD) || 25,
+    directAnthropicKey,
+    offline,
   };
 }

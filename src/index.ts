@@ -1,16 +1,14 @@
 import { readFileSync, realpathSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { run, type RunContext, type RunOptions } from "./cli.js";
-import { diagnosticErrorData, WizardDiagnostics } from "./core/diagnostics.js";
-import { scrubError } from "./core/scrub.js";
+import { run, type RunOptions } from "./cli.js";
 import { theme } from "./ui/theme.js";
 
 /**
  * Entry point for `npx @whisperr/wizard`.
  *
  * Usage:
- *   npx @whisperr/wizard [init] [path] [--api <url>] [--model <id>]
+ *   npx @whisperr/wizard [init] [path] [--offline] [--api <url>] [--model <id>]
  *
  * `init` is accepted as an optional verb for readability; the wizard runs the
  * same flow with or without it.
@@ -39,6 +37,9 @@ export function parseArgs(argv: string[]): RunOptions | { help: true } | { versi
       case "-v":
       case "--version":
         return { version: true };
+      case "--offline":
+        opts.offline = true;
+        break;
       case "--force":
         opts.force = true;
         break;
@@ -57,22 +58,6 @@ export function parseArgs(argv: string[]): RunOptions | { help: true } | { versi
   return opts;
 }
 
-type HandledSignal = "SIGINT" | "SIGTERM";
-
-export interface InvocationDependencies {
-  createDiagnostics?: (repoPath: string) => WizardDiagnostics;
-  run?: (
-    options: RunOptions,
-    diagnostics: WizardDiagnostics,
-    context: RunContext,
-  ) => Promise<number>;
-  addSignalListener?: (signal: HandledSignal, listener: () => void) => void;
-  removeSignalListener?: (signal: HandledSignal, listener: () => void) => void;
-  setExitCode?: (code: number) => void;
-  log?: (message: string) => void;
-  error?: (message: string) => void;
-}
-
 function printHelp(): void {
   // eslint-disable-next-line no-console
   console.log(
@@ -84,14 +69,15 @@ function printHelp(): void {
       "    npx @whisperr/wizard [init] [path] [options]",
       "",
       `  ${theme.bright("Options")}`,
-      "    --force           Permit existing changes and preserve them on failed-run restore",
+      "    --offline         Use a demo manifest, no account/browser needed",
+      "    --force           Proceed without a clean git tree (no safe undo)",
       "    --api <url>       Override the Whisperr API base URL",
       "    --model <id>      Override the coding-agent model",
       "    -h, --help        Show this help",
       "    -v, --version     Show version",
       "",
       `  ${theme.muted("The wizard detects your stack, authenticates with your")}`,
-      `  ${theme.muted("onboarded account, generates its model, and wires the SDK.")}`,
+      `  ${theme.muted("onboarded account, and wires up identify() + your events.")}`,
       "",
     ].join("\n"),
   );
@@ -110,93 +96,14 @@ export async function main(): Promise<void> {
     return;
   }
 
-  await runInvocation(parsed);
-}
-
-export async function runInvocation(
-  options: RunOptions,
-  dependencies: InvocationDependencies = {},
-): Promise<void> {
-  const createDiagnostics =
-    dependencies.createDiagnostics ?? ((repoPath: string) => WizardDiagnostics.create(repoPath));
-  const runWizard = dependencies.run ?? run;
-  const addSignalListener =
-    dependencies.addSignalListener ??
-    ((signal: HandledSignal, listener: () => void) => process.once(signal, listener));
-  const removeSignalListener =
-    dependencies.removeSignalListener ??
-    ((signal: HandledSignal, listener: () => void) =>
-      process.removeListener(signal, listener));
-  const setExitCode = dependencies.setExitCode ?? ((code: number) => (process.exitCode = code));
-  const log = dependencies.log ?? console.log;
-  const reportError = dependencies.error ?? console.error;
-  const repoPath = resolve(options.path ?? process.cwd());
-
-  let diagnostics: WizardDiagnostics;
   try {
-    diagnostics = createDiagnostics(repoPath);
-  } catch {
-    reportError("Unable to create secure diagnostics. The wizard did not run.");
-    setExitCode(1);
-    return;
-  }
-
-  diagnostics.log("invocation_start", {
-    version: packageVersion(),
-    forced: Boolean(options.force),
-  });
-  log(`Diagnostics: ${diagnostics.path}`);
-
-  const abortController = new AbortController();
-  let receivedSignal: HandledSignal | undefined;
-  const handlers: Record<HandledSignal, () => void> = {
-    SIGINT: () => handleSignal("SIGINT"),
-    SIGTERM: () => handleSignal("SIGTERM"),
-  };
-
-  function handleSignal(signal: HandledSignal): void {
-    if (receivedSignal) return;
-    receivedSignal = signal;
-    diagnostics.log("termination_requested", { signal });
-    abortController.abort(signal);
-  }
-
-  addSignalListener("SIGINT", handlers.SIGINT);
-  addSignalListener("SIGTERM", handlers.SIGTERM);
-
-  let exitCode = 1;
-  try {
-    const code = await runWizard(options, diagnostics, {
-      signal: abortController.signal,
-    });
-    exitCode = receivedSignal ? signalExitCode(receivedSignal) : code;
-    diagnostics.log("invocation_end", {
-      outcome: receivedSignal ? "signal" : code === 0 ? "completed" : "failed",
-      exitCode,
-      signal: receivedSignal,
-    });
+    const code = await run(parsed);
+    process.exit(code);
   } catch (err) {
-    if (receivedSignal) {
-      exitCode = signalExitCode(receivedSignal);
-      diagnostics.log("invocation_end", {
-        outcome: "signal",
-        exitCode,
-        signal: receivedSignal,
-      });
-    } else {
-      diagnostics.log("invocation_failure", diagnosticErrorData(err));
-      reportError("\n" + theme.alert("Unexpected error: ") + scrubError(err));
-    }
-  } finally {
-    removeSignalListener("SIGINT", handlers.SIGINT);
-    removeSignalListener("SIGTERM", handlers.SIGTERM);
-    diagnostics.close();
-    setExitCode(exitCode);
+    // eslint-disable-next-line no-console
+    console.error("\n" + theme.alert("Unexpected error: ") + (err as Error).message);
+    process.exit(1);
   }
-}
-
-function signalExitCode(signal: HandledSignal): 130 | 143 {
-  return signal === "SIGINT" ? 130 : 143;
 }
 
 function isCliEntry(): boolean {

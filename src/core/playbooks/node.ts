@@ -122,7 +122,7 @@ persisted session to infer it from. Source the real user id at each call site.
      import { createWhisperr } from '@whisperr/node';
      export const whisperr = createWhisperr({
        apiKey: process.env.WHISPERR_API_KEY!,
-       baseUrl: '__WHISPERR_INGESTION_BASE_URL__', // omit if it's the default
+       baseUrl: '<INGESTION_BASE_URL from manifest>', // omit if it's the default
      });
    Put WHISPERR_API_KEY in the app's server config and add it to .env /
    .env.example. This is a SERVER env var — never a public/VITE_/NEXT_PUBLIC_ one.

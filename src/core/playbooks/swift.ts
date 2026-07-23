@@ -70,17 +70,16 @@ compile first try.
        @main
        struct MyApp: App {
            init() {
-               let apiKey = Bundle.main.object(forInfoDictionaryKey: "WHISPERR_KEY") as! String
-               Task { await Whisperr.initialize(apiKey: apiKey) }
+               Task { await Whisperr.initialize(apiKey: "<INGESTION_API_KEY>") }
            }
            // ... existing body
        }
    UIKit: same Task { } inside application(_:didFinishLaunchingOptions:).
-   Only pass a base URL if the current run's URL differs from the SDK default:
-       await Whisperr.initialize(apiKey: apiKey, baseURL: URL(string: "__WHISPERR_INGESTION_BASE_URL__")!)
-   Note baseURL takes a URL, not a String. Read the key from the project's
-   existing Info.plist / .xcconfig setup and never place its value in a tracked
-   source or project file.
+   Only pass a base URL if the manifest's differs from the SDK default:
+       await Whisperr.initialize(apiKey: "...", baseURL: URL(string: "<INGESTION_BASE_URL>")!)
+   Note baseURL takes a URL, not a String. Prefer reading the key from
+   Info.plist / an .xcconfig if the project already uses that pattern;
+   otherwise a literal is acceptable (publishable ingestion key).
 
 3) identify() right after the end-user is known — login/signup success AND
    session restore. All calls go through the async optional singleton
@@ -102,15 +101,15 @@ compile first try.
 4) track() in action handlers / view-model methods — never in a View body:
        Task {
            try? await Whisperr.shared?.track(
-               "generated_event_code",
+               "event_type_from_manifest",
                properties: ["amount_cents": .number(Double(amountCents)),
                             "plan": .string(plan)]
            )
        }
    Awaiting only ENQUEUES (delivery batches in the background) — \`try? await\`
    inside Task { } is the correct fire-and-forget in UI code. In an already-
-   async throwing context, plain \`try await\` is fine. Copy the event code
-   verbatim from the current server model.
+   async throwing context, plain \`try await\` is fine. event_type verbatim
+   snake_case from the manifest.
 
 CRITICAL — JSONValue typing for properties/traits:
    Values are \`JSONValue\`, not \`Any\`. LITERALS convert automatically —
@@ -125,7 +124,7 @@ CRITICAL — no anonymous buffering in this SDK:
    this process (or when you pass \`userID:\` explicitly). Session restore must
    therefore call identify() early at startup. Do not place track() on
    pre-auth surfaces (onboarding, login screen) unless you pass
-   \`userID: "<id>"\` — if a generated event genuinely happens before the user
+   \`userID: "<id>"\` — if a manifest event genuinely happens before the user
    exists, skip it and note it in the summary.
 
 Notes / gotchas:

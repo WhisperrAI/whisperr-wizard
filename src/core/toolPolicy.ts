@@ -1,4 +1,4 @@
-import { basename, isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve } from "node:path";
 
 export type ToolPolicyDecision =
   | { behavior: "allow" }
@@ -16,17 +16,12 @@ const WRITE_OUTSIDE_REPO_DENIAL =
 
 export const SENSITIVE_WRITE_DENIAL =
   "blocked: refusing to write CI/git configuration";
-export const PACKAGE_MANIFEST_WRITE_DENIAL =
-  "blocked: dependency manifests must be updated through an approved package command";
 
 const BASH_ALLOWLIST_DENIAL =
-  "blocked: command is outside the allowlist - install approved SDK packages or use metadata-only git status/diff commands";
+  "blocked: command is outside the Bash allowlist - use package install/add commands, mkdir, or git status/diff/log only";
 
 const CHAINED_COMMAND_DENIAL =
   "blocked: chained or substituted shell command - run one command at a time";
-
-const SHELL_EXPANSION_DENIAL =
-  "blocked: shell expansion or redirection is not allowed";
 
 const ENV_EXAMPLES = new Set([".env.example", ".env.sample", ".env.template"]);
 const SECRET_DIRECTORIES = new Set([".aws", ".ssh", ".gnupg"]);
@@ -39,33 +34,6 @@ const SENSITIVE_WRITE_EXACT_FILES = new Set([
   ".drone.yml",
   "jenkinsfile",
 ]);
-const PACKAGE_MANIFEST_FILES = new Set([
-  "package.json",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "yarn.lock",
-  "bun.lock",
-  "bun.lockb",
-  "composer.json",
-  "composer.lock",
-  "pubspec.yaml",
-  "pubspec.lock",
-  "pyproject.toml",
-  "poetry.lock",
-  "pipfile",
-  "pipfile.lock",
-  "uv.lock",
-]);
-const PACKAGE_MANAGER_CONFIG_FILES = new Set([
-  ".yarnrc",
-  ".yarnrc.yml",
-  ".pnpmfile.cjs",
-  ".pnpmfile.js",
-  ".pnp.cjs",
-  ".pnp.loader.mjs",
-  "pnpm-workspace.yaml",
-]);
-const PACKAGE_MANAGER_DIRECTORIES = new Set(["node_modules", ".yarn", ".pnpm-store"]);
 const SECRET_SUFFIXES = [
   ".pem",
   ".key",
@@ -76,34 +44,9 @@ const SECRET_SUFFIXES = [
   ".tfvars",
 ];
 
-export const JS_PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun"]);
-const PYTHON_PACKAGE_MANAGERS = new Set(["pip", "pip3", "poetry", "pipenv", "uv"]);
-const ALLOWED_JS_PACKAGES = new Set([
-  "@whisperr/web",
-  "@whisperr/react",
-  "@whisperr/next",
-  "@whisperr/react-native",
-  "@whisperr/node",
-  "@react-native-async-storage/async-storage",
-]);
-const ALLOWED_PYTHON_PACKAGES = new Set(["whisperr", "whisperr[django]"]);
-const EXTERNAL_INSTALL_FLAGS = new Set([
-  "-g",
-  "--global",
-  "--user",
-  "--system",
-  "--root",
-  "--prefix",
-  "--target",
-  "-t",
-  "--directory",
-  "--working-dir",
-  "--project-directory",
-  "--modules-folder",
-  "--cwd",
-  "--dir",
-  "-c",
-]);
+const JS_PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun"]);
+const PYTHON_PACKAGE_MANAGERS = new Set(["pip", "pip3", "poetry", "uv"]);
+const RUBY_PACKAGE_MANAGERS = new Set(["gem", "bundle"]);
 
 export function evaluateToolUse(
   toolName: string,
@@ -118,7 +61,7 @@ export function evaluateToolUse(
     case "Glob":
       return evaluateReadLike(grepGlobPathInputs(input), grepGlobPathInputs(input), context);
     case "Bash":
-      return evaluateBash(input, context);
+      return evaluateBash(input);
     case "Write":
     case "Edit":
       return evaluateWrite(input, context);
@@ -204,35 +147,24 @@ function evaluateWrite(
   if (!isPathInsideRepo(pathValue, context.repoPath)) {
     return { behavior: "deny", message: WRITE_OUTSIDE_REPO_DENIAL };
   }
-  if (isPackageManagerWritePath(pathValue, context.repoPath)) {
-    return { behavior: "deny", message: PACKAGE_MANIFEST_WRITE_DENIAL };
-  }
   if (isSensitiveWritePath(pathValue, context.repoPath)) {
     return { behavior: "deny", message: SENSITIVE_WRITE_DENIAL };
   }
   return { behavior: "allow" };
 }
 
-function evaluateBash(
-  input: Record<string, unknown>,
-  context: ToolPolicyContext,
-): ToolPolicyDecision {
+function evaluateBash(input: Record<string, unknown>): ToolPolicyDecision {
   const command = firstString(input, ["command"]);
   if (!command) {
     return { behavior: "deny", message: "blocked: Bash command is missing" };
   }
-  if (/[<>${}]/.test(command)) {
-    return { behavior: "deny", message: SHELL_EXPANSION_DENIAL };
-  }
 
   const split = splitShellSegments(command);
-  if (split.hasCommandSubstitution || split.hadChain) {
+  if (split.hasCommandSubstitution) {
     return { behavior: "deny", message: CHAINED_COMMAND_DENIAL };
   }
 
-  const segmentDecisions = split.segments.map((segment) =>
-    evaluateBashSegment(segment, context),
-  );
+  const segmentDecisions = split.segments.map(evaluateBashSegment);
   const denied = segmentDecisions.find((decision) => decision.behavior === "deny");
   if (denied) {
     return split.hadChain
@@ -242,144 +174,61 @@ function evaluateBash(
   return { behavior: "allow" };
 }
 
-function evaluateBashSegment(
-  segment: string,
-  context: ToolPolicyContext,
-): ToolPolicyDecision {
-  const tokens = tokenizeShellCommand(segment);
+function evaluateBashSegment(segment: string): ToolPolicyDecision {
+  const tokens = tokenizeShellSegment(segment);
   if (!tokens.length) return { behavior: "deny", message: BASH_ALLOWLIST_DENIAL };
 
   const command = tokens[0]?.toLowerCase() ?? "";
   const second = tokens[1]?.toLowerCase() ?? "";
   const third = tokens[2]?.toLowerCase() ?? "";
 
-  if (packageCommandEscapesRepository(tokens, context)) {
-    return { behavior: "deny", message: WRITE_OUTSIDE_REPO_DENIAL };
-  }
-
   if (JS_PACKAGE_MANAGERS.has(command)) {
-    if (
-      (second === "install" || second === "add") &&
-      onlyAllowedPackages(tokens.slice(2), ALLOWED_JS_PACKAGES)
-    ) {
+    if (second === "install" || second === "add" || second === "ci") {
       return { behavior: "allow" };
     }
-  }
-  if (
-    command === "npx" &&
-    second === "--no-install" &&
-    third === "expo" &&
-    tokens.length === 5 &&
-    tokens[3]?.toLowerCase() === "install" &&
-    tokens[4]?.toLowerCase() === "@react-native-async-storage/async-storage"
-  ) {
-    return { behavior: "allow" };
+    if (second === "pkg" && (third === "get" || third === "set")) {
+      return { behavior: "allow" };
+    }
   }
 
   if (PYTHON_PACKAGE_MANAGERS.has(command)) {
-    if (
-      (second === "install" || second === "add") &&
-      onlyAllowedPackages(tokens.slice(2), ALLOWED_PYTHON_PACKAGES)
-    ) {
+    if (second === "install" || second === "add") {
       return { behavior: "allow" };
     }
-    if (
-      command === "uv" &&
-      second === "pip" &&
-      third === "install" &&
-      onlyAllowedPackages(tokens.slice(3), ALLOWED_PYTHON_PACKAGES)
-    ) {
+    if (command === "uv" && second === "pip" && third === "install") {
       return { behavior: "allow" };
     }
   }
 
-  if (command === "composer" && second === "require" && tokens.length === 3 && third === "whisperr/php") {
+  if (command === "composer" && (second === "install" || second === "require")) {
     return { behavior: "allow" };
   }
-  if (
-    (command === "flutter" || command === "dart") &&
-    second === "pub" &&
-    ((third === "get" && tokens.length === 3) ||
-      (third === "add" && tokens.length === 4 && tokens[3] === "whisperr"))
-  ) {
+  if (command === "pod" && second === "install") {
     return { behavior: "allow" };
   }
-  if (command === "git") {
-    return evaluateGitMetadataCommand(tokens);
+  if ((command === "flutter" || command === "dart") && second === "pub") {
+    return { behavior: "allow" };
+  }
+  if (RUBY_PACKAGE_MANAGERS.has(command) && (second === "install" || second === "add")) {
+    return { behavior: "allow" };
+  }
+  if (command === "go" && (second === "get" || second === "mod")) {
+    return { behavior: "allow" };
+  }
+  if (command === "mkdir") {
+    return { behavior: "allow" };
+  }
+  if (command === "git" && (second === "status" || second === "diff" || second === "log")) {
+    // Read-only git is allowed for the self-review pass, but not as a side door
+    // to secret material (e.g. `git log -p -- .env` on a repo that once
+    // committed it).
+    if (tokens.slice(2).some((token) => isSecretPathLike(token))) {
+      return { behavior: "deny", message: SECRET_MATERIAL_DENIAL };
+    }
+    return { behavior: "allow" };
   }
 
   return { behavior: "deny", message: BASH_ALLOWLIST_DENIAL };
-}
-
-function onlyAllowedPackages(tokens: string[], allowed: Set<string>): boolean {
-  return tokens.length > 0 && tokens.every((token) => allowed.has(token.toLowerCase()));
-}
-
-function evaluateGitMetadataCommand(tokens: string[]): ToolPolicyDecision {
-  const subcommand = tokens[1]?.toLowerCase();
-  const args = tokens.slice(2).map((token) => token.toLowerCase());
-  if (subcommand === "status") {
-    const allowed = new Set([
-      "--short",
-      "-s",
-      "--branch",
-      "-b",
-      "-sb",
-      "--porcelain",
-      "--porcelain=v1",
-      "--porcelain=v2",
-    ]);
-    return args.every((arg) => allowed.has(arg))
-      ? { behavior: "allow" }
-      : { behavior: "deny", message: BASH_ALLOWLIST_DENIAL };
-  }
-  if (subcommand === "diff") {
-    const outputModes = new Set([
-      "--name-only",
-      "--name-status",
-      "--stat",
-      "--numstat",
-      "--shortstat",
-      "--compact-summary",
-    ]);
-    const modifiers = new Set(["--cached", "--staged"]);
-    const hasOutputMode = args.some((arg) => outputModes.has(arg));
-    return hasOutputMode && args.every((arg) => outputModes.has(arg) || modifiers.has(arg))
-      ? { behavior: "allow" }
-      : { behavior: "deny", message: BASH_ALLOWLIST_DENIAL };
-  }
-  return { behavior: "deny", message: BASH_ALLOWLIST_DENIAL };
-}
-
-function packageCommandEscapesRepository(
-  tokens: string[],
-  context: ToolPolicyContext,
-): boolean {
-  const command = tokens[0]?.toLowerCase() ?? "";
-  const isPackageCommand =
-    JS_PACKAGE_MANAGERS.has(command) ||
-    PYTHON_PACKAGE_MANAGERS.has(command) ||
-    ["composer", "flutter", "dart"].includes(command);
-  if (!isPackageCommand) return false;
-
-  for (const token of tokens.slice(1)) {
-    const lower = token.toLowerCase();
-    if (
-      EXTERNAL_INSTALL_FLAGS.has(lower) ||
-      [...EXTERNAL_INSTALL_FLAGS].some((flag) => lower.startsWith(`${flag}=`))
-    ) {
-      return true;
-    }
-    const pathValue = lower.startsWith("file:") ? token.slice(5) : token;
-    if (
-      pathValue.startsWith("~") ||
-      ((isAbsolute(pathValue) || pathValue.includes("..")) &&
-        !isPathInsideRepo(pathValue, context.repoPath))
-    ) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function readPathInputs(input: Record<string, unknown>): string[] {
@@ -429,19 +278,6 @@ function isSensitiveWritePath(pathValue: string, repoPath: string): boolean {
   if (SENSITIVE_WRITE_DIRECTORIES.has(first)) return true;
   if (first === ".github" && second === "workflows") return true;
   return parts.length === 1 && SENSITIVE_WRITE_EXACT_FILES.has(first);
-}
-
-function isPackageManagerWritePath(pathValue: string, repoPath: string): boolean {
-  const parts = repoRelativePath(pathValue, repoPath)
-    .split("/")
-    .map((part) => stripOuterQuotes(part.trim().toLowerCase()))
-    .filter(Boolean);
-  const name = basename(pathValue).toLowerCase();
-  return (
-    PACKAGE_MANIFEST_FILES.has(name) ||
-    PACKAGE_MANAGER_CONFIG_FILES.has(name) ||
-    parts.some((part) => PACKAGE_MANAGER_DIRECTORIES.has(part))
-  );
 }
 
 function stripOuterQuotes(value: string): string {
@@ -511,7 +347,7 @@ function splitShellSegments(command: string): {
       i++;
       continue;
     }
-    if (ch === ";" || ch === "|" || ch === "&" || ch === "\n") {
+    if (ch === ";" || ch === "|" || ch === "\n") {
       hadChain = true;
       push();
       continue;
@@ -524,7 +360,7 @@ function splitShellSegments(command: string): {
   return { segments, hadChain, hasCommandSubstitution };
 }
 
-export function tokenizeShellCommand(segment: string): string[] {
+function tokenizeShellSegment(segment: string): string[] {
   const tokens: string[] = [];
   let current = "";
   let quote: "\"" | "'" | undefined;
