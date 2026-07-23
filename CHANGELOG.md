@@ -1,28 +1,5 @@
 # Changelog
 
-## 0.5.3
-
-- Routed authenticated production model-gateway traffic directly to the runtime origin so Cloudflare request-body inspection cannot block repository analysis.
-
-## 0.5.2
-
-- Prevented ambient project `OPENAI_API_KEY` values from bypassing the authenticated Whisperr model gateway.
-- Added a safe diagnostic event identifying whether the runtime gateway or explicit direct-development transport is active.
-
-## 0.5.1
-
-- Added private per-run JSONL diagnostics with strict secret redaction and safe lifecycle, progress, and request-correlation events.
-- Added bounded request IDs and safe runtime error reporting without recording response bodies or model and repository content.
-- Improved signal handling so interrupted runs finish cleanup and close diagnostics with conventional exit codes.
-
-## 0.5.0
-
-- Replaced the manifest-first Claude workflow with one OpenAI Agents SDK run led by Sol and supported by a read-only Terra repository explorer.
-- Generated intervention groups, interventions, events, and links are persisted to runtime immediately with host-derived idempotency keys.
-- Added runtime-authoritative resume, identifier-only local state, conversation fallback, heartbeat/error reporting, and invocation-scoped Git restore.
-- Removed the inactive manifest, opportunity, suggestion, additions, and offline flows.
-- Raised the runtime requirement to Node.js 22.
-
 ## 0.4.0
 
 - Opportunities now stage for **dashboard approval** instead of merging from

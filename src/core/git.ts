@@ -38,19 +38,14 @@ export async function changedFiles(
   checkpoint: GitCheckpoint,
 ): Promise<string[]> {
   if (!checkpoint.isRepo) return [];
-  const tracked = checkpoint.baseRef
-    ? await run(repoPath, ["diff", "--name-only", checkpoint.baseRef])
-    : await run(repoPath, ["diff", "--name-only", "--cached"]);
-  const unstaged = checkpoint.baseRef
-    ? { stdout: "" }
-    : await run(repoPath, ["diff", "--name-only"]);
+  const tracked = await run(repoPath, ["diff", "--name-only"]);
   const untracked = await run(repoPath, [
     "ls-files",
     "--others",
     "--exclude-standard",
   ]);
   const set = new Set<string>();
-  for (const f of `${tracked.stdout}\n${unstaged.stdout}\n${untracked.stdout}`.split("\n")) {
+  for (const f of `${tracked.stdout}\n${untracked.stdout}`.split("\n")) {
     if (f.trim()) set.add(f.trim());
   }
   return [...set];
@@ -215,15 +210,17 @@ function normalizeRemote(url: string): string {
 }
 
 /**
- * Determine which generated events the agent actually wired by scanning
- * changed files for direct string arguments to Whisperr receiver track calls.
- * This is deliberately conservative because the result gates completion.
+ * Determine which manifest events the agent actually wired, by scanning the
+ * changed files for `track(... '<event_type>' ...)` calls first, then falling
+ * back to exact quoted event-code literals for wrapper/constant indirection.
+ * Deterministic and agent-cooperation-free — we read the result from the code,
+ * not a self-report.
  *
  * The event type can be the FIRST argument (browser/Flutter SDKs:
  * `track('event', {...})`) or a LATER one (server SDKs take the user id first:
  * `track(userId, 'event', {...})`), so we match the quoted event type anywhere
- * inside the top-level `track(` argument list rather than accepting inert
- * constants, examples, comments, or unrelated bare functions named track.
+ * inside the `track(` argument list — across a short, possibly multi-line span —
+ * rather than only immediately after the opening paren.
  */
 export async function scanWiredEvents(
   repoPath: string,
@@ -231,174 +228,49 @@ export async function scanWiredEvents(
   eventTypes: string[],
 ): Promise<Map<string, string>> {
   const wired = new Map<string, string>();
+  const patterns = eventTypes.map((e) => ({
+    eventType: e,
+    trackRe: new RegExp(
+      `\\btrack\\s*\\(\\s*[\\s\\S]{0,160}?['"\`]${escapeRegExp(e)}['"\`]`,
+    ),
+    literalRe: quotedLiteralRegExp(e),
+  }));
+  const contents: Array<{ file: string; content: string }> = [];
+
   for (const file of files) {
     try {
-      const content = await readFile(join(repoPath, file), "utf8");
-      for (const eventType of trackStringArguments(content)) {
-        if (eventTypes.includes(eventType) && !wired.has(eventType)) {
-          wired.set(eventType, file);
-        }
-      }
+      contents.push({ file, content: await readFile(join(repoPath, file), "utf8") });
     } catch {
       continue;
+    }
+  }
+
+  for (const { file, content } of contents) {
+    for (const { eventType, trackRe } of patterns) {
+      if (!wired.has(eventType) && trackRe.test(content)) {
+        wired.set(eventType, file);
+      }
+    }
+  }
+
+  for (const { file, content } of contents) {
+    for (const { eventType, literalRe } of patterns) {
+      if (!wired.has(eventType) && literalRe.test(content)) {
+        wired.set(eventType, file);
+      }
     }
   }
   return wired;
 }
 
-function trackStringArguments(content: string): Set<string> {
-  const values = new Set<string>();
-  let index = 0;
-  while (index < content.length) {
-    const skipped = skipCommentOrString(content, index);
-    if (skipped !== index) {
-      index = skipped;
-      continue;
-    }
-    if (!/[A-Za-z_$]/.test(content[index] ?? "")) {
-      index++;
-      continue;
-    }
-    const start = index;
-    while (/[A-Za-z0-9_$]/.test(content[index] ?? "")) index++;
-    if (content.slice(start, index) !== "track" || !hasWhisperrReceiver(content, start)) continue;
-    let open = index;
-    while (/\s/.test(content[open] ?? "")) open++;
-    if (content[open] !== "(") continue;
-    index = collectTrackStringArguments(content, open, values);
-  }
-  return values;
+function quotedLiteralRegExp(eventType: string): RegExp {
+  const leftBoundary = /^\w/.test(eventType) ? "\\b" : "";
+  const rightBoundary = /\w$/.test(eventType) ? "\\b" : "";
+  return new RegExp(`(['"\`])${leftBoundary}${escapeRegExp(eventType)}${rightBoundary}\\1`);
 }
 
-function hasWhisperrReceiver(content: string, start: number): boolean {
-  let cursor = skipReceiverWhitespaceBackward(content, start - 1);
-  while (cursor >= 0) {
-    cursor = consumeReceiverOperator(content, cursor);
-    if (cursor < 0) return false;
-    cursor = skipReceiverWhitespaceBackward(content, cursor);
-    if (content[cursor] === "?") {
-      cursor = skipReceiverWhitespaceBackward(content, cursor - 1);
-    }
-    const identifierEnd = cursor + 1;
-    while (cursor >= 0 && /[A-Za-z0-9_$]/.test(content[cursor] ?? "")) cursor--;
-    const identifier = content.slice(cursor + 1, identifierEnd).replace(/^\$/, "");
-    if (!identifier) return false;
-    if (identifier.toLowerCase() === "whisperr") return true;
-    cursor = skipReceiverWhitespaceBackward(content, cursor);
-  }
-  return false;
-}
-
-function consumeReceiverOperator(content: string, cursor: number): number {
-  const pair = content.slice(cursor - 1, cursor + 1);
-  if (pair === "?." || pair === "::" || pair === "->") return cursor - 2;
-  if (content[cursor] === ".") return cursor - 1;
-  return -1;
-}
-
-function skipReceiverWhitespaceBackward(content: string, cursor: number): number {
-  while (cursor >= 0 && /\s/.test(content[cursor] ?? "")) cursor--;
-  return cursor;
-}
-
-export function hasWhisperrMethodCall(content: string, method: string): boolean {
-  let index = 0;
-  while (index < content.length) {
-    const skipped = skipCommentOrString(content, index);
-    if (skipped !== index) {
-      index = skipped;
-      continue;
-    }
-    if (!/[A-Za-z_$]/.test(content[index] ?? "")) {
-      index++;
-      continue;
-    }
-    const start = index;
-    while (/[A-Za-z0-9_$]/.test(content[index] ?? "")) index++;
-    if (content.slice(start, index) !== method || !hasWhisperrReceiver(content, start)) continue;
-    while (/\s/.test(content[index] ?? "")) index++;
-    if (content[index] === "(") return true;
-  }
-  return false;
-}
-
-function collectTrackStringArguments(
-  content: string,
-  open: number,
-  values: Set<string>,
-): number {
-  let parentheses = 1;
-  let braces = 0;
-  let brackets = 0;
-  let index = open + 1;
-  while (index < content.length && parentheses > 0) {
-    if (startsComment(content, index)) {
-      index = skipComment(content, index);
-      continue;
-    }
-    const character = content[index]!;
-    if (character === "'" || character === '"' || character === "`") {
-      const parsed = readStringLiteral(content, index, character);
-      if (parentheses === 1 && braces === 0 && brackets === 0) values.add(parsed.value);
-      index = parsed.end;
-      continue;
-    }
-    if (character === "(") parentheses++;
-    else if (character === ")") parentheses--;
-    else if (character === "{") braces++;
-    else if (character === "}") braces = Math.max(0, braces - 1);
-    else if (character === "[") brackets++;
-    else if (character === "]") brackets = Math.max(0, brackets - 1);
-    index++;
-  }
-  return index;
-}
-
-function skipCommentOrString(content: string, index: number): number {
-  if (startsComment(content, index)) return skipComment(content, index);
-  const character = content[index];
-  if (character === "'" || character === '"' || character === "`") {
-    return readStringLiteral(content, index, character).end;
-  }
-  return index;
-}
-
-function startsComment(content: string, index: number): boolean {
-  return (
-    content.startsWith("//", index) ||
-    content.startsWith("/*", index) ||
-    content[index] === "#"
-  );
-}
-
-function skipComment(content: string, index: number): number {
-  if (content.startsWith("/*", index)) {
-    const end = content.indexOf("*/", index + 2);
-    return end === -1 ? content.length : end + 2;
-  }
-  const end = content.indexOf("\n", index + 1);
-  return end === -1 ? content.length : end + 1;
-}
-
-function readStringLiteral(
-  content: string,
-  start: number,
-  quote: string,
-): { value: string; end: number } {
-  let value = "";
-  let index = start + 1;
-  while (index < content.length) {
-    const character = content[index]!;
-    if (character === "\\") {
-      if (index + 1 < content.length) value += content[index + 1];
-      index += 2;
-      continue;
-    }
-    if (character === quote) return { value, end: index + 1 };
-    value += character;
-    index++;
-  }
-  return { value, end: content.length };
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function run(

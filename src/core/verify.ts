@@ -9,12 +9,15 @@ import type { WizardConfig, WizardSession } from "../types.js";
  *   GET {api}/v1/wizard/first-event   (Authorization: Bearer <wizard token>)
  *     -> { received: boolean, event_type?: string, at?: string }
  *
+ * Skipped in --offline mode.
  */
 export async function pollFirstEvent(
   config: WizardConfig,
   session: WizardSession,
   opts: { timeoutMs?: number; intervalMs?: number; signal?: AbortSignal } = {},
 ): Promise<{ received: boolean; eventType?: string }> {
+  if (config.offline) return { received: false };
+
   const timeoutMs = opts.timeoutMs ?? 120_000;
   const intervalMs = opts.intervalMs ?? 3_000;
   const deadline = Date.now() + timeoutMs;
