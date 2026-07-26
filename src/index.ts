@@ -1,7 +1,7 @@
-import { readFileSync, realpathSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { run, type RunOptions } from "./cli.js";
+import { packageVersion } from "./core/version.js";
 import { theme } from "./ui/theme.js";
 
 /**
@@ -15,11 +15,7 @@ import { theme } from "./ui/theme.js";
  */
 const modulePath = fileURLToPath(import.meta.url);
 
-export function packageVersion(): string {
-  const packagePath = join(dirname(modulePath), "..", "package.json");
-  const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: string };
-  return pkg.version ?? "0.0.0";
-}
+export { packageVersion };
 
 export function parseArgs(argv: string[]): RunOptions | { help: true } | { version: true } {
   const args = [...argv];
@@ -42,6 +38,15 @@ export function parseArgs(argv: string[]): RunOptions | { help: true } | { versi
         break;
       case "--force":
         opts.force = true;
+        break;
+      case "--review-plan":
+        opts.reviewPlan = true;
+        break;
+      case "--propose-only":
+        opts.proposeOnly = true;
+        break;
+      case "--strict-review":
+        opts.strictReview = true;
         break;
       case "--api":
         opts.apiBaseUrl = args[++i];
@@ -71,6 +76,10 @@ function printHelp(): void {
       `  ${theme.bright("Options")}`,
       "    --offline         Use a demo manifest, no account/browser needed",
       "    --force           Proceed without a clean git tree (no safe undo)",
+      "    --review-plan     Confirm the placement plan before anything is wired",
+      "    --propose-only    Send new events/interventions for dashboard approval",
+      "                      instead of adding them to your universe now",
+      "    --strict-review   Review the finished diff with the deeper planner model",
       "    --api <url>       Override the Whisperr API base URL",
       "    --model <id>      Override the coding-agent model",
       "    -h, --help        Show this help",

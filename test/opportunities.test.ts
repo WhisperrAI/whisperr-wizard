@@ -6,8 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
-  OPPORTUNITIES_FILE,
-  collectOpportunities,
   fetchSuggestions,
   markSuggestionIntegrated,
   normalizeCode,
@@ -15,12 +13,6 @@ import {
   submitAdditions,
   submitSuggestions,
 } from "../src/core/opportunities.js";
-import {
-  takeCheckpoint,
-  snapshotChanges,
-  snapshotsEqual,
-  restoreToSnapshot,
-} from "../src/core/git.js";
 import { runVerifyCommand, verdictToVerified } from "../src/core/postflight.js";
 import type { IntegrationManifest, WizardConfig, WizardSession } from "../src/types.js";
 
@@ -185,82 +177,6 @@ test("sanitizeOpportunities tolerates a completely malformed document", () => {
     const out = sanitizeOpportunities(doc, manifest);
     assert.deepEqual(out, { events: [], interventions: [] });
   }
-});
-
-test("collectOpportunities reads then deletes the proposals file", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "wsp-opps-"));
-  const checkpoint = await takeCheckpoint(dir);
-  await writeFile(
-    join(dir, OPPORTUNITIES_FILE),
-    JSON.stringify({ events: [{ code: "trial_expired" }], interventions: [] }),
-  );
-
-  const out = await collectOpportunities(dir, manifest, checkpoint);
-  assert.deepEqual(
-    out.events.map((e) => e.code),
-    ["trial_expired"],
-  );
-  // The file must never linger in the customer's working tree.
-  assert.deepEqual(await readdir(dir), []);
-});
-
-test("collectOpportunities returns empty when the file is absent or invalid", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "wsp-opps-"));
-  const checkpoint = await takeCheckpoint(dir);
-  assert.deepEqual(await collectOpportunities(dir, manifest, checkpoint), {
-    events: [],
-    interventions: [],
-  });
-
-  await writeFile(join(dir, OPPORTUNITIES_FILE), "not json {");
-  assert.deepEqual(await collectOpportunities(dir, manifest, checkpoint), {
-    events: [],
-    interventions: [],
-  });
-  assert.deepEqual(await readdir(dir), []);
-});
-
-test("collectOpportunities ignores a proposals file that was already committed pre-pass", async () => {
-  // A repo shipping its own whisperr-opportunities.json is attacker-supplied
-  // input, not agent output: it must not be trusted and must not be deleted.
-  const dir = await mkdtemp(join(tmpdir(), "wsp-opps-tracked-"));
-  await git(dir, "init");
-  const payload = JSON.stringify({
-    events: [{ code: "attacker_event", rationale: "planted in the repo" }],
-    interventions: [],
-  });
-  await writeFile(join(dir, OPPORTUNITIES_FILE), payload);
-  await git(dir, "add", ".");
-  await git(dir, "commit", "-m", "repo ships a planted proposals file");
-  const checkpoint = await takeCheckpoint(dir);
-
-  assert.deepEqual(await collectOpportunities(dir, manifest, checkpoint), {
-    events: [],
-    interventions: [],
-  });
-  // The customer's own file stays exactly where it was.
-  assert.equal(await readFile(join(dir, OPPORTUNITIES_FILE), "utf8"), payload);
-});
-
-test("collectOpportunities still accepts a file the agent wrote in a git repo", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "wsp-opps-untracked-"));
-  await git(dir, "init");
-  await writeFile(join(dir, "app.txt"), "app\n");
-  await git(dir, "add", ".");
-  await git(dir, "commit", "-m", "base");
-  const checkpoint = await takeCheckpoint(dir);
-
-  // Written after the checkpoint — this is genuine agent output.
-  await writeFile(
-    join(dir, OPPORTUNITIES_FILE),
-    JSON.stringify({ events: [{ code: "trial_expired" }], interventions: [] }),
-  );
-  const out = await collectOpportunities(dir, manifest, checkpoint);
-  assert.deepEqual(
-    out.events.map((e) => e.code),
-    ["trial_expired"],
-  );
-  assert.equal(await fileExists(join(dir, OPPORTUNITIES_FILE)), false);
 });
 
 test("submitAdditions posts the whisperr-go contract and returns its result", async () => {
@@ -486,55 +402,6 @@ async function fileExists(path: string): Promise<boolean> {
     return false;
   }
 }
-
-test("instrumentation pass that breaks the build makes the reported verified=false", async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), "wsp-reverify-"));
-  await git(dir, "init");
-  await writeFile(join(dir, "app.txt"), "original\n");
-  await writeFile(join(dir, "pristine.txt"), "pristine\n");
-  await git(dir, "add", ".");
-  await git(dir, "commit", "-m", "base");
-  const checkpoint = await takeCheckpoint(dir);
-
-  // Integration pass edits, then 6b verifies them: passes.
-  await writeFile(join(dir, "app.txt"), "integrated\n");
-  await writeFile(join(dir, "wired.txt"), "track('trial_expired')\n");
-  assert.equal(verdictToVerified(await runVerifyCommand(dir, VERIFY_CMD)), true);
-
-  // The instrumentation pass then breaks the build (and touches files both
-  // inside and outside the earlier diff).
-  const prePass = await snapshotChanges(dir, checkpoint);
-  await writeFile(join(dir, "broken.txt"), "syntax error\n");
-  await writeFile(join(dir, "wired.txt"), "track('trial_expired')\ntrack('payment_failed')\n");
-  await writeFile(join(dir, "pristine.txt"), "instrumented\n");
-
-  // The pass edited files, so the CLI re-verifies — and must now report false.
-  assert.equal(snapshotsEqual(prePass, await snapshotChanges(dir, checkpoint)), false);
-  assert.equal(verdictToVerified(await runVerifyCommand(dir, VERIFY_CMD)), false);
-
-  // The failure-path revert restores exactly the tree 6b verified: pass edits
-  // are gone, the integration edits stay.
-  assert.equal(await restoreToSnapshot(dir, checkpoint, prePass), true);
-  assert.equal(await fileExists(join(dir, "broken.txt")), false);
-  assert.equal(await readFile(join(dir, "wired.txt"), "utf8"), "track('trial_expired')\n");
-  assert.equal(await readFile(join(dir, "pristine.txt"), "utf8"), "pristine\n");
-  assert.equal(await readFile(join(dir, "app.txt"), "utf8"), "integrated\n");
-  assert.equal(verdictToVerified(await runVerifyCommand(dir, VERIFY_CMD)), true);
-  t.diagnostic("snapshot round-trip verified");
-});
-
-test("a no-op instrumentation pass leaves the snapshot equal, so no re-verify is needed", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "wsp-noop-"));
-  await git(dir, "init");
-  await writeFile(join(dir, "app.txt"), "original\n");
-  await git(dir, "add", ".");
-  await git(dir, "commit", "-m", "base");
-  const checkpoint = await takeCheckpoint(dir);
-
-  await writeFile(join(dir, "wired.txt"), "track('trial_expired')\n");
-  const prePass = await snapshotChanges(dir, checkpoint);
-  assert.equal(snapshotsEqual(prePass, await snapshotChanges(dir, checkpoint)), true);
-});
 
 test("verdictToVerified maps inconclusive verify runs to null", () => {
   assert.equal(verdictToVerified({ ran: true, ok: false, output: "", toolMissing: true }), null);

@@ -1,6 +1,3 @@
-import { readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { wasTrackedAtCheckpoint, type GitCheckpoint } from "./git.js";
 import type {
   IntegrationManifest,
   OpportunityEvent,
@@ -14,15 +11,12 @@ import type {
 } from "../types.js";
 
 /**
- * Universe opportunities: during the self-review phase the agent may spot real
- * lifecycle moments (events) or messaging strategies (interventions) the
- * onboarding-generated universe misses. It writes them to OPPORTUNITIES_FILE
- * in the repo root; the CLI collects the file (and deletes it — it must never
- * end up in the customer's diff), pre-filters obvious duplicates against the
- * manifest, asks the user which to submit, and posts the confirmed set to
- * whisperr-go, which owns the authoritative merge/dedupe.
+ * Universe opportunities: while planning, the agent spots real lifecycle
+ * moments (events) or messaging strategies (interventions) the
+ * onboarding-generated universe misses. They come back in the planning pass's
+ * JSON, get sanitized here against the manifest, and are posted to whisperr-go,
+ * which owns the authoritative merge/dedupe.
  */
-export const OPPORTUNITIES_FILE = "whisperr-opportunities.json";
 
 /**
  * Mirrors whisperr-go's NormalizeCode (internal/onboardingimport) exactly:
@@ -39,43 +33,6 @@ export function normalizeCode(value: string): string {
     .replace(/[^a-z0-9_]/g, "")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "");
-}
-
-/**
- * Read, validate, and delete the agent's opportunities file. Returns an empty
- * set when the file is absent or unusable — opportunities are additive and
- * must never fail the run.
- *
- * Trust boundary: only a file the agent wrote during THIS run counts. A
- * whisperr-opportunities.json that was already tracked at the pre-pass
- * checkpoint is the audited repo's own content — attacker-controllable, not
- * agent output — so it is ignored and left untouched.
- */
-export async function collectOpportunities(
-  repoPath: string,
-  manifest: IntegrationManifest,
-  checkpoint: GitCheckpoint,
-): Promise<UniverseOpportunities> {
-  const path = join(repoPath, OPPORTUNITIES_FILE);
-  if (await wasTrackedAtCheckpoint(repoPath, checkpoint, OPPORTUNITIES_FILE)) {
-    return { events: [], interventions: [] };
-  }
-  let rawText: string;
-  try {
-    rawText = await readFile(path, "utf8");
-  } catch {
-    return { events: [], interventions: [] };
-  }
-  // Whatever happens next, the file must not linger in the customer's tree.
-  await rm(path, { force: true }).catch(() => {});
-
-  let raw: unknown;
-  try {
-    raw = JSON.parse(rawText);
-  } catch {
-    return { events: [], interventions: [] };
-  }
-  return sanitizeOpportunities(raw, manifest);
 }
 
 /**
