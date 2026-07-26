@@ -273,15 +273,49 @@ export async function run(options: RunOptions): Promise<number> {
 
   if (tick) clearInterval(tick);
 
-  // Everything the run report needs, filled in as the run proceeds. A run that
-  // dies is the one most worth seeing, so the report goes out on every exit
-  // below — not just the happy one.
+  // Everything the run report needs. A run that dies is the one most worth
+  // seeing, so the report goes out on every exit below — not just the happy one.
   let verified: boolean | null = null;
-  let reportEvents: ReportEvent[] = [];
   let reported = false;
-  const reportRun = async (exitClass: ExitClass): Promise<void> => {
-    if (reported) return;
+
+  // Derive per-event coverage from the diff AT REPORT TIME rather than reading
+  // a variable assigned later in the happy path. A verify failure reports from
+  // the middle of the run, and reportRun latches, so anything filled in further
+  // down would be missing from exactly the reports worth having.
+  const collectReportEvents = async (): Promise<ReportEvent[]> => {
+    if (!outcome) return [];
+    const eventOutcomeByType = new Map(
+      outcome.eventOutcomes.map((event) => [event.event, event]),
+    );
+    const eventTypes = [
+      ...manifest.events.map((e) => e.eventType),
+      ...additions.applied.map((e) => e.code),
+    ];
+    let wired = new Map<string, string>();
+    try {
+      wired = await scanWiredEvents(
+        repoPath,
+        await changedFiles(repoPath, checkpoint),
+        eventTypes,
+      );
+    } catch {
+      // A scan failure must not cost us the whole report — statuses degrade to
+      // skipped, which is still better than reporting nothing.
+    }
+    return eventTypes.map((eventType) => ({
+      event_type: eventType,
+      status: wired.has(eventType) ? "wired" : "skipped",
+      file: wired.get(eventType),
+      // The agent's own words on why it skipped — the field that answers "why
+      // didn't it wire X" without anyone opening the repo.
+      reason: wired.has(eventType) ? undefined : eventOutcomeByType.get(eventType)?.reason,
+    }));
+  };
+
+  const reportRun = async (exitClass: ExitClass): Promise<ReportEvent[]> => {
+    if (reported) return [];
     reported = true;
+    const reportEvents = await collectReportEvents();
     const result = await postRunReport(config, session, {
       target: chosen.playbook.target.id,
       repo_fingerprint: fingerprint,
@@ -309,6 +343,7 @@ export async function run(options: RunOptions): Promise<number> {
           ),
       );
     }
+    return reportEvents;
   };
 
   if (!outcome) {
@@ -360,6 +395,10 @@ export async function run(options: RunOptions): Promise<number> {
       p.outro(theme.muted("Reverted — nothing was left in your working tree."));
       return 1;
     }
+    // Kept the partial tree. Still a core failure — record it as one here,
+    // because the run continues to the normal tail and would otherwise be
+    // filed as "completed" alongside runs where identify() actually landed.
+    await reportRun("core_failed");
   }
 
   // 6b. Deterministic guardrail: run the playbook's verify command OURSELVES so
@@ -465,27 +504,19 @@ export async function run(options: RunOptions): Promise<number> {
     }
   }
 
-  // Derive which events actually got wired (from the diff) and record coverage
-  // so future runs — including on other surfaces — know what this one handled.
-  // Newly added events are wired in the same pass as the manifest's own, so a
-  // single scan covers both.
-  const eventOutcomeByType = new Map(
-    outcome.eventOutcomes.map((event) => [event.event, event]),
+  // Record coverage so future runs — including on other surfaces — know what
+  // this one handled. Newly added events are wired in the same pass as the
+  // manifest's own, so a single scan covers both. A no-op when an earlier exit
+  // already reported; the local render below falls back to its own scan.
+  const reportedEvents = await reportRun(
+    outcome.eventsComplete ? "completed" : "events_incomplete",
   );
-  const eventTypesToScan = [
-    ...manifest.events.map((e) => e.eventType),
-    ...additions.applied.map((e) => e.code),
-  ];
-  const wiredMap = await scanWiredEvents(repoPath, files, eventTypesToScan);
-  reportEvents = eventTypesToScan.map((eventType) => ({
-    event_type: eventType,
-    status: wiredMap.has(eventType) ? "wired" : "skipped",
-    file: wiredMap.get(eventType),
-    // The agent's own words on why it skipped — the field that answers "why
-    // didn't it wire X" without anyone opening the repo.
-    reason: wiredMap.has(eventType) ? undefined : eventOutcomeByType.get(eventType)?.reason,
-  }));
-  await reportRun(outcome.eventsComplete ? "completed" : "events_incomplete");
+  const reportEvents = reportedEvents.length ? reportedEvents : await collectReportEvents();
+  const wiredMap = new Map(
+    reportEvents
+      .filter((event) => event.status === "wired")
+      .map((event) => [event.event_type, event.file ?? ""]),
+  );
 
   // Approved events are already part of the normal manifest/instrumentation
   // flow. Reconcile only after final per-event outcomes are known; this is
@@ -555,7 +586,7 @@ export async function run(options: RunOptions): Promise<number> {
       theme.signal("What you could be doing"),
     );
   }
-  const eventDenominator = manifest.universeSummary?.wireableHere ?? eventTypesToScan.length;
+  const eventDenominator = manifest.universeSummary?.wireableHere ?? reportEvents.length;
   const eventStatsLabel = manifest.universeSummary ? "events wired here" : "events wired";
   const timingDetails = outcome.phaseTimings
     .map(({ phase, ms }) => `${shortPhaseLabel(phase)} ${formatDuration(ms)}`)

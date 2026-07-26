@@ -173,3 +173,35 @@ test("postRunReport omits telemetry the run never produced", async () => {
     assert.equal(key in sentBody, false, `${key} should not be sent when unset`);
   }
 });
+
+// A verify failure reports from the middle of the run and the reporter latches,
+// so per-event coverage has to be derived AT report time. The first version
+// read a variable assigned further down the happy path, which meant the runs
+// most worth inspecting — failed builds — landed with `events: []`.
+test("postRunReport sends the events it is given, including from a mid-run exit", async () => {
+  const realFetch = globalThis.fetch;
+  const bodies: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_url: unknown, init: RequestInit) => {
+    bodies.push(JSON.parse(String(init.body)));
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    await postRunReport(config, session, {
+      ...report,
+      verified: false,
+      exit_class: "verify_failed",
+      events: [
+        { event_type: "trial_started", status: "wired", file: "app/auth.ts" },
+        { event_type: "seat_added", status: "skipped", reason: "no team features here" },
+      ],
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const events = bodies[0]?.events as Array<Record<string, unknown>>;
+  assert.equal(bodies[0]?.exit_class, "verify_failed");
+  assert.equal(events.length, 2, "a failed-verify report must still carry per-event outcomes");
+  assert.equal(events[1]?.reason, "no team features here");
+});

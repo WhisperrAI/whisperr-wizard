@@ -15,14 +15,18 @@ hands you a clean diff to review and commit.
 
 The wizard is an agentic integrator with a planner/editor split:
 
-1. **Map** — a read-only pass charts your repo: entry points, end-user vs
-   admin auth flows, billing surfaces, existing analytics wrappers.
-2. **Plan** — a reasoning model decides, per event, exactly where it belongs
-   (`file @ anchor`) with the properties available in scope — or says
-   honestly that it doesn't exist on this surface.
-3. **Review the plan** — you see every placement before a single line
-   changes, and pick what gets wired.
-4. **Wire** — a fast editor model executes the approved plan mechanically.
+1. **Plan** — one read-only pass charts your repo (entry points, end-user vs
+   admin auth flows, billing surfaces, existing analytics wrappers) and
+   decides, per event, exactly where it belongs (`file @ anchor`) with the
+   properties available in scope — or says honestly that it doesn't exist on
+   this surface. It also notes churn-relevant moments your plan is missing.
+2. **See the plan** — every placement is printed before a single line
+   changes. The run then proceeds on its own; pass `--review-plan` if you'd
+   rather confirm placements first, or `--propose-only` to keep new
+   events/interventions behind dashboard approval instead of adding them.
+3. **Wire** — a fast editor model executes the plan mechanically.
+4. **Review** — the agent re-reads its own diff and fixes wrong subjects,
+   wrong lifecycle moments, and missing discriminators.
 5. **Verify** — placements are scanned back out of the diff, your build/lint
    command runs, and failures get one automatic repair pass. Every event ends
    the run as `✓ wired @ file` or `○ skipped — reason`.

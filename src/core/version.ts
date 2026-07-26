@@ -1,20 +1,37 @@
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, parse } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const modulePath = fileURLToPath(import.meta.url);
+const PACKAGE_NAME = "@whisperr/wizard";
 
 /**
- * The published wizard version. Lives here rather than in the CLI entry point
- * so the run reporter can stamp it without importing the entry module (which
- * self-executes on import).
+ * The published wizard version, stamped onto every run report.
+ *
+ * Walks up from this module looking for our own package.json rather than using
+ * a fixed relative path. A fixed path cannot be right in both places: from
+ * source this file sits at src/core/, but tsup bundles it into dist/index.js —
+ * one directory shallower. The first version of this hardcoded the source depth
+ * and reported "0.0.0" from every published binary.
+ *
+ * Checking the `name` matters too: walking up from a customer's node_modules
+ * would otherwise find THEIR package.json first and report their version as
+ * ours.
  */
 export function packageVersion(): string {
-  try {
-    const packagePath = join(dirname(modulePath), "..", "..", "package.json");
-    const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as { version?: string };
-    return pkg.version ?? "0.0.0";
-  } catch {
-    return "0.0.0";
+  let dir = dirname(fileURLToPath(import.meta.url));
+  const { root } = parse(dir);
+
+  while (true) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as {
+        name?: string;
+        version?: string;
+      };
+      if (pkg.name === PACKAGE_NAME && pkg.version) return pkg.version;
+    } catch {
+      /* no package.json here, or unreadable — keep walking */
+    }
+    if (dir === root) return "0.0.0";
+    dir = dirname(dir);
   }
 }
