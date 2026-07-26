@@ -443,6 +443,23 @@ const FULL_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"] as const;
 /** Marks the end of the free-text repo map and the start of the JSON payload. */
 const PLANNING_JSON_FENCE = /```json\s*([\s\S]*?)```/;
 
+/**
+ * Flatten model-authored text for safe display: strip ANSI escapes and control
+ * characters (newlines included — they would fake extra terminal lines). Mirrors
+ * the guard the opportunities coercion already applies.
+ */
+export function scrubTerminalText(value: string): string {
+  return value
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, " ")
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
 function emptyOpportunities(): UniverseOpportunities {
   return { events: [], interventions: [] };
 }
@@ -551,7 +568,10 @@ function coerceEventPlan(items: unknown[]): EventPlanEntry[] | null {
     const entry: EventPlanEntry = {
       event,
       decision,
-      reason: typeof obj.reason === "string" ? obj.reason.trim() : "",
+      // Model-authored text that ends up in the customer's terminal and in
+      // the run report — scrub it like every other string we take from the
+      // model, so it cannot restyle or spoof the surrounding UI.
+      reason: typeof obj.reason === "string" ? scrubTerminalText(obj.reason) : "",
     };
     if (typeof obj.file === "string" && obj.file.trim()) {
       entry.file = obj.file.trim();

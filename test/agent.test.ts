@@ -188,3 +188,26 @@ test("parsePlanningResult ignores non-array opportunity payloads", () => {
 
   assert.deepEqual(result.opportunities, { events: [], interventions: [] });
 });
+
+
+// A plan `reason` is model-authored and gets printed in the customer's
+// terminal and stored in the run ledger, so it needs the same scrubbing the
+// opportunities path already applies — otherwise it can restyle the UI around
+// it or fake extra output lines.
+test("plan reasons are stripped of terminal control sequences", () => {
+  const esc = String.fromCharCode(27);
+  const plan = parseEventPlan(
+    JSON.stringify([
+      {
+        event: "trial_started",
+        decision: "skip",
+        reason: `${esc}[31mnot here${esc}[0m\nFAKE: everything wired`,
+      },
+    ]),
+  );
+
+  const reason = plan?.[0]?.reason ?? "";
+  assert.equal(reason.includes(esc), false, "ANSI escapes must not survive");
+  assert.equal(reason.includes("\n"), false, "newlines must not survive");
+  assert.match(reason, /not here/);
+});
