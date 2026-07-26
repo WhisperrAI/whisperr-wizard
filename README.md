@@ -19,11 +19,12 @@ The wizard is an agentic integrator with a planner/editor split:
    admin auth flows, billing surfaces, existing analytics wrappers) and
    decides, per event, exactly where it belongs (`file @ anchor`) with the
    properties available in scope — or says honestly that it doesn't exist on
-   this surface. It also notes churn-relevant moments your plan is missing.
+   this surface. It records observed property names/types and also notes
+   churn-relevant moments your plan is missing.
 2. **See the plan** — every placement is printed before a single line
    changes. The run then proceeds on its own; pass `--review-plan` if you'd
-   rather confirm placements first, or `--propose-only` to keep new
-   events/interventions behind dashboard approval instead of adding them.
+   rather confirm placements first. New event/intervention ideas always go to
+   dashboard approval and never become SDK event names during the current run.
 3. **Wire** — a fast editor model executes the plan mechanically.
 4. **Review** — the agent re-reads its own diff and fixes wrong subjects,
    wrong lifecycle moments, and missing discriminators.

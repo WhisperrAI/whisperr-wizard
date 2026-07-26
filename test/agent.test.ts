@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { parseEventPlan, parsePlanningResult } from "../src/core/agent.js";
-import { renderOpportunitiesBrief } from "../src/core/playbooks/shared-prompt.js";
+import {
+  renderEventsBrief,
+  renderOpportunitiesBrief,
+} from "../src/core/playbooks/shared-prompt.js";
 import type { IntegrationManifest } from "../src/types.js";
 
 test("parseEventPlan parses a valid JSON code block", () => {
@@ -9,7 +12,7 @@ test("parseEventPlan parses a valid JSON code block", () => {
     [
       "```json",
       "[",
-      '  {"event":"trial_started","decision":"place","file":"app/auth.ts","anchor":"createTrial","properties":["plan"],"reason":"trial is created here"}',
+      '  {"event":"trial_started","decision":"place","file":"app/auth.ts","anchor":"createTrial","properties":[{"name":"plan","type":"string"}],"reason":"trial is created here"}',
       "]",
       "```",
     ].join("\n"),
@@ -21,10 +24,17 @@ test("parseEventPlan parses a valid JSON code block", () => {
       decision: "place",
       file: "app/auth.ts",
       anchor: "createTrial",
-      properties: ["plan"],
+      properties: [{ name: "plan", type: "string" }],
       reason: "trial is created here",
     },
   ]);
+});
+
+test("parseEventPlan keeps legacy property names without inventing types", () => {
+  const plan = parseEventPlan(
+    '[{"event":"trial_started","decision":"place","properties":["plan"],"reason":"here"}]',
+  );
+  assert.deepEqual(plan?.[0]?.properties, [{ name: "plan" }]);
 });
 
 test("parseEventPlan tolerates trailing prose after the first JSON array", () => {
@@ -63,21 +73,122 @@ test("opportunities brief requests expected effects for every proposal kind", ()
   );
 });
 
-// Proposals now go straight into the customer's universe and get wired in the
-// same run, so the brief has to hold the line on evidence rather than volume.
+// Proposals enter the approval queue, so the brief has to hold the line on
+// evidence and explain that they are not event names for this run.
 test("opportunities brief demands verified code evidence before proposing", () => {
   const manifest = {
     identify: {},
-    events: [{ eventType: "trial_started" }],
+    events: [
+      {
+        eventDefinitionId: "ared_trial_started",
+        eventType: "trial_started",
+        suggestedWireableOn: ["frontend"],
+        variantLinks: [],
+      },
+    ],
     interventions: [{ code: "winback_email" }],
   } as unknown as IntegrationManifest;
   const brief = renderOpportunitiesBrief(manifest);
 
   assert.match(brief, /VERIFY before you write it/);
-  assert.match(brief, /instrumented in this same run/);
+  assert.match(brief, /dashboard approval/);
+  assert.doesNotMatch(brief, /instrumented in this same run/);
   // Already-covered codes must be listed so they're never re-proposed.
   assert.match(brief, /trial_started/);
   assert.match(brief, /winback_email/);
+});
+
+test("events brief treats wireability as advice and renders typed variant links", () => {
+  const brief = renderEventsBrief({
+    businessContext: "A subscription app.",
+    events: [
+      {
+        eventDefinitionId: "ared_payment_failed",
+        eventType: "payment_failed",
+        label: "Payment failed",
+        description: "A renewal payment failed.",
+        suggestedWireableOn: ["backend"],
+        variantLinks: [
+          {
+            interventionCode: "dunning",
+            interventionLabel: "Dunning",
+            variantCode: "gentle_reminder",
+            variantLabel: "Gentle reminder",
+            role: "required",
+            rationale: "A failed renewal should open recovery.",
+          },
+        ],
+      },
+    ],
+  } as IntegrationManifest);
+
+  assert.match(brief, /suggested surface: backend \(advisory only\)/);
+  assert.match(brief, /Dunning \/ Gentle reminder \[required\]/);
+  assert.match(brief, /inspect the code and capture properties actually available/);
+  assert.doesNotMatch(brief, /importance|weight|properties to capture/);
+});
+
+test("events brief renders approved review evidence as planning guidance", () => {
+  const brief = renderEventsBrief({
+    events: [
+      {
+        eventDefinitionId: "ared_payment_failed",
+        eventType: "payment_failed",
+        suggestedWireableOn: ["backend"],
+        variantLinks: [],
+        reviewEvidence: {
+          suggestionId: "suggestion_payment_failed",
+          side: "backend",
+          rationale: "Stripe webhook in src/billing/webhook.ts confirms the failure.",
+          expectedEffect: "Start recovery while the failure is fresh.",
+          confidence: 0.91,
+          properties: [
+            {
+              name: "charge_type",
+              description: "Initial or recurring charge.",
+              required: true,
+            },
+          ],
+        },
+      },
+    ],
+  } as IntegrationManifest);
+
+  assert.match(brief, /approved review evidence \(planning guidance only\)/);
+  assert.match(brief, /observed surface: backend/);
+  assert.match(brief, /src\/billing\/webhook\.ts confirms the failure/);
+  assert.match(brief, /charge_type \(required\)/);
+  assert.match(brief, /Start recovery while the failure is fresh/);
+  assert.match(brief, /review confidence: 91%/);
+});
+
+test("events brief recognizes runtime existing and added coverage statuses", () => {
+  const brief = renderEventsBrief({
+    identify: {},
+    events: [
+      {
+        eventDefinitionId: "ared_existing",
+        eventType: "account_created",
+        suggestedWireableOn: ["backend"],
+        variantLinks: [],
+        coverage: [
+          { target: "node", status: "existing", sameSurface: true },
+        ],
+      },
+      {
+        eventDefinitionId: "ared_added_elsewhere",
+        eventType: "payment_failed",
+        suggestedWireableOn: ["backend"],
+        variantLinks: [],
+        coverage: [
+          { target: "php", status: "added", sameSurface: false },
+        ],
+      },
+    ],
+  } as IntegrationManifest);
+
+  assert.match(brief, /account_created.*\[already wired here\]/);
+  assert.match(brief, /payment_failed.*\[wired on php\]/);
 });
 
 // --- parsePlanningResult ---

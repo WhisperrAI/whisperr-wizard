@@ -89,40 +89,26 @@ test("trims reasons, lowercases their first letter, and omits an absent reason c
   assert.doesNotMatch(rendered, /without_reason isn't flowing yet —/);
 });
 
-test("renders surface and derived facts only when positive and computes hasContent", () => {
-  const empty = buildGapReport({
-    manifest: manifestWithEvents([], { otherSurface: 0, derived: 3 }),
-    events: [],
-  });
-  assert.equal(empty.hasContent, false);
-
+test("only required typed links can block a variant", () => {
+  const optional = event("nice_to_have", "rescue", "Rescue", "optional");
+  const outcome = event("recovered", "rescue", "Rescue", "outcome");
   const report = buildGapReport({
-    manifest: manifestWithEvents([], { otherSurface: 1, derived: 2 }),
-    events: [],
+    manifest: manifestWithEvents([optional, outcome]),
+    events: [
+      { eventType: "nice_to_have", status: "skipped" },
+      { eventType: "recovered", status: "skipped" },
+    ],
   });
-  assert.equal(report.hasContent, true);
-  const rendered = renderGapReport(report, plainTheme);
-  assert.match(rendered, /■ 1 more event live on another surface/);
-  assert.match(rendered, /2 derived signals/);
-
-  const noCounts = renderGapReport(
-    { interventionGaps: [], otherSurface: 0, derived: 0, hasContent: false },
-    plainTheme,
-  );
-  assert.doesNotMatch(noCounts, /another surface/);
-  assert.doesNotMatch(noCounts, /derived signal/);
+  assert.deepEqual(report, { interventionGaps: [], hasContent: false });
 });
 
 test("renders the signed-off opportunity copy verbatim", () => {
   const report = buildGapReport({
-    manifest: manifestWithEvents(
-      [
-        event("missing_one", "on_hold", "On-hold play"),
-        event("missing_two", "partial", "Partial play"),
-        event("working", "partial", "Partial play"),
-      ],
-      { otherSurface: 2, derived: 4 },
-    ),
+    manifest: manifestWithEvents([
+      event("missing_one", "on_hold", "On-hold play"),
+      event("missing_two", "partial", "Partial play"),
+      event("working", "partial", "Partial play"),
+    ]),
     events: [
       { eventType: "missing_one", status: "skipped" },
       { eventType: "missing_two", status: "skipped" },
@@ -143,38 +129,43 @@ test("renders the signed-off opportunity copy verbatim", () => {
   );
   assert.ok(
     rendered.includes(
-      "Run the wizard there and they join the same strategy — nothing to reconfigure.",
-    ),
-  );
-  assert.ok(
-    rendered.includes(
       "All of this is capacity your strategy already includes. Each item you unlock compounds the rest.",
     ),
   );
 });
 
-function event(eventType: string, code: string, label: string) {
+function event(
+  eventType: string,
+  code: string,
+  label: string,
+  role: "required" | "optional" | "outcome" = "required",
+): IntegrationManifest["events"][number] {
   return {
+    eventDefinitionId: `ared_${eventType}_${code}`,
     eventType,
-    interventions: [{ code, label }],
+    suggestedWireableOn: ["backend"],
+    variantLinks: [
+      {
+        interventionCode: code,
+        interventionLabel: label,
+        variantCode: "default",
+        variantLabel: "Default",
+        role,
+      },
+    ],
   };
 }
 
 function manifestWithEvents(
   events: IntegrationManifest["events"],
-  counts: { otherSurface: number; derived: number } = { otherSurface: 0, derived: 0 },
 ): IntegrationManifest {
   return {
     appId: "app",
+    configVersionId: "arcv_1",
+    manifestRevision: "manifest-r1",
     ingestionApiKey: "key",
     ingestionBaseUrl: "https://example.invalid",
     identify: {},
     events,
-    universeSummary: {
-      total: events.length + counts.otherSurface + counts.derived,
-      wireableHere: events.length,
-      otherSurface: counts.otherSurface,
-      derived: counts.derived,
-    },
   };
 }

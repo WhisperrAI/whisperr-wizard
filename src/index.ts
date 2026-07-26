@@ -42,9 +42,6 @@ export function parseArgs(argv: string[]): RunOptions | { help: true } | { versi
       case "--review-plan":
         opts.reviewPlan = true;
         break;
-      case "--propose-only":
-        opts.proposeOnly = true;
-        break;
       case "--strict-review":
         opts.strictReview = true;
         break;
@@ -77,8 +74,6 @@ function printHelp(): void {
       "    --offline         Use a demo manifest, no account/browser needed",
       "    --force           Proceed without a clean git tree (no safe undo)",
       "    --review-plan     Confirm the placement plan before anything is wired",
-      "    --propose-only    Send new events/interventions for dashboard approval",
-      "                      instead of adding them to your universe now",
       "    --strict-review   Review the finished diff with the deeper planner model",
       "    --api <url>       Override the Whisperr API base URL",
       "    --model <id>      Override the coding-agent model",

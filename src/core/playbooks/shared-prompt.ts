@@ -1,4 +1,5 @@
 import type { IntegrationManifest } from "../../types.js";
+import { isInstrumentedCoverageStatus } from "../coverage.js";
 
 /**
  * The base wizard system prompt — SDK-agnostic, applies to every phase. It
@@ -96,12 +97,9 @@ DECISIVENESS:
 PROPERTY CAPTURE (this is the craft):
 - For each event you place, look at what's in scope AT THAT CALL SITE — function
   arguments, the object/model/state you're inside, nearby local variables — and
-  populate every listed property you can source from those values.
-- Omit a property only if it genuinely isn't available there. Do NOT fetch,
-  compute, or invent data to fill a property, and do NOT wander off to find it.
-- If a property marked (required) can't be sourced at your chosen site, that's a
-  strong hint you've picked the wrong site — reconsider; if it's still the best
-  spot, add the track() call and note the missing property.
+  attach only useful properties that genuinely exist there.
+- Do NOT fetch, compute, or invent data to fill an imagined contract, and do not
+  wander off to find it. The universe does not prescribe a payload schema.
 
 CORRECTNESS:
 - Match the app's existing conventions (imports, state management, file layout).
@@ -149,14 +147,11 @@ export function renderIdentifyBrief(m: IntegrationManifest): string {
 }
 
 /**
- * Phase 2 brief: the events to instrument, highest-importance first, each with
- * its meaning, the interventions it drives (the "why"), and the exact
- * properties to capture if present at the call site.
+ * Phase 2 brief: exact events to evaluate, with semantic meaning, advisory
+ * surface suggestions and their typed intervention-variant relationships.
  */
 export function renderEventsBrief(m: IntegrationManifest): string {
-  const events = [...m.events].sort(
-    (a, b) => (b.importance ?? 0) - (a.importance ?? 0),
-  );
+  const events = m.events;
 
   const lines: string[] = [];
   if (m.businessContext) {
@@ -164,10 +159,10 @@ export function renderEventsBrief(m: IntegrationManifest): string {
     lines.push("");
   }
   lines.push(
-    `${events.length} candidate events (highest-impact first). For each: fire` +
-      ` track('<event_type>', { ...properties }) at the real moment it happens,` +
-      ` and attach every listed property you can source from values in scope` +
-      ` there. Skip an event entirely if it has no clear trigger in this codebase.`,
+    `${events.length} exact events. For each: inspect the code and capture properties` +
+      ` actually available at the real trigger, then fire` +
+      ` track('<event_type>', { ...properties }). Skip an event entirely if it` +
+      ` has no clear trigger in this codebase.`,
   );
 
   if (events.some((e) => e.coverage?.length)) {
@@ -181,18 +176,49 @@ export function renderEventsBrief(m: IntegrationManifest): string {
 
   for (const e of events) {
     lines.push("");
-    const why = e.interventions?.length
-      ? `  ·  drives: ${e.interventions.map((i) => i.label ?? i.code).join(", ")}`
-      : "";
     const cov = coverageNote(e.coverage);
-    lines.push(`■ ${e.eventType}${e.label ? `  (${e.label})` : ""}${why}${cov}`);
+    lines.push(`■ ${e.eventType}${e.label ? `  (${e.label})` : ""}${cov}`);
     if (e.description) lines.push(`  ${e.description}`);
-    if (e.properties?.length) {
-      lines.push("  properties to capture if available:");
-      for (const p of e.properties) {
-        const req = p.required ? " (required)" : "";
-        const desc = p.description ? ` — ${p.description}` : "";
-        lines.push(`    · ${p.name}${req}${desc}`);
+    lines.push(
+      `  suggested surface: ${e.suggestedWireableOn.join(", ")} (advisory only)`,
+    );
+    if (e.reviewEvidence) {
+      lines.push("  approved review evidence (planning guidance only):");
+      if (e.reviewEvidence.side) {
+        lines.push(`    · observed surface: ${e.reviewEvidence.side}`);
+      }
+      if (e.reviewEvidence.rationale) {
+        lines.push(`    · placement evidence: ${e.reviewEvidence.rationale}`);
+      }
+      if (e.reviewEvidence.properties?.length) {
+        lines.push(
+          `    · observed properties: ${e.reviewEvidence.properties
+            .map((property) =>
+              `${property.name}${property.required ? " (required)" : ""}` +
+              (property.description ? ` — ${property.description}` : ""),
+            )
+            .join("; ")}`,
+        );
+      }
+      if (e.reviewEvidence.expectedEffect) {
+        lines.push(`    · expected effect: ${e.reviewEvidence.expectedEffect}`);
+      }
+      if (e.reviewEvidence.confidence !== undefined) {
+        lines.push(
+          `    · review confidence: ${Math.round(e.reviewEvidence.confidence * 100)}%`,
+        );
+      }
+      lines.push("    · verify this evidence against the current repository before placing.");
+    }
+    if (e.variantLinks.length) {
+      lines.push("  graph links:");
+      for (const link of e.variantLinks) {
+        const intervention = link.interventionLabel ?? link.interventionCode;
+        const variant = link.variantLabel ?? link.variantCode;
+        lines.push(
+          `    · ${intervention} / ${variant} [${link.role}]` +
+            (link.rationale ? ` — ${link.rationale}` : ""),
+        );
       }
     }
   }
@@ -213,7 +239,9 @@ export function renderOpportunitiesBrief(m: IntegrationManifest): string {
   const eventCodes = m.events.map((e) => e.eventType);
   const interventionCodes = [
     ...new Set([
-      ...m.events.flatMap((e) => e.interventions ?? []).map((i) => i.code),
+      ...m.events
+        .flatMap((e) => e.variantLinks)
+        .map((link) => `${link.interventionCode}/${link.variantCode}`),
       ...(m.interventions ?? []).map((i) => i.code),
     ]),
   ];
@@ -232,17 +260,21 @@ export function renderOpportunitiesBrief(m: IntegrationManifest): string {
     '    "expectedEffect": "one sentence: what improves if this is adopted",',
     '    "confidence": 0.0-1.0,',
     '    "properties": [{"name": "...", "description": "...", "required": false}],',
-    '    "links": [{"interventionCode": "existing_or_proposed", "weight": 0.0-1.0}]}]',
+    '    "links": [{"interventionCode": "existing_or_proposed",',
+    '      "variantCode": "required_for_existing_multi_variant_intervention",',
+    '      "role": "required|optional|outcome", "rationale": "why this link exists"}]}]',
     '  interventions: [{"code": "snake_case_strategy", "label": "...", "description": "...",',
     '    "rationale": "...", "confidence": 0.0-1.0, "expectedEffect": "...",',
-    '    "links": [{"eventCode": "existing_or_proposed", "weight": 0.0-1.0}]}]',
+    '    "links": [{"eventCode": "existing_or_proposed",',
+    '      "variantCode": "omit_for_new_intervention_default_variant",',
+    '      "role": "required|optional|outcome", "rationale": "why this link exists"}]}]',
     "",
     `- The plan already covers these events: ${eventCodes.join(", ") || "(none)"}.`,
     `  And these interventions: ${interventionCodes.join(", ") || "(none)"}.`,
     "  Propose ONLY what is genuinely missing — never re-propose or rename these.",
-    "- These go straight into the customer's universe, and the events you propose",
-    "  get instrumented in this same run. That raises the bar on evidence, not the",
-    "  volume: every proposal needs concrete code backing in its rationale, with",
+    "- These are suggestions for dashboard approval. They do not enter the",
+    "  universe or become SDK event names during this run. That raises the bar on",
+    "  evidence, not the volume: every proposal needs concrete code backing in its rationale, with",
     "  the file/flow named. VERIFY before you write it — re-open the file you are",
     "  citing and confirm the flow exists as you describe. Drop anything you",
     "  cannot point at real code; a false proposal costs more trust than a missed one.",
@@ -253,7 +285,8 @@ export function renderOpportunitiesBrief(m: IntegrationManifest): string {
     "  genuinely covers the product's lifecycle — never because you stopped early.",
     "- Every proposal should include expectedEffect: one sentence on what adoption improves.",
     "- Link each proposed event to the intervention(s) it should feed (existing",
-    "  codes or ones you propose alongside it).",
+    "  codes or ones you propose alongside it). Pick the exact variant when an",
+    "  existing intervention has more than one, and always give the typed role.",
   ].join("\n");
 }
 
@@ -262,9 +295,13 @@ function coverageNote(
   coverage?: Array<{ target: string; status: string; sameSurface: boolean }>,
 ): string {
   if (!coverage?.length) return "";
-  const here = coverage.find((c) => c.sameSurface && c.status === "wired");
+  const here = coverage.find(
+    (c) => c.sameSurface && isInstrumentedCoverageStatus(c.status),
+  );
   if (here) return "  [already wired here]";
-  const elsewhere = coverage.filter((c) => c.status === "wired");
+  const elsewhere = coverage.filter((c) =>
+    isInstrumentedCoverageStatus(c.status),
+  );
   if (elsewhere.length) {
     return `  [wired on ${elsewhere.map((c) => c.target).join(", ")}]`;
   }

@@ -14,13 +14,14 @@ import {
   type EventPlanEntry,
 } from "./core/agent.js";
 import {
+  enrichManifestWithApprovedSuggestions,
   fetchSuggestions,
   markSuggestionIntegrated,
-  normalizeCode,
   sanitizeOpportunities,
-  submitAdditions,
+  suggestionsReadyToMarkIntegrated,
   submitSuggestions,
 } from "./core/opportunities.js";
+import { isInstrumentedCoverageStatus } from "./core/coverage.js";
 import {
   takeCheckpoint,
   changedFiles,
@@ -28,12 +29,17 @@ import {
   revertToCheckpoint,
   isWorkingTreeClean,
   repoFingerprint,
-  scanWiredEvents,
+  scanWiredEventPlacements,
   type GitCheckpoint,
 } from "./core/git.js";
 import { pollFirstEvent } from "./core/verify.js";
 import { runVerifyCommand, verdictToVerified } from "./core/postflight.js";
-import { postRunReport, scrubSummary, type ReportEvent } from "./core/report.js";
+import {
+  buildReportEvents,
+  postRunReport,
+  scrubSummary,
+  type ReportEvent,
+} from "./core/report.js";
 import { packageVersion } from "./core/version.js";
 import { buildGapReport, renderGapReport } from "./core/gapreport.js";
 import { banner } from "./ui/banner.js";
@@ -41,7 +47,6 @@ import { theme } from "./ui/theme.js";
 import type {
   Detection,
   IntegrationManifest,
-  OpportunityEvent,
   Playbook,
   StageResult,
   UniverseOpportunities,
@@ -121,15 +126,21 @@ export async function run(options: RunOptions): Promise<number> {
   // 3. Pull the integration manifest (events/interventions/key), telling the
   //    backend which surface this is so it can mark what's already covered.
   const fingerprint = await repoFingerprint(repoPath);
-  const manifest = await withSpinner("Loading your onboarding context", () =>
+  const baseManifest = await withSpinner("Loading your onboarding context", () =>
     fetchManifest(config, session, chosen.playbook.target.id, fingerprint),
   );
-  // Approval immediately merges suggestions into the manifest. Fetch the
-  // approved records in parallel with the run so the end-of-run bookkeeping
-  // only has to reconcile what this surface actually wired.
-  const approvedSuggestionsPromise = config.offline
-    ? null
-    : fetchSuggestions(config, session, ["approved"]);
+  // Approval merges graph fields into the manifest, while placement evidence
+  // remains only on the suggestion. Fetch it before planning and enrich the
+  // in-memory event view so the agent can verify that evidence in this repo.
+  const approvedSuggestions = config.offline
+    ? []
+    : await withSpinner("Loading approved suggestions", () =>
+        fetchSuggestions(config, session, ["approved"]),
+      );
+  const manifest = enrichManifestWithApprovedSuggestions(
+    baseManifest,
+    approvedSuggestions,
+  );
   p.note(
     summarizeManifest(manifest),
     theme.signal(`Plan for ${manifest.appName ?? manifest.appId}`),
@@ -194,8 +205,8 @@ export async function run(options: RunOptions): Promise<number> {
   // logged explicitly instead.
   const tick = useIntegrationSpinner ? setInterval(updateIntegrationMessage, 1000) : undefined;
 
-  // Tracks what the run proposed and what the universe kept, for the report.
-  const additions: AdditionsOutcome = { proposed: 0, applied: [] };
+  // Tracks what the run proposed and staged for human approval.
+  const suggestions: SuggestionsOutcome = { proposed: 0 };
   const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
 
   const outcome = await runIntegrationAgent({
@@ -236,17 +247,16 @@ export async function run(options: RunOptions): Promise<number> {
     },
     async onOpportunitiesReady(raw) {
       if (useIntegrationSpinner) spin.stop(theme.success("Planning done"));
-      const applied = await applyOpportunities({
+      await applyOpportunities({
         config,
         session,
         playbook: chosen.playbook,
         manifest,
         fingerprint,
         raw,
-        additions,
+        suggestions,
       });
       if (useIntegrationSpinner) spin.start(theme.bright("Continuing integration"));
-      return applied;
     },
     progress: {
       onPhase(label) {
@@ -282,18 +292,12 @@ export async function run(options: RunOptions): Promise<number> {
   // a variable assigned later in the happy path. A verify failure reports from
   // the middle of the run, and reportRun latches, so anything filled in further
   // down would be missing from exactly the reports worth having.
-  const collectReportEvents = async (): Promise<ReportEvent[]> => {
+  const collectReportEvents = async (exitClass?: ExitClass): Promise<ReportEvent[]> => {
     if (!outcome) return [];
-    const eventOutcomeByType = new Map(
-      outcome.eventOutcomes.map((event) => [event.event, event]),
-    );
-    const eventTypes = [
-      ...manifest.events.map((e) => e.eventType),
-      ...additions.applied.map((e) => e.code),
-    ];
-    let wired = new Map<string, string>();
+    const eventTypes = manifest.events.map((e) => e.eventType);
+    let wired = new Map<string, string[]>();
     try {
-      wired = await scanWiredEvents(
+      wired = await scanWiredEventPlacements(
         repoPath,
         await changedFiles(repoPath, checkpoint),
         eventTypes,
@@ -302,21 +306,18 @@ export async function run(options: RunOptions): Promise<number> {
       // A scan failure must not cost us the whole report — statuses degrade to
       // skipped, which is still better than reporting nothing.
     }
-    return eventTypes.map((eventType) => ({
-      event_type: eventType,
-      status: wired.has(eventType) ? "wired" : "skipped",
-      file: wired.get(eventType),
-      // The agent's own words on why it skipped — the field that answers "why
-      // didn't it wire X" without anyone opening the repo.
-      reason: wired.has(eventType) ? undefined : eventOutcomeByType.get(eventType)?.reason,
-    }));
+    return buildReportEvents(manifest.events, outcome.eventOutcomes, wired, {
+      reverted: exitClass === "reverted",
+    });
   };
 
   const reportRun = async (exitClass: ExitClass): Promise<ReportEvent[]> => {
     if (reported) return [];
     reported = true;
-    const reportEvents = await collectReportEvents();
+    const reportEvents = await collectReportEvents(exitClass);
     const result = await postRunReport(config, session, {
+      config_version_id: manifest.configVersionId,
+      manifest_revision: manifest.manifestRevision,
       target: chosen.playbook.target.id,
       repo_fingerprint: fingerprint,
       identify_wired: outcome?.coreOk ?? false,
@@ -331,8 +332,7 @@ export async function run(options: RunOptions): Promise<number> {
       effort: config.effort,
       exit_class: exitClass,
       phase_timings: outcome?.phaseTimings ?? [],
-      opportunities_proposed: additions.proposed,
-      opportunities_applied: additions.applied.length,
+      opportunities_proposed: suggestions.proposed,
     });
     if (!result.ok) {
       p.log.warn(
@@ -514,8 +514,12 @@ export async function run(options: RunOptions): Promise<number> {
   const reportEvents = reportedEvents.length ? reportedEvents : await collectReportEvents();
   const wiredMap = new Map(
     reportEvents
-      .filter((event) => event.status === "wired")
-      .map((event) => [event.event_type, event.file ?? ""]),
+      .filter(
+        (event) =>
+          event.instrumentation_status === "added" ||
+          event.instrumentation_status === "existing",
+      )
+      .map((event) => [event.event_type, event.placements[0]?.file ?? ""]),
   );
 
   // Approved events are already part of the normal manifest/instrumentation
@@ -523,24 +527,34 @@ export async function run(options: RunOptions): Promise<number> {
   // deliberately best-effort so bookkeeping can never fail an otherwise good
   // integration run.
   try {
-    const approvedSuggestions = await approvedSuggestionsPromise;
-    if (approvedSuggestions?.length) {
+    if (approvedSuggestions.length) {
       const integratedEventCodes = new Set(
         reportEvents
-          .filter((event) => event.status === "wired")
-          .map((event) => normalizeCode(event.event_type)),
+          .filter(
+            (event) =>
+              event.instrumentation_status === "added" ||
+              event.instrumentation_status === "existing",
+          )
+          .map((event) => event.event_type),
       );
+      const provenEventCodes = new Set(integratedEventCodes);
       for (const event of manifest.events) {
-        if (event.coverage?.some((entry) => entry.sameSurface && entry.status === "wired")) {
-          integratedEventCodes.add(normalizeCode(event.eventType));
+        const instrumentedCoverage = event.coverage?.filter((entry) =>
+          isInstrumentedCoverageStatus(entry.status),
+        );
+        if (instrumentedCoverage?.length) {
+          provenEventCodes.add(event.eventType);
+        }
+        if (instrumentedCoverage?.some((entry) => entry.sameSurface)) {
+          integratedEventCodes.add(event.eventType);
         }
       }
 
-      const toMark = approvedSuggestions.filter(
-        (suggestion) =>
-          suggestion.status === "approved" &&
-          (suggestion.kind === "intervention" ||
-            integratedEventCodes.has(normalizeCode(suggestion.code))),
+      const toMark = suggestionsReadyToMarkIntegrated(
+        approvedSuggestions,
+        manifest,
+        integratedEventCodes,
+        provenEventCodes,
       );
       const marked = (
         await Promise.all(
@@ -564,8 +578,8 @@ export async function run(options: RunOptions): Promise<number> {
       }
     }
   } catch {
-    // Enrichment only: fetch/mark helpers already swallow failures, and this
-    // guard also protects the run from unexpected response-shape issues.
+    // Bookkeeping only: mark helpers already swallow failures, and this guard
+    // also protects the run from unexpected response-shape issues.
   }
 
   const eventLines = renderEventOutcomeLines(outcome.eventOutcomes, wiredMap);
@@ -576,7 +590,11 @@ export async function run(options: RunOptions): Promise<number> {
     manifest,
     events: reportEvents.map((event) => ({
       eventType: event.event_type,
-      status: event.status,
+      status:
+        event.instrumentation_status === "added" ||
+        event.instrumentation_status === "existing"
+          ? "wired"
+          : "skipped",
       reason: event.reason,
     })),
   });
@@ -586,8 +604,8 @@ export async function run(options: RunOptions): Promise<number> {
       theme.signal("What you could be doing"),
     );
   }
-  const eventDenominator = manifest.universeSummary?.wireableHere ?? reportEvents.length;
-  const eventStatsLabel = manifest.universeSummary ? "events wired here" : "events wired";
+  const eventDenominator = reportEvents.length;
+  const eventStatsLabel = "events wired";
   const timingDetails = outcome.phaseTimings
     .map(({ phase, ms }) => `${shortPhaseLabel(phase)} ${formatDuration(ms)}`)
     .join(" · ");
@@ -656,20 +674,14 @@ type ExitClass =
   | "reverted"
   | "agent_error";
 
-/** Running tally of what this run proposed and what the universe kept. */
-interface AdditionsOutcome {
+/** Running tally of what this run proposed and staged for approval. */
+interface SuggestionsOutcome {
   proposed: number;
-  applied: OpportunityEvent[];
 }
 
 /**
- * Take the planner's raw proposals into the app's universe and report back the
- * events that landed, so the wiring pass can instrument them in this same run.
- *
- * Two paths: by default proposals are added outright (the server owns dedupe;
- * new interventions start paused and a live policy only ever gets a review
- * draft, so nothing reaches a real user unreviewed). Under --propose-only they
- * are staged for dashboard approval instead and nothing is wired now.
+ * Sanitize the planner's raw proposals and stage them for dashboard approval.
+ * No event is wired until a later manifest proves that a human accepted it.
  *
  * Never throws — the integration itself must not fail over a proposal.
  */
@@ -680,9 +692,9 @@ async function applyOpportunities(opts: {
   manifest: IntegrationManifest;
   fingerprint: string;
   raw: UniverseOpportunities;
-  additions: AdditionsOutcome;
-}): Promise<OpportunityEvent[]> {
-  const { config, session, playbook, manifest, fingerprint, raw, additions } = opts;
+  suggestions: SuggestionsOutcome;
+}): Promise<void> {
+  const { config, session, playbook, manifest, fingerprint, raw, suggestions } = opts;
 
   // The planner's JSON is unvalidated model output: coerce it, drop malformed
   // entries, and pre-filter anything the manifest already covers.
@@ -691,16 +703,16 @@ async function applyOpportunities(opts: {
   // Don't re-propose what's already sitting in the approval queue.
   const openSuggestions = await fetchSuggestions(config, session, ["proposed", "approved"]);
   const openKeys = new Set(
-    openSuggestions.map((s) => `${s.kind}:${normalizeCode(s.code)}`),
+    openSuggestions.map((s) => `${s.kind}:${s.code}`),
   );
   const opportunities: UniverseOpportunities = {
-    events: clean.events.filter((e) => !openKeys.has(`event:${normalizeCode(e.code)}`)),
+    events: clean.events.filter((e) => !openKeys.has(`event:${e.code}`)),
     interventions: clean.interventions.filter(
-      (i) => !openKeys.has(`intervention:${normalizeCode(i.code)}`),
+      (i) => !openKeys.has(`intervention:${i.code}`),
     ),
   };
-  additions.proposed = opportunities.events.length + opportunities.interventions.length;
-  if (additions.proposed === 0) return [];
+  suggestions.proposed = opportunities.events.length + opportunities.interventions.length;
+  if (suggestions.proposed === 0) return;
 
   const describe = (kind: string, code: string, why?: string) =>
     `${theme.muted(`${kind}: `)}${theme.bright(code)}${why ? theme.muted(` — ${why}`) : ""}`;
@@ -716,112 +728,44 @@ async function applyOpportunities(opts: {
 
   if (config.offline) {
     p.log.info(theme.muted("Offline mode — proposals shown only, nothing submitted."));
-    return [];
+    return;
   }
 
-  if (config.proposeOnly) {
-    await stageOpportunities(config, session, playbook, fingerprint, opportunities);
-    return [];
-  }
-
-  let result;
-  try {
-    result = await withSpinner("Adding to your universe", () =>
-      submitAdditions(config, session, playbook.target.id, fingerprint, opportunities),
-    );
-  } catch (err) {
-    p.log.warn(
-      theme.warn("Couldn't add the proposals") +
-        theme.muted(` — ${(err as Error).message}. Your universe is unchanged.`),
-    );
-    return [];
-  }
-
-  const lines = result.outcomes.map((o) => {
-    const mark =
-      o.status === "applied"
-        ? theme.success("✓")
-        : o.status === "duplicate"
-          ? theme.muted("=")
-          : theme.warn("✗");
-    const detail =
-      o.status === "duplicate"
-        ? theme.muted(
-            ` (already in your universe${o.duplicateOf && o.duplicateOf !== o.code ? ` as ${o.duplicateOf}` : ""})`,
-          )
-        : o.status === "invalid" && o.reason
-          ? theme.muted(` (${o.reason})`)
-          : "";
-    return `${mark} ${o.kind} ${theme.bright(o.code)}${detail}`;
-  });
-  lines.push(
-    theme.muted(
-      `${result.applied} added · ${result.duplicates} already present · ${result.invalid} rejected`,
-    ),
+  await stageOpportunities(
+    config,
+    session,
+    playbook,
+    fingerprint,
+    manifest,
+    opportunities,
   );
-  if (opportunities.interventions.length) {
-    lines.push(theme.muted("New interventions start paused — activate them in your dashboard."));
-  }
-  // The regen leg tells us whether live decisioning will actually see the
-  // applied rows — "Universe updated" alone would overpromise when it failed.
-  if (result.policyRegen?.status === "pending") {
-    lines.push(
-      theme.muted("Runtime policy update queued — the additions go live once it completes."),
-    );
-  }
-  if (result.policyRegen?.status === "draft") {
-    lines.push(
-      theme.muted(
-        "A review policy draft was queued — activate it in your dashboard once it finishes generating to take the additions live (your current live policy was left untouched).",
-      ),
-    );
-  }
-  p.note(lines.join("\n"), theme.signal("Universe updated"));
-  if (result.policyRegen?.status === "failed") {
-    p.log.warn(
-      theme.warn("Live runtime NOT updated") +
-        theme.muted(
-          " — the additions were recorded, but the runtime policy wasn't regenerated" +
-            (result.policyRegen.reason ? `: ${result.policyRegen.reason}` : "") +
-            ". They won't drive live decisions until the policy regenerates.",
-        ),
-    );
-  }
-
-  const appliedCodes = new Set(
-    result.outcomes
-      .filter((o) => o.kind === "event" && o.status === "applied")
-      .map((o) => o.code),
-  );
-  const applied = opportunities.events.filter((e) => appliedCodes.has(e.code));
-  additions.applied = applied;
-  return applied;
 }
 
-/** --propose-only: send proposals to the dashboard queue instead of the universe. */
+/** Send proposals to the dashboard queue; this is the only supported write path. */
 async function stageOpportunities(
   config: WizardConfig,
   session: WizardSession,
   playbook: Playbook,
   fingerprint: string,
+  manifest: Pick<IntegrationManifest, "configVersionId" | "manifestRevision">,
   opportunities: UniverseOpportunities,
 ): Promise<void> {
-  let stageResult: StageResult | null;
+  let stageResult: StageResult;
   try {
     stageResult = await withSpinner("Sending suggestions for approval", () =>
-      submitSuggestions(config, session, playbook.target.id, fingerprint, opportunities),
+      submitSuggestions(
+        config,
+        session,
+        playbook.target.id,
+        fingerprint,
+        manifest,
+        opportunities,
+      ),
     );
   } catch (err) {
     p.log.warn(
       theme.warn("Couldn't send the proposals") +
         theme.muted(` — ${(err as Error).message}. Nothing was submitted.`),
-    );
-    return;
-  }
-  if (!stageResult) {
-    p.log.warn(
-      theme.warn("This Whisperr backend has no approval queue") +
-        theme.muted(" — nothing was submitted. Re-run without --propose-only to add them directly."),
     );
     return;
   }
@@ -1083,31 +1027,17 @@ function shortPhaseLabel(phase: string): string {
 }
 
 export function summarizeManifest(m: {
-  events: { eventType: string; importance?: number }[];
+  events: { eventType: string }[];
   identify: { channels?: string[] };
-  universeSummary?: {
-    total: number;
-    wireableHere: number;
-    derived: number;
-    otherSurface: number;
-  };
 }): string {
-  const events = [...m.events]
-    .sort((a, b) => (b.importance ?? 0) - (a.importance ?? 0))
-    .map((e) => theme.muted("• ") + e.eventType);
+  const events = m.events.map((e) => theme.muted("• ") + e.eventType);
   const channels = m.identify.channels?.length
     ? theme.muted(`channels: ${m.identify.channels.join(", ")}`)
     : "";
-  const firstLine = m.universeSummary
-    ? theme.bright(`${m.universeSummary.total} events in your universe`) +
-      theme.muted(
-        ` — ${m.universeSummary.wireableHere} wireable here · ` +
-          `${m.universeSummary.derived} computed by Whisperr from your raw events · ` +
-          `${m.universeSummary.otherSurface} live on other surfaces`,
-      )
-    : theme.bright("identify()") +
-      theme.muted(" + ") +
-      theme.bright(`${m.events.length} events`);
+  const firstLine =
+    theme.bright("identify()") +
+    theme.muted(" + ") +
+    theme.bright(`${m.events.length} events`);
   return [
     firstLine,
     ...events,

@@ -2,9 +2,9 @@ import type {
   IntegrationManifest,
   OpportunityEvent,
   OpportunityIntervention,
+  StageOutcome,
   StageResult,
   SuggestionRecord,
-  UniverseAdditionsResult,
   UniverseOpportunities,
   WizardConfig,
   WizardSession,
@@ -18,21 +18,115 @@ import type {
  * which owns the authoritative merge/dedupe.
  */
 
+const exactCodePattern = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
+
+/** Match the runtime graph's exact, non-normalizing code contract. */
+export function isExactCode(value: string): boolean {
+  return exactCodePattern.test(value);
+}
+
 /**
- * Mirrors whisperr-go's NormalizeCode (internal/onboardingimport) exactly:
- * lowercase, then space/`-`/`.`/`/` become underscores, every other
- * non-alphanumeric is DROPPED, and runs of underscores collapse to one.
- * Client-side it's only used to pre-filter no-op proposals; the server check
- * is authoritative — which is why the semantics must not drift.
+ * Attach approved event-placement evidence to matching manifest events for this
+ * process only. The backend manifest remains the graph contract; suggestion
+ * evidence is planning context and must never be posted back as graph fields.
  */
-export function normalizeCode(value: string): string {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[ \-./]/g, "_")
-    .replace(/[^a-z0-9_]/g, "")
-    .replace(/_+/g, "_")
-    .replace(/^_+|_+$/g, "");
+export function enrichManifestWithApprovedSuggestions(
+  manifest: IntegrationManifest,
+  suggestions: SuggestionRecord[],
+): IntegrationManifest {
+  const evidenceByCode = new Map<
+    string,
+    NonNullable<IntegrationManifest["events"][number]["reviewEvidence"]>
+  >();
+
+  for (const suggestion of suggestions) {
+    if (suggestion.status !== "approved" || suggestion.kind !== "event") continue;
+    const payload = suggestion.payload as OpportunityEvent;
+    if (payload.code !== suggestion.code) continue;
+
+    const properties = Array.isArray(payload.properties)
+      ? payload.properties.flatMap((property) => {
+          if (!property || typeof property.name !== "string" || !property.name.trim()) {
+            return [];
+          }
+          const description =
+            typeof property.description === "string" && property.description.trim()
+              ? property.description.trim()
+              : undefined;
+          return [{
+            name: property.name.trim(),
+            ...(description ? { description } : {}),
+            ...(property.required === true ? { required: true } : {}),
+          }];
+        })
+      : [];
+
+    evidenceByCode.set(suggestion.code, {
+      suggestionId: suggestion.id,
+      ...(typeof payload.side === "string" && payload.side
+        ? { side: payload.side }
+        : {}),
+      ...(typeof payload.rationale === "string" && payload.rationale
+        ? { rationale: payload.rationale }
+        : {}),
+      ...(typeof payload.expectedEffect === "string" && payload.expectedEffect
+        ? { expectedEffect: payload.expectedEffect }
+        : {}),
+      ...(typeof payload.confidence === "number" && Number.isFinite(payload.confidence)
+        ? { confidence: Math.min(1, Math.max(0, payload.confidence)) }
+        : {}),
+      ...(properties.length ? { properties } : {}),
+    });
+  }
+
+  return {
+    ...manifest,
+    events: manifest.events.map((event) => {
+      const reviewEvidence = evidenceByCode.get(event.eventType);
+      return reviewEvidence ? { ...event, reviewEvidence } : event;
+    }),
+  };
+}
+
+/**
+ * Select approved suggestions whose instrumentation lifecycle may advance.
+ * Event suggestions require proof on the current surface. Intervention
+ * suggestions advance only after every required typed link in the exact
+ * post-approval manifest has coverage. The manifest is authoritative because a
+ * link may have been declared from either suggestion payload direction.
+ */
+export function suggestionsReadyToMarkIntegrated(
+  suggestions: SuggestionRecord[],
+  manifest: Pick<IntegrationManifest, "events">,
+  integratedEventCodes: ReadonlySet<string>,
+  provenEventCodes: ReadonlySet<string>,
+): SuggestionRecord[] {
+  const requiredEventsByIntervention = new Map<string, Set<string>>();
+  for (const event of manifest.events) {
+    for (const link of event.variantLinks) {
+      if (link.role !== "required") continue;
+      const requiredEvents =
+        requiredEventsByIntervention.get(link.interventionCode) ?? new Set<string>();
+      requiredEvents.add(event.eventType);
+      requiredEventsByIntervention.set(link.interventionCode, requiredEvents);
+    }
+  }
+
+  return suggestions.filter((suggestion) => {
+    if (suggestion.status !== "approved") return false;
+    if (suggestion.kind === "event") {
+      return integratedEventCodes.has(suggestion.code);
+    }
+
+    const payload = suggestion.payload as OpportunityIntervention;
+    if (payload.code !== suggestion.code) return false;
+    const requiredEventCodes = requiredEventsByIntervention.get(suggestion.code);
+    return (
+      requiredEventCodes !== undefined &&
+      requiredEventCodes.size > 0 &&
+      [...requiredEventCodes].every((eventCode) => provenEventCodes.has(eventCode))
+    );
+  });
 }
 
 /**
@@ -47,21 +141,32 @@ export function sanitizeOpportunities(
   if (typeof raw !== "object" || raw === null) return out;
   const doc = raw as Record<string, unknown>;
 
-  const knownEvents = new Set(manifest.events.map((e) => normalizeCode(e.eventType)));
-  // Interventions surface two ways: nested under the events they drive (via
-  // weights) AND in the manifest's top-level catalog, which also carries
+  const knownEvents = new Set(manifest.events.map((e) => e.eventType));
+  // Interventions surface two ways: in typed variant links AND in the
+  // manifest's top-level catalog, which also carries
   // link-less interventions the per-event view misses. Union both so a
   // wizard-added intervention with no links isn't re-proposed every run.
   const knownInterventions = new Set([
-    ...manifest.events.flatMap((e) => e.interventions ?? []).map((i) => normalizeCode(i.code)),
-    ...(manifest.interventions ?? []).map((i) => normalizeCode(i.code)),
+    ...manifest.events
+      .flatMap((e) => e.variantLinks)
+      .map((link) => link.interventionCode),
+    ...(manifest.interventions ?? []).map((i) => i.code),
   ]);
+  const knownVariants = collectKnownVariants(manifest);
 
   const seenEvents = new Set<string>();
   for (const entry of asArray(doc.events)) {
     const ev = coerceEvent(entry);
     if (!ev) continue;
     if (knownEvents.has(ev.code) || seenEvents.has(ev.code)) continue;
+    if (ev.links) {
+      ev.links = ev.links.filter((link) => {
+        const variants = knownVariants.get(link.interventionCode);
+        if (!variants?.size) return true;
+        if (!link.variantCode) return variants.size === 1;
+        return variants.has(link.variantCode);
+      });
+    }
     seenEvents.add(ev.code);
     out.events.push(ev);
   }
@@ -78,57 +183,59 @@ export function sanitizeOpportunities(
   return out;
 }
 
-/** The additions POST does server-side merging + policy regen triggering, so
- *  give it real headroom — but never let it hang the CLI indefinitely. */
+/** Suggestion writes need real headroom, but must never hang the CLI indefinitely. */
 const SUBMIT_TIMEOUT_MS = 30_000;
 
 /**
- * Post the confirmed opportunities to whisperr-go. Unlike the coverage report
- * this is a real write the user just approved, so failures surface to the
- * caller instead of being swallowed.
- */
-export async function submitAdditions(
-  config: WizardConfig,
-  session: WizardSession,
-  target: string,
-  repoFingerprint: string,
-  opportunities: UniverseOpportunities,
-): Promise<UniverseAdditionsResult> {
-  const res = await fetch(`${config.apiBaseUrl}/wizard/universe/additions`, {
-    method: "POST",
-    signal: AbortSignal.timeout(SUBMIT_TIMEOUT_MS),
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${session.token}`,
-    },
-    body: JSON.stringify({
-      target,
-      repoFingerprint,
-      events: opportunities.events,
-      interventions: opportunities.interventions,
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(
-      `Submitting universe additions failed (${res.status})${body ? `: ${body.slice(0, 300)}` : ""}`,
-    );
-  }
-  return (await res.json()) as UniverseAdditionsResult;
-}
-
-/**
- * Stage confirmed opportunities for dashboard approval. A 404 means the
- * backend predates suggestions, so the caller can use the legacy additions
- * flow. Other failures remain visible because this is a user-approved write.
+ * Stage confirmed opportunities for dashboard approval. There is deliberately
+ * no direct-additions fallback: only a human-approved graph patch may change
+ * the universe.
  */
 export async function submitSuggestions(
   config: WizardConfig,
   session: WizardSession,
   target: string,
   repoFingerprint: string,
+  manifestPin: Pick<IntegrationManifest, "configVersionId" | "manifestRevision">,
   opportunities: UniverseOpportunities,
-): Promise<StageResult | null> {
+): Promise<StageResult> {
+  const localInvalid: StageOutcome[] = [
+    ...opportunities.events
+      .filter((event) => !isExactCode(event.code))
+      .map((event) => ({
+        kind: "event" as const,
+        code: event.code,
+        status: "invalid" as const,
+        reason: "event code must be exact lowercase snake_case",
+      })),
+    ...opportunities.interventions
+      .filter((intervention) => !isExactCode(intervention.code))
+      .map((intervention) => ({
+        kind: "intervention" as const,
+        code: intervention.code,
+        status: "invalid" as const,
+        reason: "intervention code must be exact lowercase snake_case",
+      })),
+  ];
+  const validOpportunities: UniverseOpportunities = {
+    events: opportunities.events.filter((event) => isExactCode(event.code)),
+    interventions: opportunities.interventions.filter((intervention) =>
+      isExactCode(intervention.code),
+    ),
+  };
+
+  if (
+    validOpportunities.events.length === 0 &&
+    validOpportunities.interventions.length === 0
+  ) {
+    return {
+      staged: 0,
+      duplicates: 0,
+      invalid: localInvalid.length,
+      outcomes: localInvalid,
+    };
+  }
+
   const res = await fetch(`${config.apiBaseUrl}/wizard/universe/suggestions`, {
     method: "POST",
     signal: AbortSignal.timeout(SUBMIT_TIMEOUT_MS),
@@ -139,18 +246,25 @@ export async function submitSuggestions(
     body: JSON.stringify({
       target,
       repoFingerprint,
-      events: opportunities.events,
-      interventions: opportunities.interventions,
+      configVersionId: manifestPin.configVersionId,
+      manifestRevision: manifestPin.manifestRevision,
+      events: validOpportunities.events,
+      interventions: validOpportunities.interventions,
     }),
   });
-  if (res.status === 404) return null;
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(
       `Submitting universe suggestions failed (${res.status})${body ? `: ${body.slice(0, 300)}` : ""}`,
     );
   }
-  return (await res.json()) as StageResult;
+  const result = (await res.json()) as StageResult;
+  if (localInvalid.length === 0) return result;
+  return {
+    ...result,
+    invalid: result.invalid + localInvalid.length,
+    outcomes: [...localInvalid, ...result.outcomes],
+  };
 }
 
 /** Fetch suggestions as non-fatal run enrichment. */
@@ -243,21 +357,20 @@ function asString(value: unknown): string | undefined {
   return cleaned ? cleaned : undefined;
 }
 
+/** Codes are identity: retain the model's exact bytes and validate later. */
+function asCode(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function asConfidence(value: unknown): number | undefined {
   if (typeof value !== "number" || Number.isNaN(value)) return undefined;
   return Math.min(1, Math.max(0, value));
 }
 
-function asWeight(value: unknown): number | undefined {
-  if (typeof value !== "number" || Number.isNaN(value)) return undefined;
-  if (value < 0 || value > 1) return undefined;
-  return value;
-}
-
 function coerceEvent(entry: unknown): OpportunityEvent | null {
   if (typeof entry !== "object" || entry === null) return null;
   const e = entry as Record<string, unknown>;
-  const code = normalizeCode(asString(e.code) ?? "");
+  const code = asCode(e.code);
   if (!code) return null;
 
   const properties: OpportunityEvent["properties"] = [];
@@ -282,10 +395,17 @@ function coerceEvent(entry: unknown): OpportunityEvent | null {
   for (const link of asArray(e.links)) {
     if (typeof link !== "object" || link === null) continue;
     const l = link as Record<string, unknown>;
-    const interventionCode = normalizeCode(asString(l.interventionCode) ?? "");
-    if (!interventionCode) continue;
-    const weight = asWeight(l.weight);
-    links.push({ interventionCode, ...(weight !== undefined ? { weight } : {}) });
+    const interventionCode = asCode(l.interventionCode);
+    const role = normalizeRole(asString(l.role));
+    if (!interventionCode || !role) continue;
+    const variantCode = asCode(l.variantCode);
+    const rationale = asString(l.rationale);
+    links.push({
+      interventionCode,
+      ...(variantCode !== undefined ? { variantCode } : {}),
+      role,
+      ...(rationale ? { rationale } : {}),
+    });
   }
 
   const side = normalizeSide(asString(e.side));
@@ -305,17 +425,24 @@ function coerceEvent(entry: unknown): OpportunityEvent | null {
 function coerceIntervention(entry: unknown): OpportunityIntervention | null {
   if (typeof entry !== "object" || entry === null) return null;
   const i = entry as Record<string, unknown>;
-  const code = normalizeCode(asString(i.code) ?? "");
+  const code = asCode(i.code);
   if (!code) return null;
 
   const links: OpportunityIntervention["links"] = [];
   for (const link of asArray(i.links)) {
     if (typeof link !== "object" || link === null) continue;
     const l = link as Record<string, unknown>;
-    const eventCode = normalizeCode(asString(l.eventCode) ?? "");
-    if (!eventCode) continue;
-    const weight = asWeight(l.weight);
-    links.push({ eventCode, ...(weight !== undefined ? { weight } : {}) });
+    const eventCode = asCode(l.eventCode);
+    const role = normalizeRole(asString(l.role));
+    if (!eventCode || !role) continue;
+    const variantCode = asCode(l.variantCode);
+    const rationale = asString(l.rationale);
+    links.push({
+      eventCode,
+      ...(variantCode !== undefined ? { variantCode } : {}),
+      role,
+      ...(rationale ? { rationale } : {}),
+    });
   }
 
   return {
@@ -340,4 +467,42 @@ function normalizeSide(value?: string): string | undefined {
     default:
       return undefined;
   }
+}
+
+function normalizeRole(
+  value?: string,
+): "required" | "optional" | "outcome" | undefined {
+  switch (value?.toLowerCase()) {
+    case "required":
+      return "required";
+    case "optional":
+      return "optional";
+    case "outcome":
+      return "outcome";
+    default:
+      return undefined;
+  }
+}
+
+function collectKnownVariants(
+  manifest: IntegrationManifest,
+): Map<string, Set<string>> {
+  const variants = new Map<string, Set<string>>();
+  const add = (interventionCode: string, variantCode: string) => {
+    if (!interventionCode || !variantCode) return;
+    const bucket = variants.get(interventionCode) ?? new Set<string>();
+    bucket.add(variantCode);
+    variants.set(interventionCode, bucket);
+  };
+  for (const intervention of manifest.interventions ?? []) {
+    for (const variant of intervention.variants ?? []) {
+      add(intervention.code, variant.code);
+    }
+  }
+  for (const event of manifest.events) {
+    for (const link of event.variantLinks) {
+      add(link.interventionCode, link.variantCode);
+    }
+  }
+  return variants;
 }

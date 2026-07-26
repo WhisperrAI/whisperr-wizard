@@ -5,11 +5,13 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import type {
   IntegrationManifest,
+  ManifestEvent,
   Playbook,
   WizardConfig,
   WizardSession,
 } from "../types.js";
-import type { OpportunityEvent, UniverseOpportunities } from "../types.js";
+import type { UniverseOpportunities } from "../types.js";
+import { isInstrumentedCoverageStatus } from "./coverage.js";
 import { changedFiles, scanWiredEvents } from "./git.js";
 import {
   BASE_WIZARD_PROMPT,
@@ -42,14 +44,29 @@ export interface AgentRunOutcome {
   repoMap?: string;
   /** Universe opportunities the planning pass proposed, before the server deduped them. */
   opportunitiesProposed: number;
-  /** Opportunity events the server actually applied and this run then wired. */
-  opportunitiesApplied: number;
 }
 
 export interface AgentEventOutcome {
+  eventDefinitionId: string;
   event: string;
   outcome: "wired" | "skipped";
+  feasibilityStatus: "confirmed" | "not_found" | "uncertain";
+  instrumentationStatus:
+    | "existing"
+    | "added"
+    | "declined"
+    | "failed"
+    | "reverted"
+    | "not_attempted";
+  placements: Array<{ file: string }>;
+  observedProperties: ObservedProperty[];
   reason?: string;
+}
+
+export interface ObservedProperty {
+  name: string;
+  /** Best-effort language-level type inferred by the read-only planner. */
+  type?: string;
 }
 
 export interface EventPlanEntry {
@@ -57,7 +74,7 @@ export interface EventPlanEntry {
   decision: "place" | "skip" | "unsure";
   file?: string;
   anchor?: string;
-  properties?: string[];
+  properties?: ObservedProperty[];
   reason: string;
 }
 
@@ -90,16 +107,8 @@ export async function runIntegrationAgent(opts: {
   manifest: IntegrationManifest;
   progress?: AgentProgress;
   onPlanReady?: (plan: EventPlanEntry[]) => Promise<EventPlanEntry[] | null>;
-  /**
-   * Hand the planner's universe proposals to the caller, which owns the API
-   * call that adds them, and get back the events the server actually applied.
-   * Those are folded into the same wiring pass as the manifest's own events, so
-   * a wizard-added event fires from this surface on this run rather than the
-   * next one. The agent stays dumb about the network; the CLI owns the write.
-   */
-  onOpportunitiesReady?: (
-    opportunities: UniverseOpportunities,
-  ) => Promise<OpportunityEvent[]>;
+  /** Hand review-only graph suggestions to the caller for approval-queue staging. */
+  onOpportunitiesReady?: (opportunities: UniverseOpportunities) => Promise<void>;
 }): Promise<AgentRunOutcome> {
   const {
     repoPath,
@@ -161,7 +170,6 @@ export async function runIntegrationAgent(opts: {
     }
   }
 
-  let appliedOpportunityEvents: OpportunityEvent[] = [];
   const opportunitiesProposed =
     planning.opportunities.events.length + planning.opportunities.interventions.length;
 
@@ -209,16 +217,13 @@ export async function runIntegrationAgent(opts: {
   costUsd += core.costUsd;
   if (core.summary) summaries.push(`Core setup:\n${core.summary}`);
 
-  // Proposals go to the universe only AFTER the core lands. They are additive
-  // and the server owns dedupe, but a universe write is not undone by the git
-  // revert we offer on a failed run — so a run that never got the SDK
-  // installed should not leave permanent additions behind. A failure here must
-  // never cost us the integration itself.
+  // Suggestions are staged only after core setup succeeds. They do not mutate
+  // the graph or become event names during this run.
   if (onOpportunitiesReady && opportunitiesProposed > 0 && core.ok) {
     try {
-      appliedOpportunityEvents = await onOpportunitiesReady(planning.opportunities);
+      await onOpportunitiesReady(planning.opportunities);
     } catch (err) {
-      debugNote(`universe additions failed: ${(err as Error).message}`);
+      debugNote(`universe suggestion staging failed: ${(err as Error).message}`);
     }
   }
 
@@ -228,11 +233,11 @@ export async function runIntegrationAgent(opts: {
   let eventsComplete = true;
   if (manifest.events.length > 0 && config.budgetUsd - costUsd <= BUDGET_FLOOR) {
     eventsComplete = false;
-    eventOutcomes = manifest.events.map((event) => ({
-      event: event.eventType,
-      outcome: "skipped",
-      reason: "Spend limit reached during core setup.",
-    }));
+    eventOutcomes = manifest.events.map(
+      (event) =>
+        existingOutcome(event) ??
+        notAttemptedOutcome(event, "Spend limit reached during core setup."),
+    );
     summaries.push(
       "Events: skipped — the spend limit was reached during core setup. " +
         "Re-run with a higher WHISPERR_WIZARD_BUDGET_USD to instrument events.",
@@ -261,7 +266,7 @@ export async function runIntegrationAgent(opts: {
       const unsureEntries = scopedPlan.filter((entry) => entry.decision === "unsure");
 
       let wire: PassResult | undefined;
-      const hasWorkToWire = placeEntries.length > 0 || appliedOpportunityEvents.length > 0;
+      const hasWorkToWire = placeEntries.length > 0;
       if (hasWorkToWire && config.budgetUsd - costUsd > BUDGET_FLOOR) {
         wire = await runTimedPass("Instrumenting planned events", {
           prompt: renderEventWirePrompt(
@@ -269,7 +274,6 @@ export async function runIntegrationAgent(opts: {
             playbook,
             repoMap,
             placeEntries,
-            appliedOpportunityEvents,
           ),
           systemPrompt,
           repoPath,
@@ -380,7 +384,6 @@ export async function runIntegrationAgent(opts: {
     eventOutcomes,
     repoMap: repoMap || undefined,
     opportunitiesProposed,
-    opportunitiesApplied: appliedOpportunityEvents.length,
   };
 }
 
@@ -584,9 +587,23 @@ function coerceEventPlan(items: unknown[]): EventPlanEntry[] | null {
       entry.anchor = obj.anchor.trim();
     }
     if (Array.isArray(obj.properties)) {
-      entry.properties = obj.properties
-        .filter((prop): prop is string => typeof prop === "string" && !!prop.trim())
-        .map((prop) => prop.trim());
+      entry.properties = obj.properties.flatMap((prop): ObservedProperty[] => {
+        if (typeof prop === "string" && prop.trim()) {
+          return [{ name: prop.trim() }];
+        }
+        if (!prop || typeof prop !== "object" || Array.isArray(prop)) return [];
+        const candidate = prop as Record<string, unknown>;
+        const name =
+          typeof candidate.name === "string"
+            ? scrubTerminalText(candidate.name).trim()
+            : "";
+        if (!name) return [];
+        const type =
+          typeof candidate.type === "string"
+            ? scrubTerminalText(candidate.type).trim()
+            : "";
+        return [{ name, ...(type ? { type } : {}) }];
+      });
     }
     entries.push(entry);
   }
@@ -680,7 +697,9 @@ function renderPlanningPrompt(
     "PART 2 — a single ```json fenced block, and nothing after it:",
     "{",
     '  "plan": [{"event":"event_name","decision":"place|skip|unsure","file":"path",',
-    '            "anchor":"function/route/handler","properties":["prop"],"reason":"short reason"}],',
+    '            "anchor":"function/route/handler",',
+    '            "properties":[{"name":"observed_name","type":"inferred type"}],',
+    '            "reason":"short reason"}],',
     '  "opportunities": {"events": [], "interventions": []}',
     "}",
     "",
@@ -689,7 +708,9 @@ function renderPlanningPrompt(
     "- decision=skip when the event clearly lives on another surface or does not exist here.",
     "- decision=unsure when there is a plausible surface but the exact anchor is not proven.",
     "- For place decisions, include file and anchor precisely.",
-    "- properties should list only properties likely available at that anchor.",
+    "- properties should list only names observed at that anchor; include a type",
+    "  only when the repository makes it reasonably inferable. Never include values",
+    "  or source expressions.",
     "",
     renderOpportunitiesBrief(manifest),
     "",
@@ -704,7 +725,6 @@ function renderEventWirePrompt(
   playbook: Playbook,
   repoMap: string,
   entries: EventPlanEntry[],
-  addedEvents: OpportunityEvent[] = [],
 ): string {
   return [
     `The Whisperr ${playbook.target.displayName} SDK is installed and initialized.`,
@@ -719,41 +739,7 @@ function renderEventWirePrompt(
     "----- EVENT WIRING PLAN -----",
     ...renderPlanEntryLines(entries),
     "----- END EVENT WIRING PLAN -----",
-    // Events the planner proposed and the universe accepted this run. They have
-    // no plan entry (they weren't in the manifest when the plan was written), so
-    // the rationale carries the placement — the planner already saw the site.
-    ...(addedEvents.length
-      ? [
-          "",
-          "----- NEWLY ADDED EVENTS -----",
-          "You proposed these while planning and they are now part of this app's",
-          "universe. Wire them the same way — your own rationale says where you",
-          "saw each one. Skip any that turn out not to have a clear trigger.",
-          ...renderAddedEventLines(addedEvents),
-          "----- END NEWLY ADDED EVENTS -----",
-        ]
-      : []),
   ].join("\n");
-}
-
-function renderAddedEventLines(events: OpportunityEvent[]): string[] {
-  const lines: string[] = [];
-  for (const event of events) {
-    lines.push("");
-    lines.push(`■ ${event.code}${event.label ? `  (${event.label})` : ""}`);
-    if (event.description) lines.push(`  ${event.description}`);
-    if (event.rationale) lines.push(`  where: ${event.rationale}`);
-    if (event.properties?.length) {
-      lines.push("  properties to capture if available:");
-      for (const prop of event.properties) {
-        lines.push(
-          `    · ${prop.name}${prop.required ? " (required)" : ""}` +
-            `${prop.description ? ` — ${prop.description}` : ""}`,
-        );
-      }
-    }
-  }
-  return lines;
 }
 
 function renderEventReconcilePrompt(
@@ -787,7 +773,13 @@ function renderPlanEntryLines(entries: EventPlanEntry[]): string[] {
     if (entry.file) lines.push(`  file: ${entry.file}`);
     if (entry.anchor) lines.push(`  anchor: ${entry.anchor}`);
     if (entry.properties?.length) {
-      lines.push(`  properties: ${entry.properties.join(", ")}`);
+      lines.push(
+        `  observed properties: ${entry.properties
+          .map((property) =>
+            property.type ? `${property.name}: ${property.type}` : property.name,
+          )
+          .join(", ")}`,
+      );
     }
     if (entry.reason) lines.push(`  reason: ${entry.reason}`);
   }
@@ -822,7 +814,7 @@ async function runDirectEventsPass(opts: {
     "below with track().",
     "",
     ...renderRepoMapSection(repoMap),
-    "Work in importance order. Place each event at the real call site where the",
+    "Work in manifest order. Place each event at the real call site where the",
     "END USER performs the action (not an admin/staff path — see WHO COUNTS AS",
     "\"THE USER\"), and attach the properties you can source from what's in scope",
     "there (see the property-capture rule). These events describe the same",
@@ -848,15 +840,19 @@ async function runDirectEventsPass(opts: {
   const wired = await scanManifestEvents(repoPath, manifest);
   return {
     pass,
-    eventOutcomes: manifest.events.map((event) =>
-      wired.has(event.eventType)
-        ? { event: event.eventType, outcome: "wired" }
-        : {
-            event: event.eventType,
-            outcome: "skipped",
-            reason: "No track() call was detected after the direct wiring pass.",
-          },
-    ),
+    eventOutcomes: manifest.events.map((event) => {
+      const existing = existingOutcome(event);
+      if (existing) return existing;
+      const file = wired.get(event.eventType);
+      if (file) return addedOutcome(event, file);
+      return {
+        ...baseOutcome(event),
+        outcome: "skipped",
+        feasibilityStatus: "uncertain",
+        instrumentationStatus: "failed",
+        reason: "No track() call was detected after the direct wiring pass.",
+      };
+    }),
   };
 }
 
@@ -907,36 +903,44 @@ function buildEventOutcomes(
 ): AgentEventOutcome[] {
   const byEvent = new Map(plan.map((entry) => [entry.event, entry]));
   return manifest.events.map((event) => {
-    if (wired.has(event.eventType)) {
-      return { event: event.eventType, outcome: "wired" };
-    }
     const entry = byEvent.get(event.eventType);
+    const existing = existingOutcome(event);
+    if (existing) return existing;
+    const file = wired.get(event.eventType);
+    if (file) return addedOutcome(event, file, entry?.properties);
     if (entry?.decision === "skip") {
       return {
-        event: event.eventType,
+        ...baseOutcome(event),
         outcome: "skipped",
+        feasibilityStatus: entry.reason === "Deselected in plan review."
+          ? "confirmed"
+          : "not_found",
+        instrumentationStatus: entry.reason === "Deselected in plan review."
+          ? "declined"
+          : "not_attempted",
         reason: entry.reason || "Planner skipped this event for this surface.",
       };
     }
     if (entry?.decision === "unsure") {
       return {
-        event: event.eventType,
+        ...baseOutcome(event),
         outcome: "skipped",
+        feasibilityStatus: "uncertain",
+        instrumentationStatus: "not_attempted",
         reason: entry.reason || "Planner could not confirm a concrete anchor.",
       };
     }
     if (entry?.decision === "place") {
       return {
-        event: event.eventType,
+        ...baseOutcome(event),
         outcome: "skipped",
+        feasibilityStatus: "confirmed",
+        instrumentationStatus: "failed",
+        observedProperties: entry.properties ?? [],
         reason: "No track() call was detected after wiring and one targeted follow-up.",
       };
     }
-    return {
-      event: event.eventType,
-      outcome: "skipped",
-      reason: "No placement decision was returned.",
-    };
+    return notAttemptedOutcome(event, "No placement decision was returned.");
   });
 }
 
@@ -947,17 +951,72 @@ function refreshWiredOutcomes(
 ): AgentEventOutcome[] {
   const byEvent = new Map(current.map((outcome) => [outcome.event, outcome]));
   return manifest.events.map((event) => {
-    if (wired.has(event.eventType)) {
-      return { event: event.eventType, outcome: "wired" };
-    }
+    const previous = byEvent.get(event.eventType);
+    const existing = existingOutcome(event);
+    if (existing) return existing;
+    const file = wired.get(event.eventType);
+    if (file) return addedOutcome(event, file, previous?.observedProperties);
     return (
-      byEvent.get(event.eventType) ?? {
-        event: event.eventType,
-        outcome: "skipped",
-        reason: "No track() call was detected.",
-      }
+      previous ?? notAttemptedOutcome(event, "No track() call was detected.")
     );
   });
+}
+
+function baseOutcome(
+  event: ManifestEvent,
+): Pick<
+  AgentEventOutcome,
+  "eventDefinitionId" | "event" | "placements" | "observedProperties"
+> {
+  return {
+    eventDefinitionId: event.eventDefinitionId,
+    event: event.eventType,
+    placements: [],
+    observedProperties: [],
+  };
+}
+
+function addedOutcome(
+  event: ManifestEvent,
+  file: string,
+  observedProperties: ObservedProperty[] = [],
+): AgentEventOutcome {
+  return {
+    ...baseOutcome(event),
+    outcome: "wired",
+    feasibilityStatus: "confirmed",
+    instrumentationStatus: "added",
+    placements: [{ file }],
+    observedProperties,
+  };
+}
+
+function existingOutcome(event: ManifestEvent): AgentEventOutcome | null {
+  const existing = event.coverage?.find(
+    (coverage) =>
+      coverage.sameSurface && isInstrumentedCoverageStatus(coverage.status),
+  );
+  if (!existing) return null;
+  return {
+    ...baseOutcome(event),
+    outcome: "wired",
+    feasibilityStatus: "confirmed",
+    instrumentationStatus: "existing",
+    placements: (existing.placementFiles ?? []).map((file) => ({ file })),
+  };
+}
+
+function notAttemptedOutcome(
+  event: ManifestEvent,
+  reason: string,
+): AgentEventOutcome {
+  return {
+    ...baseOutcome(event),
+    outcome: "skipped",
+    feasibilityStatus: "uncertain",
+    instrumentationStatus: "not_attempted",
+    reason,
+  };
 }
 
 function tail(s: string, max: number): string {

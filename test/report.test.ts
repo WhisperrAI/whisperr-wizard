@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { postRunReport, scrubSummary, type RunReport } from "../src/core/report.js";
-import type { WizardConfig, WizardSession } from "../src/types.js";
+import {
+  buildReportEvents,
+  postRunReport,
+  scrubSummary,
+  type RunReport,
+} from "../src/core/report.js";
+import type { AgentEventOutcome } from "../src/core/agent.js";
+import type {
+  ManifestEvent,
+  WizardConfig,
+  WizardSession,
+} from "../src/types.js";
 
 const config = {
   apiBaseUrl: "https://example.invalid",
@@ -15,6 +25,8 @@ const session: WizardSession = {
 };
 
 const report: RunReport = {
+  config_version_id: "arcv_1",
+  manifest_revision: "manifest-r7",
   target: "test-target",
   repo_fingerprint: "test-fingerprint",
   identify_wired: true,
@@ -116,10 +128,21 @@ test("postRunReport serializes run telemetry and per-event skip reasons", async 
       ...report,
       verified: false,
       events: [
-        { event_type: "menu_viewed", status: "wired", file: "src/app/menu/page.tsx" },
         {
+          event_definition_id: "ared_menu_viewed",
+          event_type: "menu_viewed",
+          feasibility_status: "confirmed",
+          instrumentation_status: "added",
+          placements: [{ file: "src/app/menu/page.tsx" }],
+          observed_properties: [],
+        },
+        {
+          event_definition_id: "ared_booking_started",
           event_type: "booking_started",
-          status: "skipped",
+          feasibility_status: "not_found",
+          instrumentation_status: "not_attempted",
+          placements: [],
+          observed_properties: [],
           reason: "no clear trigger in this codebase",
         },
       ],
@@ -130,7 +153,6 @@ test("postRunReport serializes run telemetry and per-event skip reasons", async 
       exit_class: "verify_failed",
       phase_timings: [{ phase: "Planning your integration", ms: 41230 }],
       opportunities_proposed: 4,
-      opportunities_applied: 3,
     });
   } finally {
     globalThis.fetch = realFetch;
@@ -143,7 +165,6 @@ test("postRunReport serializes run telemetry and per-event skip reasons", async 
   assert.equal(body.effort, "high");
   assert.equal(body.exit_class, "verify_failed");
   assert.equal(body.opportunities_proposed, 4);
-  assert.equal(body.opportunities_applied, 3);
   // false must survive as false — it means the build broke, which is not the
   // same as null ("we couldn't tell").
   assert.equal(body.verified, false);
@@ -192,8 +213,23 @@ test("postRunReport sends the events it is given, including from a mid-run exit"
       verified: false,
       exit_class: "verify_failed",
       events: [
-        { event_type: "trial_started", status: "wired", file: "app/auth.ts" },
-        { event_type: "seat_added", status: "skipped", reason: "no team features here" },
+        {
+          event_definition_id: "ared_trial_started",
+          event_type: "trial_started",
+          feasibility_status: "confirmed",
+          instrumentation_status: "added",
+          placements: [{ file: "app/auth.ts" }],
+          observed_properties: [{ name: "plan", type: "string" }],
+        },
+        {
+          event_definition_id: "ared_seat_added",
+          event_type: "seat_added",
+          feasibility_status: "not_found",
+          instrumentation_status: "not_attempted",
+          placements: [],
+          observed_properties: [],
+          reason: "no team features here",
+        },
       ],
     });
   } finally {
@@ -205,3 +241,134 @@ test("postRunReport sends the events it is given, including from a mid-run exit"
   assert.equal(events.length, 2, "a failed-verify report must still carry per-event outcomes");
   assert.equal(events[1]?.reason, "no team features here");
 });
+
+test("postRunReport pins exact manifest identity and structured event findings", async () => {
+  const realFetch = globalThis.fetch;
+  let sentBody: Record<string, unknown> = {};
+  globalThis.fetch = (async (_url: unknown, init: RequestInit) => {
+    sentBody = JSON.parse(String(init.body));
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    await postRunReport(config, session, {
+      ...report,
+      events: [
+        {
+          event_definition_id: "ared_payment_failed",
+          event_type: "payment_failed",
+          feasibility_status: "confirmed",
+          instrumentation_status: "existing",
+          placements: [{ file: "src/billing/webhook.ts" }],
+          observed_properties: [
+            { name: "amount", type: "number" },
+            { name: "currency" },
+          ],
+        },
+      ],
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assert.equal(sentBody.config_version_id, "arcv_1");
+  assert.equal(sentBody.manifest_revision, "manifest-r7");
+  assert.deepEqual(sentBody.events, [
+    {
+      event_definition_id: "ared_payment_failed",
+      event_type: "payment_failed",
+      feasibility_status: "confirmed",
+      instrumentation_status: "existing",
+      placements: [{ file: "src/billing/webhook.ts" }],
+      observed_properties: [
+        { name: "amount", type: "number" },
+        { name: "currency" },
+      ],
+    },
+  ]);
+});
+
+test("buildReportEvents classifies added, existing, and reverted instrumentation", () => {
+  const added = manifestEvent("ared_added", "payment_failed");
+  const existing: ManifestEvent = {
+    ...manifestEvent("ared_existing", "account_created"),
+    coverage: [
+      {
+        target: "nextjs",
+        status: "existing",
+        sameSurface: true,
+        placementFiles: ["src/auth.ts"],
+      },
+    ],
+  };
+  const outcomes: AgentEventOutcome[] = [
+    outcome(added, "added"),
+    outcome(existing, "existing"),
+  ];
+  outcomes[0]!.observedProperties = [{ name: "amount", type: "number" }];
+
+  assert.deepEqual(
+    buildReportEvents(
+      [added, existing],
+      outcomes,
+      new Map([
+        ["payment_failed", ["src/stripe.ts", "src/adyen.ts"]],
+        ["account_created", ["src/auth.ts"]],
+      ]),
+    ),
+    [
+      {
+        event_definition_id: "ared_added",
+        event_type: "payment_failed",
+        feasibility_status: "confirmed",
+        instrumentation_status: "added",
+        placements: [{ file: "src/stripe.ts" }, { file: "src/adyen.ts" }],
+        observed_properties: [{ name: "amount", type: "number" }],
+        reason: undefined,
+      },
+      {
+        event_definition_id: "ared_existing",
+        event_type: "account_created",
+        feasibility_status: "confirmed",
+        instrumentation_status: "existing",
+        placements: [{ file: "src/auth.ts" }],
+        observed_properties: [],
+        reason: undefined,
+      },
+    ],
+  );
+
+  assert.equal(
+    buildReportEvents([added], outcomes, new Map(), { reverted: true })[0]
+      ?.instrumentation_status,
+    "reverted",
+  );
+});
+
+function manifestEvent(eventDefinitionId: string, eventType: string): ManifestEvent {
+  return {
+    eventDefinitionId,
+    eventType,
+    suggestedWireableOn: ["backend"],
+    variantLinks: [],
+  };
+}
+
+function outcome(
+  event: ManifestEvent,
+  instrumentationStatus: AgentEventOutcome["instrumentationStatus"],
+): AgentEventOutcome {
+  return {
+    eventDefinitionId: event.eventDefinitionId,
+    event: event.eventType,
+    outcome:
+      instrumentationStatus === "added" || instrumentationStatus === "existing"
+        ? "wired"
+        : "skipped",
+    feasibilityStatus: "confirmed",
+    instrumentationStatus,
+    placements:
+      instrumentationStatus === "existing" ? [{ file: "src/auth.ts" }] : [],
+    observedProperties: [],
+  };
+}

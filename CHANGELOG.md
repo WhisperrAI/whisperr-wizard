@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- The manifest is now a focused graph contract: exact event IDs/codes,
+  advisory wireability, and typed intervention-variant links. Aliases, weights,
+  importance, payload contracts, side/kind, and derived-event metadata are no
+  longer wizard inputs.
+- Reports are pinned to a config/revision and record feasibility,
+  instrumentation status, placement files, and observed property names/types.
+- New universe ideas always enter the dashboard approval queue. The direct
+  additions and automatic policy-regeneration path is removed.
+
 ## 0.6.0
 
 - **One run, no interruptions.** The placement plan is printed and the run keeps

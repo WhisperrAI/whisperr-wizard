@@ -70,27 +70,71 @@ export interface DetectContext {
   list(relDir: string): Promise<string[]>;
 }
 
-/** One canonical event the agent must instrument, sourced from onboarding. */
+export type WireableSurface = "frontend" | "backend";
+export type VariantEventRole = "required" | "optional" | "outcome";
+
+/** Why a generated event belongs to one intervention variant. */
+export interface ManifestVariantLink {
+  interventionCode: string;
+  interventionLabel?: string;
+  variantCode: string;
+  variantLabel?: string;
+  role: VariantEventRole;
+  rationale?: string;
+}
+
+/**
+ * Review-only evidence retained on an approved suggestion. The CLI attaches it
+ * to the in-memory manifest so the planner can verify the proposed placement;
+ * it is never part of the backend universe graph contract.
+ */
+export interface ManifestReviewEvidence {
+  suggestionId: string;
+  side?: string;
+  rationale?: string;
+  expectedEffect?: string;
+  confidence?: number;
+  properties?: Array<{
+    name: string;
+    description?: string;
+    required?: boolean;
+  }>;
+}
+
+/** One exact generated event the agent must evaluate and, when possible, instrument. */
 export interface ManifestEvent {
+  /** Stable database identity; reports must echo this with the exact eventType. */
+  eventDefinitionId: string;
   /** The exact snake_case event_type the SDK should emit. */
   eventType: string;
   /** Human label, e.g. "Subscription cancelled". */
   label?: string;
   /** What this event means / when it fires — guides placement. */
   description?: string;
-  /** Suggested properties to attach, with descriptions. */
-  properties?: Array<{ name: string; description?: string; required?: boolean }>;
-  /** Why this event matters: the interventions it drives + weights. */
-  interventions?: Array<{ code: string; label?: string; weight?: number }>;
-  /** Relative importance 0..1 (max weight across its interventions). */
-  importance?: number;
+  /**
+   * Universe-generation advice only. The wizard must inspect the repository
+   * and may confirm or reject the suggestion.
+   */
+  suggestedWireableOn: WireableSurface[];
+  /** Typed graph relationships; never policy weights. */
+  variantLinks: ManifestVariantLink[];
+  /** Ephemeral approved-suggestion evidence for the local planning pass only. */
+  reviewEvidence?: ManifestReviewEvidence;
   /** Where this event is already instrumented across the app's surfaces. */
   coverage?: Array<{
     target: string;
     repoFingerprint?: string;
     status: string;
     sameSurface: boolean;
+    placementFiles?: string[];
   }>;
+}
+
+/** Parent/variant catalog used only for suggestion dedupe and link selection. */
+export interface ManifestIntervention {
+  code: string;
+  label?: string;
+  variants?: Array<{ code: string; label?: string }>;
 }
 
 /** Guidance for the identify() call. */
@@ -108,6 +152,10 @@ export interface ManifestIdentify {
  */
 export interface IntegrationManifest {
   appId: string;
+  /** Active runtime config this manifest was compiled from. */
+  configVersionId: string;
+  /** Opaque revision pin echoed by every report. */
+  manifestRevision: string;
   appName?: string;
   /** The ingestion API key the SDK will use (surfaced to the client here). */
   ingestionApiKey: string;
@@ -117,30 +165,18 @@ export interface IntegrationManifest {
   businessContext?: string;
   identify: ManifestIdentify;
   events: ManifestEvent[];
-  /**
-   * The app's full active-config intervention catalog. Events carry their own
-   * driving interventions via weights, but an intervention with no event links
-   * never surfaces there — so this list lets the dedup pre-filter see every
-   * existing intervention (link-less ones included) and avoid re-proposing them.
-   */
-  interventions?: Array<{ code: string; label?: string }>;
+  /** Full active-config catalog, including variants with no event links. */
+  interventions?: ManifestIntervention[];
   /** SDK ids the backend knows about, for cross-checking detection. */
   supportedTargets?: string[];
-  /** Optional universe-level counts used for clearer terminal summaries. */
-  universeSummary?: {
-    total: number;
-    wireableHere: number;
-    derived: number;
-    otherSurface: number;
-  };
 }
 
 /**
  * Universe opportunities — new events/interventions the agent spotted while
  * reading the customer's code that the onboarding-generated universe misses.
  * The agent writes these to a JSON file; after the user confirms in the CLI
- * they're staged in whisperr-go for dashboard approval. Older backends fall
- * back to the legacy additions endpoint.
+ * they're staged in whisperr-go for dashboard approval. There is no immediate
+ * graph-mutation fallback.
  */
 export interface OpportunityEvent {
   /** snake_case canonical event code, e.g. "subscription_payment_failed". */
@@ -157,7 +193,13 @@ export interface OpportunityEvent {
   confidence?: number;
   properties?: Array<{ name: string; description?: string; required?: boolean }>;
   /** Existing (or same-batch) interventions this event should feed. */
-  links?: Array<{ interventionCode: string; weight?: number }>;
+  links?: Array<{
+    interventionCode: string;
+    /** Required when linking to an existing intervention with multiple variants. */
+    variantCode?: string;
+    role: VariantEventRole;
+    rationale?: string;
+  }>;
 }
 
 export interface OpportunityIntervention {
@@ -171,7 +213,13 @@ export interface OpportunityIntervention {
   /** 0..1 */
   confidence?: number;
   /** Existing (or same-batch) events that should drive this intervention. */
-  links?: Array<{ eventCode: string; weight?: number }>;
+  links?: Array<{
+    eventCode: string;
+    /** Omitted for a new intervention's server-created default variant. */
+    variantCode?: string;
+    role: VariantEventRole;
+    rationale?: string;
+  }>;
 }
 
 export interface UniverseOpportunities {
@@ -214,48 +262,6 @@ export interface SuggestionRecord {
   decisionNote?: string;
   additionId?: string;
   integratedAt?: string;
-}
-
-/** How one submitted item resolved on the backend. */
-export interface AdditionOutcome {
-  kind: "event" | "intervention" | "link";
-  code: string;
-  status: "applied" | "duplicate" | "invalid";
-  reason?: string;
-  duplicateOf?: string;
-}
-
-/**
- * The policy-regeneration leg of an additions request. Applied additions land
- * in the universe tables, but live decisioning reads the derived runtime
- * policy — which only changes once regeneration runs and the new version
- * activates. Mirrors whisperr-go's PolicyRegenOutcome.
- */
-export interface PolicyRegenOutcome {
-  /**
-   * "pending": regen job enqueued; the app had no active policy at trigger time,
-   *            so the draft is predicted to auto-activate once the job completes.
-   * "draft":   regen job enqueued; the app already has an active policy, so a
-   *            review draft will be queued (not auto-activated) for a human to
-   *            activate from the dashboard.
-   * "skipped": nothing applied, runtime already current.
-   * "failed":  additions recorded but the live runtime was NOT updated.
-   */
-  status: "pending" | "draft" | "skipped" | "failed";
-  jobId?: string;
-  reason?: string;
-}
-
-/** Response of POST /wizard/universe/additions. */
-export interface UniverseAdditionsResult {
-  additionId: string;
-  configVersionId: string;
-  applied: number;
-  duplicates: number;
-  invalid: number;
-  outcomes: AdditionOutcome[];
-  /** Optional only for older backends; current whisperr-go always sends it. */
-  policyRegen?: PolicyRegenOutcome;
 }
 
 /** A short-lived session the CLI holds after device authorization. */
@@ -301,12 +307,6 @@ export interface WizardConfig {
    * plan is printed either way so nothing is hidden.
    */
   reviewPlan: boolean;
-  /**
-   * Stage universe proposals for dashboard approval instead of adding them
-   * outright. Off by default — a proposal backed by code evidence is worth more
-   * in the universe now than in a queue nobody opens.
-   */
-  proposeOnly: boolean;
   /** Run the self-review on the planner model at full depth. */
   strictReview: boolean;
 }

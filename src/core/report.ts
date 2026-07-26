@@ -1,10 +1,25 @@
-import type { WizardConfig, WizardSession } from "../types.js";
+import type { AgentEventOutcome } from "./agent.js";
+import type {
+  ManifestEvent,
+  WizardConfig,
+  WizardSession,
+} from "../types.js";
 
 /** One event's outcome in a run, as reported to the coverage ledger. */
 export interface ReportEvent {
+  /** Exact pair from the manifest; the server rejects mismatches. */
+  event_definition_id: string;
   event_type: string;
-  status: "wired" | "skipped";
-  file?: string;
+  feasibility_status: "confirmed" | "not_found" | "uncertain";
+  instrumentation_status:
+    | "existing"
+    | "added"
+    | "declined"
+    | "failed"
+    | "reverted"
+    | "not_attempted";
+  placements: Array<{ file: string }>;
+  observed_properties: Array<{ name: string; type?: string }>;
   /**
    * The agent's own explanation for a skip. Costs nothing to send and is the
    * difference between "12/28 wired" and knowing why the other 16 weren't.
@@ -22,6 +37,9 @@ export interface ReportPhaseTiming {
 export type ReportExitClass = string;
 
 export interface RunReport {
+  /** Pins this report to the exact graph the wizard evaluated. */
+  config_version_id: string;
+  manifest_revision: string;
   target: string;
   repo_fingerprint: string;
   identify_wired: boolean;
@@ -48,7 +66,67 @@ export interface RunReport {
   exit_class?: ReportExitClass;
   phase_timings?: ReportPhaseTiming[];
   opportunities_proposed?: number;
-  opportunities_applied?: number;
+}
+
+/**
+ * Compile deterministic repository scans and planner findings into the exact
+ * per-event wire contract. Identity matching uses both database ID and event
+ * code, so a stale/mismatched finding cannot be attached to another event.
+ */
+export function buildReportEvents(
+  events: ManifestEvent[],
+  outcomes: AgentEventOutcome[],
+  currentPlacements: Map<string, string[]>,
+  opts: { reverted?: boolean } = {},
+): ReportEvent[] {
+  const byIdentity = new Map(
+    outcomes.map((outcome) => [
+      eventIdentity(outcome.eventDefinitionId, outcome.event),
+      outcome,
+    ]),
+  );
+  return events.map((event) => {
+    const outcome = byIdentity.get(
+      eventIdentity(event.eventDefinitionId, event.eventType),
+    );
+    const currentFiles = currentPlacements.get(event.eventType) ?? [];
+    const wasExisting = outcome?.instrumentationStatus === "existing";
+    const wasReverted =
+      opts.reverted === true && outcome?.instrumentationStatus === "added";
+    const instrumentationStatus = wasExisting
+      ? "existing"
+      : wasReverted
+        ? "reverted"
+        : currentFiles.length
+          ? "added"
+          : outcome?.instrumentationStatus === "added"
+            ? "failed"
+            : (outcome?.instrumentationStatus ?? "not_attempted");
+
+    return {
+      event_definition_id: event.eventDefinitionId,
+      event_type: event.eventType,
+      feasibility_status:
+        currentFiles.length || wasExisting || wasReverted
+          ? "confirmed"
+          : (outcome?.feasibilityStatus ?? "uncertain"),
+      instrumentation_status: instrumentationStatus,
+      placements: wasExisting && outcome.placements.length
+        ? outcome.placements
+        : currentFiles.length
+        ? currentFiles.map((file) => ({ file }))
+        : (outcome?.placements ?? []),
+      observed_properties: outcome?.observedProperties ?? [],
+      reason:
+        instrumentationStatus === "added" || instrumentationStatus === "existing"
+          ? undefined
+          : outcome?.reason,
+    };
+  });
+}
+
+function eventIdentity(eventDefinitionId: string, eventType: string): string {
+  return `${eventDefinitionId}\u0000${eventType}`;
 }
 
 export type PostRunReportResult =

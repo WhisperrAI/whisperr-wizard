@@ -126,7 +126,21 @@ export async function scanWiredEvents(
   files: string[],
   eventTypes: string[],
 ): Promise<Map<string, string>> {
-  const wired = new Map<string, string>();
+  const placements = await scanWiredEventPlacements(repoPath, files, eventTypes);
+  return new Map(
+    [...placements].flatMap(([eventType, eventFiles]) =>
+      eventFiles[0] ? [[eventType, eventFiles[0]] as const] : [],
+    ),
+  );
+}
+
+/** Every changed file that emits each exact event code. */
+export async function scanWiredEventPlacements(
+  repoPath: string,
+  files: string[],
+  eventTypes: string[],
+): Promise<Map<string, string[]>> {
+  const wired = new Map<string, string[]>();
   const patterns = eventTypes.map((e) => ({
     eventType: e,
     trackRe: new RegExp(
@@ -146,8 +160,8 @@ export async function scanWiredEvents(
 
   for (const { file, content } of contents) {
     for (const { eventType, trackRe } of patterns) {
-      if (!wired.has(eventType) && trackRe.test(content)) {
-        wired.set(eventType, file);
+      if (trackRe.test(content)) {
+        appendPlacement(wired, eventType, file);
       }
     }
   }
@@ -155,11 +169,21 @@ export async function scanWiredEvents(
   for (const { file, content } of contents) {
     for (const { eventType, literalRe } of patterns) {
       if (!wired.has(eventType) && literalRe.test(content)) {
-        wired.set(eventType, file);
+        appendPlacement(wired, eventType, file);
       }
     }
   }
   return wired;
+}
+
+function appendPlacement(
+  wired: Map<string, string[]>,
+  eventType: string,
+  file: string,
+): void {
+  const files = wired.get(eventType) ?? [];
+  if (!files.includes(file)) files.push(file);
+  wired.set(eventType, files);
 }
 
 function quotedLiteralRegExp(eventType: string): RegExp {

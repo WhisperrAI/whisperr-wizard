@@ -11,15 +11,15 @@ export interface GapReportInput {
 
 export interface InterventionGap {
   code: string;
+  variantCode: string;
   label?: string;
+  variantLabel?: string;
   blocked: "fully" | "partially";
   missingEvents: Array<{ code: string; reason?: string }>;
 }
 
 export interface GapReport {
   interventionGaps: InterventionGap[];
-  otherSurface: number;
-  derived: number;
   hasContent: boolean;
 }
 
@@ -30,7 +30,9 @@ export interface ThemeLike {
 
 interface CollectedIntervention {
   code: string;
+  variantCode: string;
   label?: string;
+  variantLabel?: string;
   drivingEvents: string[];
   drivingEventSet: Set<string>;
 }
@@ -48,18 +50,26 @@ export function buildGapReport(input: GapReportInput): GapReport {
   const interventions = new Map<string, CollectedIntervention>();
 
   for (const event of input.manifest.events) {
-    for (const intervention of event.interventions ?? []) {
-      let collected = interventions.get(intervention.code);
+    for (const link of event.variantLinks.filter((candidate) => candidate.role === "required")) {
+      const key = `${link.interventionCode}\u0000${link.variantCode}`;
+      let collected = interventions.get(key);
       if (!collected) {
         collected = {
-          code: intervention.code,
-          label: intervention.label,
+          code: link.interventionCode,
+          variantCode: link.variantCode,
+          label: link.interventionLabel,
+          variantLabel: link.variantLabel,
           drivingEvents: [],
           drivingEventSet: new Set(),
         };
-        interventions.set(intervention.code, collected);
-      } else if (!collected.label && intervention.label) {
-        collected.label = intervention.label;
+        interventions.set(key, collected);
+      } else {
+        if (!collected.label && link.interventionLabel) {
+          collected.label = link.interventionLabel;
+        }
+        if (!collected.variantLabel && link.variantLabel) {
+          collected.variantLabel = link.variantLabel;
+        }
       }
 
       if (!collected.drivingEventSet.has(event.eventType)) {
@@ -81,7 +91,9 @@ export function buildGapReport(input: GapReportInput): GapReport {
 
     interventionGaps.push({
       code: intervention.code,
+      variantCode: intervention.variantCode,
       ...(intervention.label ? { label: intervention.label } : {}),
+      ...(intervention.variantLabel ? { variantLabel: intervention.variantLabel } : {}),
       blocked: missingEvents.length === plannedEvents.length ? "fully" : "partially",
       missingEvents,
     });
@@ -92,13 +104,9 @@ export function buildGapReport(input: GapReportInput): GapReport {
     return b.missingEvents.length - a.missingEvents.length;
   });
 
-  const otherSurface = input.manifest.universeSummary?.otherSurface ?? 0;
-  const derived = input.manifest.universeSummary?.derived ?? 0;
   return {
     interventionGaps,
-    otherSurface,
-    derived,
-    hasContent: interventionGaps.length > 0 || otherSurface > 0,
+    hasContent: interventionGaps.length > 0,
   };
 }
 
@@ -107,7 +115,11 @@ export function renderGapReport(report: GapReport, theme: ThemeLike): string {
 
   for (const gap of report.interventionGaps) {
     const status = gap.blocked === "fully" ? "on hold" : "running below potential";
-    lines.push(`■ ${theme.bright(gap.label ?? gap.code)}${theme.muted(` — ${status}`)}`);
+    const parent = gap.label ?? gap.code;
+    const variant = gap.variantLabel ?? gap.variantCode;
+    lines.push(
+      `■ ${theme.bright(`${parent} / ${variant}`)}${theme.muted(` — ${status}`)}`,
+    );
     for (const event of gap.missingEvents) {
       const reason = event.reason ? ` — ${lowercaseFirst(event.reason)}` : "";
       lines.push(
@@ -121,27 +133,6 @@ export function renderGapReport(report: GapReport, theme: ThemeLike): string {
         gap.blocked === "fully"
           ? "  Ship the missing flow and this play switches on by itself — the strategy is already built for it."
           : "  It works today, but with only part of its signal — every event above sharpens it.",
-      ),
-    );
-  }
-
-  if (report.otherSurface > 0) {
-    const suffix = report.otherSurface === 1 ? "" : "s";
-    lines.push(
-      `■ ${report.otherSurface} more event${suffix} live on another surface (your backend or another app)`,
-    );
-    lines.push(
-      theme.muted(
-        "  Run the wizard there and they join the same strategy — nothing to reconfigure.",
-      ),
-    );
-  }
-
-  if (report.derived > 0) {
-    const suffix = report.derived === 1 ? "" : "s";
-    lines.push(
-      theme.muted(
-        `${report.derived} derived signal${suffix} (dormancy, anniversaries, expiries) are computed by Whisperr automatically once your raw events flow — nothing to wire.`,
       ),
     );
   }

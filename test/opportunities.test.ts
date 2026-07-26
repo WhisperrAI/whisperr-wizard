@@ -6,27 +6,64 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
+  enrichManifestWithApprovedSuggestions,
   fetchSuggestions,
+  isExactCode,
   markSuggestionIntegrated,
-  normalizeCode,
   sanitizeOpportunities,
-  submitAdditions,
+  suggestionsReadyToMarkIntegrated,
   submitSuggestions,
 } from "../src/core/opportunities.js";
 import { runVerifyCommand, verdictToVerified } from "../src/core/postflight.js";
-import type { IntegrationManifest, WizardConfig, WizardSession } from "../src/types.js";
+import type {
+  IntegrationManifest,
+  SuggestionRecord,
+  WizardConfig,
+  WizardSession,
+} from "../src/types.js";
 
 const manifest: IntegrationManifest = {
   appId: "app_1",
+  configVersionId: "arcv_1",
+  manifestRevision: "manifest-r1",
   ingestionApiKey: "pk_test",
   ingestionBaseUrl: "https://api.whisperr.net",
   identify: {},
   events: [
     {
+      eventDefinitionId: "ared_subscription_cancelled",
       eventType: "subscription_cancelled",
-      interventions: [{ code: "retention", weight: 0.8 }],
+      suggestedWireableOn: ["backend"],
+      variantLinks: [
+        {
+          interventionCode: "retention",
+          variantCode: "winback",
+          role: "required",
+        },
+      ],
     },
-    { eventType: "viewed_pricing", interventions: [{ code: "monetization" }] },
+    {
+      eventDefinitionId: "ared_viewed_pricing",
+      eventType: "viewed_pricing",
+      suggestedWireableOn: ["frontend"],
+      variantLinks: [
+        {
+          interventionCode: "monetization",
+          variantCode: "pricing_nudge",
+          role: "optional",
+        },
+      ],
+    },
+  ],
+  interventions: [
+    {
+      code: "retention",
+      variants: [
+        { code: "winback" },
+        { code: "cancellation_rescue" },
+      ],
+    },
+    { code: "monetization", variants: [{ code: "pricing_nudge" }] },
   ],
 };
 
@@ -40,37 +77,216 @@ const session: WizardSession = {
   appId: "app_1",
   expiresAt: Date.now() / 1000 + 600,
 };
+const manifestPin = {
+  configVersionId: manifest.configVersionId,
+  manifestRevision: manifest.manifestRevision,
+};
 
-test("normalizeCode mirrors whisperr-go's NormalizeCode", () => {
-  assert.equal(normalizeCode("Payment Failed"), "payment_failed");
-  assert.equal(normalizeCode("  sub.cancelled/v2  "), "sub_cancelled_v2");
-  assert.equal(normalizeCode("__weird--CODE__"), "weird_code");
-  assert.equal(normalizeCode("---"), "");
-  // Go converts only space/-/./ slash to "_" and DROPS other
-  // non-alphanumerics — it does not turn them into underscores.
-  assert.equal(normalizeCode("user's plan"), "users_plan");
-  assert.equal(normalizeCode("a+b=c"), "abc");
-  assert.equal(normalizeCode("café latte"), "caf_latte");
-  assert.equal(normalizeCode("foo — bar"), "foo_bar");
+test("approved event evidence enriches only the matching in-memory manifest event", () => {
+  const approved: SuggestionRecord[] = [
+    {
+      id: "suggestion_payment_failed",
+      kind: "event",
+      code: "subscription_cancelled",
+      status: "approved",
+      payload: {
+        code: "subscription_cancelled",
+        side: "backend",
+        rationale: "Stripe cancellation webhook in src/billing/webhook.ts.",
+        expectedEffect: "Trigger win-back at the cancellation moment.",
+        confidence: 0.94,
+        properties: [
+          {
+            name: "plan",
+            description: "The cancelled subscription plan.",
+            required: true,
+          },
+        ],
+      },
+    },
+    {
+      id: "suggestion_unmatched",
+      kind: "event",
+      code: "not_in_manifest",
+      status: "approved",
+      payload: {
+        code: "not_in_manifest",
+        rationale: "This must not leak onto a different event.",
+      },
+    },
+  ];
+
+  const enriched = enrichManifestWithApprovedSuggestions(manifest, approved);
+
+  assert.notEqual(enriched, manifest);
+  assert.notEqual(enriched.events, manifest.events);
+  assert.equal(manifest.events[0]?.reviewEvidence, undefined);
+  assert.deepEqual(enriched.events[0]?.reviewEvidence, {
+    suggestionId: "suggestion_payment_failed",
+    side: "backend",
+    rationale: "Stripe cancellation webhook in src/billing/webhook.ts.",
+    expectedEffect: "Trigger win-back at the cancellation moment.",
+    confidence: 0.94,
+    properties: [
+      {
+        name: "plan",
+        description: "The cancelled subscription plan.",
+        required: true,
+      },
+    ],
+  });
+  assert.equal(enriched.events[1]?.reviewEvidence, undefined);
 });
 
-test("sanitizeOpportunities keeps valid proposals and normalizes codes", () => {
+test("intervention integration waits for every required linked event", () => {
+  const readinessManifest: IntegrationManifest = {
+    ...manifest,
+    events: [
+      {
+        eventDefinitionId: "ared_subscription_cancelled",
+        eventType: "subscription_cancelled",
+        suggestedWireableOn: ["backend"],
+        variantLinks: [
+          {
+            interventionCode: "winback",
+            variantCode: "winback",
+            role: "required",
+          },
+          {
+            interventionCode: "retention_rescue",
+            variantCode: "retention_rescue",
+            role: "required",
+          },
+        ],
+      },
+      {
+        eventDefinitionId: "ared_payment_failed",
+        eventType: "payment_failed",
+        suggestedWireableOn: ["backend"],
+        variantLinks: [
+          {
+            interventionCode: "retention_rescue",
+            variantCode: "retention_rescue",
+            role: "required",
+          },
+        ],
+      },
+      {
+        eventDefinitionId: "ared_viewed_pricing",
+        eventType: "viewed_pricing",
+        suggestedWireableOn: ["frontend"],
+        variantLinks: [
+          {
+            interventionCode: "pricing_nudge",
+            variantCode: "pricing_nudge",
+            role: "optional",
+          },
+        ],
+      },
+    ],
+  };
+  const approved: SuggestionRecord[] = [
+    {
+      id: "suggestion_event",
+      kind: "event",
+      code: "subscription_cancelled",
+      status: "approved",
+      payload: { code: "subscription_cancelled" },
+    },
+    {
+      id: "suggestion_ready_intervention",
+      kind: "intervention",
+      code: "winback",
+      status: "approved",
+      payload: {
+        code: "winback",
+        // The required link was declared on the event suggestion. Readiness
+        // must use the exact post-approval manifest, not this one-sided payload.
+        links: [],
+      },
+    },
+    {
+      id: "suggestion_blocked_intervention",
+      kind: "intervention",
+      code: "retention_rescue",
+      status: "approved",
+      payload: {
+        code: "retention_rescue",
+        // This payload omits payment_failed, but the approved manifest has both
+        // required links, so one covered event must not advance the lifecycle.
+        links: [
+          { eventCode: "subscription_cancelled", role: "required" },
+        ],
+      },
+    },
+    {
+      id: "suggestion_no_required_dependencies",
+      kind: "intervention",
+      code: "pricing_nudge",
+      status: "approved",
+      payload: {
+        code: "pricing_nudge",
+        links: [
+          { eventCode: "viewed_pricing", role: "optional" },
+        ],
+      },
+    },
+  ];
+
+  const ready = suggestionsReadyToMarkIntegrated(
+    approved,
+    readinessManifest,
+    new Set(["subscription_cancelled"]),
+    new Set(["subscription_cancelled"]),
+  );
+
+  assert.deepEqual(
+    ready.map((suggestion) => suggestion.id),
+    ["suggestion_event", "suggestion_ready_intervention"],
+  );
+});
+
+test("isExactCode mirrors the runtime graph's non-normalizing contract", () => {
+  assert.equal(isExactCode("payment_failed"), true);
+  assert.equal(isExactCode("event2_started"), true);
+  assert.equal(isExactCode("Payment Failed"), false);
+  assert.equal(isExactCode(" payment_failed "), false);
+  assert.equal(isExactCode("sub.cancelled/v2"), false);
+  assert.equal(isExactCode("__weird_code__"), false);
+  assert.equal(isExactCode("---"), false);
+});
+
+test("sanitizeOpportunities keeps valid proposals without rewriting codes", () => {
   const out = sanitizeOpportunities(
     {
       events: [
         {
-          code: "Payment Failed",
+          code: "payment_failed",
           side: "Backend",
           confidence: 1.4,
           rationale: "billing webhook has no event",
           properties: [{ name: "charge_type", required: true }, "plan", { bogus: true }],
-          links: [{ interventionCode: "Retention", weight: 0.6 }, { weight: 0.2 }],
+          links: [
+            {
+              interventionCode: "retention",
+              variantCode: "winback",
+              role: "Required",
+              rationale: "The failed payment opens a recovery moment.",
+            },
+            { interventionCode: "retention", weight: 0.2 },
+          ],
         },
       ],
       interventions: [
         {
           code: "support_rescue",
-          links: [{ eventCode: "payment_failed" }],
+          links: [
+            {
+              eventCode: "payment_failed",
+              role: "outcome",
+              rationale: "Recovery should lead to a successful payment.",
+            },
+          ],
         },
       ],
     },
@@ -86,21 +302,34 @@ test("sanitizeOpportunities keeps valid proposals and normalizes codes", () => {
     { name: "charge_type", required: true },
     { name: "plan" },
   ]);
-  assert.deepEqual(ev.links, [{ interventionCode: "retention", weight: 0.6 }]);
+  assert.deepEqual(ev.links, [
+    {
+      interventionCode: "retention",
+      variantCode: "winback",
+      role: "required",
+      rationale: "The failed payment opens a recovery moment.",
+    },
+  ]);
 
   assert.equal(out.interventions.length, 1);
-  assert.deepEqual(out.interventions[0]!.links, [{ eventCode: "payment_failed" }]);
+  assert.deepEqual(out.interventions[0]!.links, [
+    {
+      eventCode: "payment_failed",
+      role: "outcome",
+      rationale: "Recovery should lead to a successful payment.",
+    },
+  ]);
 });
 
-test("sanitizeOpportunities drops manifest duplicates, repeats, and junk", () => {
+test("sanitizeOpportunities drops exact manifest duplicates, repeats, and junk", () => {
   const out = sanitizeOpportunities(
     {
       events: [
         { code: "subscription_cancelled" }, // already in the manifest
-        { code: "Viewed Pricing" }, // manifest duplicate after normalization
+        { code: "viewed_pricing" }, // exact manifest duplicate
         { code: "trial_expired" },
         { code: "trial_expired" }, // repeat within the proposal set
-        { code: "   " }, // empty after normalization
+        { code: "" },
         "nonsense",
       ],
       interventions: [
@@ -131,7 +360,7 @@ test("sanitizeOpportunities dedups against the top-level intervention catalog", 
   const out = sanitizeOpportunities(
     {
       interventions: [
-        { code: "Support Rescue" }, // catalog duplicate after normalization
+        { code: "support_rescue" },
         { code: "brand_new" },
       ],
     },
@@ -141,6 +370,44 @@ test("sanitizeOpportunities dedups against the top-level intervention catalog", 
     out.interventions.map((i) => i.code),
     ["brand_new"],
   );
+});
+
+test("sanitizeOpportunities requires the exact variant for existing multi-variant links", () => {
+  const out = sanitizeOpportunities(
+    {
+      events: [
+        {
+          code: "trial_expired",
+          links: [
+            { interventionCode: "retention", role: "required" },
+            {
+              interventionCode: "retention",
+              variantCode: "does_not_exist",
+              role: "required",
+            },
+            {
+              interventionCode: "retention",
+              variantCode: "cancellation_rescue",
+              role: "required",
+            },
+            { interventionCode: "monetization", role: "optional" },
+            { interventionCode: "brand_new", role: "outcome" },
+          ],
+        },
+      ],
+    },
+    manifest,
+  );
+
+  assert.deepEqual(out.events[0]?.links, [
+    {
+      interventionCode: "retention",
+      variantCode: "cancellation_rescue",
+      role: "required",
+    },
+    { interventionCode: "monetization", role: "optional" },
+    { interventionCode: "brand_new", role: "outcome" },
+  ]);
 });
 
 test("sanitizeOpportunities strips ANSI escapes and control chars from LLM strings", () => {
@@ -179,53 +446,41 @@ test("sanitizeOpportunities tolerates a completely malformed document", () => {
   }
 });
 
-test("submitAdditions posts the whisperr-go contract and returns its result", async () => {
-  const calls: Array<{ url: string; init: RequestInit }> = [];
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (url: any, init: any) => {
-    calls.push({ url: String(url), init });
-    return new Response(
-      JSON.stringify({
-        additionId: "wua_1",
-        configVersionId: "arcv_1",
-        applied: 2,
-        duplicates: 0,
-        invalid: 0,
-        outcomes: [
-          { kind: "event", code: "trial_expired", status: "applied" },
-          { kind: "link", code: "trial_expired -> retention", status: "applied" },
-        ],
-      }),
-      { status: 200 },
-    );
-  }) as typeof fetch;
-
-  try {
-    const result = await submitAdditions(config, session, "nextjs", "fp-1", {
+test("sanitizeOpportunities preserves invalid model codes instead of normalizing identity", () => {
+  const out = sanitizeOpportunities(
+    {
       events: [
-        { code: "trial_expired", links: [{ interventionCode: "retention", weight: 0.4 }] },
+        {
+          code: "Payment Failed",
+          links: [
+            {
+              interventionCode: "Retention Rescue",
+              variantCode: "Default Variant",
+              role: "required",
+            },
+          ],
+        },
       ],
-      interventions: [],
-    });
-    assert.equal(result.applied, 2);
-    assert.equal(result.outcomes.length, 2);
+      interventions: [
+        {
+          code: " support_rescue ",
+          links: [
+            {
+              eventCode: "Payment Failed",
+              role: "outcome",
+            },
+          ],
+        },
+      ],
+    },
+    manifest,
+  );
 
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0]!.url, "https://api.whisperr.net/wizard/universe/additions");
-    const headers = calls[0]!.init.headers as Record<string, string>;
-    assert.equal(headers.Authorization, "Bearer wzs_test");
-    const body = JSON.parse(String(calls[0]!.init.body));
-    assert.deepEqual(body, {
-      target: "nextjs",
-      repoFingerprint: "fp-1",
-      events: [
-        { code: "trial_expired", links: [{ interventionCode: "retention", weight: 0.4 }] },
-      ],
-      interventions: [],
-    });
-  } finally {
-    globalThis.fetch = realFetch;
-  }
+  assert.equal(out.events[0]?.code, "Payment Failed");
+  assert.equal(out.events[0]?.links?.[0]?.interventionCode, "Retention Rescue");
+  assert.equal(out.events[0]?.links?.[0]?.variantCode, "Default Variant");
+  assert.equal(out.interventions[0]?.code, " support_rescue ");
+  assert.equal(out.interventions[0]?.links?.[0]?.eventCode, "Payment Failed");
 });
 
 test("submitSuggestions posts the staged-suggestions contract and returns its result", async () => {
@@ -248,10 +503,17 @@ test("submitSuggestions posts the staged-suggestions contract and returns its re
   }) as typeof fetch;
 
   try {
-    const result = await submitSuggestions(config, session, "nextjs", "fp-1", {
-      events: [{ code: "trial_expired", expectedEffect: "More trial conversions" }],
-      interventions: [{ code: "winback", expectedEffect: "More recovered users" }],
-    });
+    const result = await submitSuggestions(
+      config,
+      session,
+      "nextjs",
+      "fp-1",
+      manifestPin,
+      {
+        events: [{ code: "trial_expired", expectedEffect: "More trial conversions" }],
+        interventions: [{ code: "winback", expectedEffect: "More recovered users" }],
+      },
+    );
     assert.equal(result?.staged, 2);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]!.url, "https://api.whisperr.net/wizard/universe/suggestions");
@@ -259,6 +521,8 @@ test("submitSuggestions posts the staged-suggestions contract and returns its re
     assert.deepEqual(JSON.parse(String(calls[0]!.init?.body)), {
       target: "nextjs",
       repoFingerprint: "fp-1",
+      configVersionId: "arcv_1",
+      manifestRevision: "manifest-r1",
       events: [{ code: "trial_expired", expectedEffect: "More trial conversions" }],
       interventions: [{ code: "winback", expectedEffect: "More recovered users" }],
     });
@@ -267,16 +531,124 @@ test("submitSuggestions posts the staged-suggestions contract and returns its re
   }
 });
 
-test("submitSuggestions returns null when the suggestions capability is absent", async () => {
+test("submitSuggestions rejects invalid exact codes locally and never rewrites them", async () => {
+  const calls: Array<{ body: unknown }> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ body: JSON.parse(String(init?.body)) });
+    return new Response(
+      JSON.stringify({
+        staged: 1,
+        duplicates: 0,
+        invalid: 0,
+        outcomes: [{ kind: "event", code: "trial_expired", status: "staged" }],
+      }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+
+  try {
+    const result = await submitSuggestions(
+      config,
+      session,
+      "nextjs",
+      "fp-1",
+      manifestPin,
+      {
+        events: [
+          { code: "Payment Failed" },
+          { code: "trial_expired" },
+        ],
+        interventions: [{ code: " support_rescue " }],
+      },
+    );
+
+    assert.deepEqual(calls[0]?.body, {
+      target: "nextjs",
+      repoFingerprint: "fp-1",
+      configVersionId: "arcv_1",
+      manifestRevision: "manifest-r1",
+      events: [{ code: "trial_expired" }],
+      interventions: [],
+    });
+    assert.deepEqual(result.outcomes, [
+      {
+        kind: "event",
+        code: "Payment Failed",
+        status: "invalid",
+        reason: "event code must be exact lowercase snake_case",
+      },
+      {
+        kind: "intervention",
+        code: " support_rescue ",
+        status: "invalid",
+        reason: "intervention code must be exact lowercase snake_case",
+      },
+      { kind: "event", code: "trial_expired", status: "staged" },
+    ]);
+    assert.equal(result.staged, 1);
+    assert.equal(result.invalid, 2);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("submitSuggestions returns local invalid outcomes without a request", async () => {
+  let called = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    called = true;
+    throw new Error("should not be called");
+  }) as typeof fetch;
+
+  try {
+    const result = await submitSuggestions(
+      config,
+      session,
+      "nextjs",
+      "fp-1",
+      manifestPin,
+      {
+        events: [{ code: "Not Snake Case" }],
+        interventions: [],
+      },
+    );
+    assert.equal(called, false);
+    assert.deepEqual(result, {
+      staged: 0,
+      duplicates: 0,
+      invalid: 1,
+      outcomes: [
+        {
+          kind: "event",
+          code: "Not Snake Case",
+          status: "invalid",
+          reason: "event code must be exact lowercase snake_case",
+        },
+      ],
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("submitSuggestions rejects when the approval queue is unavailable", async () => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(null, { status: 404 })) as typeof fetch;
   try {
-    assert.equal(
-      await submitSuggestions(config, session, "nextjs", "fp-1", {
-        events: [{ code: "trial_expired" }],
-        interventions: [],
-      }),
-      null,
+    await assert.rejects(
+      submitSuggestions(
+        config,
+        session,
+        "nextjs",
+        "fp-1",
+        manifestPin,
+        {
+          events: [{ code: "trial_expired" }],
+          interventions: [],
+        },
+      ),
+      /404/,
     );
   } finally {
     globalThis.fetch = realFetch;
@@ -289,10 +661,17 @@ test("submitSuggestions surfaces non-capability backend failures", async () => {
     new Response(JSON.stringify({ error: "internal" }), { status: 500 })) as typeof fetch;
   try {
     await assert.rejects(
-      submitSuggestions(config, session, "nextjs", "fp-1", {
-        events: [{ code: "trial_expired" }],
-        interventions: [],
-      }),
+      submitSuggestions(
+        config,
+        session,
+        "nextjs",
+        "fp-1",
+        manifestPin,
+        {
+          events: [{ code: "trial_expired" }],
+          interventions: [],
+        },
+      ),
       /500/,
     );
   } finally {
@@ -408,21 +787,4 @@ test("verdictToVerified maps inconclusive verify runs to null", () => {
   assert.equal(verdictToVerified({ ran: true, ok: false, output: "", timedOut: true }), null);
   assert.equal(verdictToVerified({ ran: true, ok: true, output: "" }), true);
   assert.equal(verdictToVerified({ ran: true, ok: false, output: "" }), false);
-});
-
-test("submitAdditions surfaces backend failures", async () => {
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async () =>
-    new Response(JSON.stringify({ error: "onboarding_incomplete" }), { status: 409 })) as typeof fetch;
-  try {
-    await assert.rejects(
-      submitAdditions(config, session, "nextjs", "fp-1", {
-        events: [{ code: "trial_expired" }],
-        interventions: [],
-      }),
-      /409/,
-    );
-  } finally {
-    globalThis.fetch = realFetch;
-  }
 });

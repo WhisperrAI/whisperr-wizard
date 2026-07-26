@@ -3,7 +3,10 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { scanWiredEvents } from "../src/core/git.js";
+import {
+  scanWiredEventPlacements,
+  scanWiredEvents,
+} from "../src/core/git.js";
 
 test("scanWiredEvents detects plain track literal calls", async () => {
   const repo = await fixture({
@@ -48,6 +51,24 @@ test("scanWiredEvents does not count substring event literals", async () => {
   const wired = await scanWiredEvents(repo, ["src/app.ts"], ["booking_started"]);
 
   assert.equal(wired.has("booking_started"), false);
+});
+
+test("scanWiredEventPlacements returns every file that emits an event", async () => {
+  const repo = await fixture({
+    "src/stripe.ts": "analytics.track('payment_failed');\n",
+    "src/adyen.ts": "analytics.track(userId, 'payment_failed', { gateway: 'adyen' });\n",
+  });
+
+  const placements = await scanWiredEventPlacements(
+    repo,
+    ["src/stripe.ts", "src/adyen.ts"],
+    ["payment_failed"],
+  );
+
+  assert.deepEqual(placements.get("payment_failed"), [
+    "src/stripe.ts",
+    "src/adyen.ts",
+  ]);
 });
 
 async function fixture(files: Record<string, string>): Promise<string> {

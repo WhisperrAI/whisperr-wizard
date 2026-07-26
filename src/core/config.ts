@@ -46,8 +46,6 @@ export interface CliFlags {
   force?: boolean;
   /** Confirm the placement plan before wiring, instead of just running it. */
   reviewPlan?: boolean;
-  /** Stage universe proposals for dashboard approval instead of adding them. */
-  proposeOnly?: boolean;
   /** Run the self-review on the planner model at full depth. */
   strictReview?: boolean;
 }
@@ -90,7 +88,6 @@ export function resolveConfig(flags: CliFlags = {}): WizardConfig {
     directAnthropicKey,
     offline,
     reviewPlan: flags.reviewPlan ?? false,
-    proposeOnly: flags.proposeOnly ?? false,
     strictReview: flags.strictReview ?? false,
   };
 }
