@@ -161,18 +161,9 @@ export async function runIntegrationAgent(opts: {
     }
   }
 
-  // Proposals are additive: hand them over, take back whatever the server kept.
-  // A failure here must never cost us the integration itself.
   let appliedOpportunityEvents: OpportunityEvent[] = [];
   const opportunitiesProposed =
     planning.opportunities.events.length + planning.opportunities.interventions.length;
-  if (onOpportunitiesReady && opportunitiesProposed > 0) {
-    try {
-      appliedOpportunityEvents = await onOpportunitiesReady(planning.opportunities);
-    } catch (err) {
-      debugNote(`universe additions failed: ${(err as Error).message}`);
-    }
-  }
 
   // ---- Phase 1: core (install + initialize + identify) ----
   const corePrompt = [
@@ -217,6 +208,19 @@ export async function runIntegrationAgent(opts: {
   }, phaseTimings);
   costUsd += core.costUsd;
   if (core.summary) summaries.push(`Core setup:\n${core.summary}`);
+
+  // Proposals go to the universe only AFTER the core lands. They are additive
+  // and the server owns dedupe, but a universe write is not undone by the git
+  // revert we offer on a failed run — so a run that never got the SDK
+  // installed should not leave permanent additions behind. A failure here must
+  // never cost us the integration itself.
+  if (onOpportunitiesReady && opportunitiesProposed > 0 && core.ok) {
+    try {
+      appliedOpportunityEvents = await onOpportunitiesReady(planning.opportunities);
+    } catch (err) {
+      debugNote(`universe additions failed: ${(err as Error).message}`);
+    }
+  }
 
   // ---- Phase 2: events (bounded, skip-fast) ----
   // A small floor below which a pass can't do useful work — skip rather than
