@@ -9,16 +9,15 @@ import { authenticate, startDeviceAuth, startSessionKeepalive } from "./core/aut
 import { fetchManifest } from "./core/manifest.js";
 import {
   runIntegrationAgent,
-  runAdditionsInstrumentationPass,
   runRepairPass,
   type AgentEventOutcome,
   type EventPlanEntry,
 } from "./core/agent.js";
 import {
-  collectOpportunities,
   fetchSuggestions,
   markSuggestionIntegrated,
   normalizeCode,
+  sanitizeOpportunities,
   submitAdditions,
   submitSuggestions,
 } from "./core/opportunities.js";
@@ -30,15 +29,12 @@ import {
   isWorkingTreeClean,
   repoFingerprint,
   scanWiredEvents,
-  snapshotChanges,
-  snapshotsEqual,
-  restoreToSnapshot,
-  type ChangesSnapshot,
   type GitCheckpoint,
 } from "./core/git.js";
 import { pollFirstEvent } from "./core/verify.js";
 import { runVerifyCommand, verdictToVerified } from "./core/postflight.js";
 import { postRunReport, scrubSummary, type ReportEvent } from "./core/report.js";
+import { packageVersion } from "./core/version.js";
 import { buildGapReport, renderGapReport } from "./core/gapreport.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
@@ -198,43 +194,60 @@ export async function run(options: RunOptions): Promise<number> {
   // logged explicitly instead.
   const tick = useIntegrationSpinner ? setInterval(updateIntegrationMessage, 1000) : undefined;
 
+  // Tracks what the run proposed and what the universe kept, for the report.
+  const additions: AdditionsOutcome = { proposed: 0, applied: [] };
+  const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
+
   const outcome = await runIntegrationAgent({
     repoPath,
     config,
     session,
     playbook: chosen.playbook,
     manifest,
-    ...(process.stdout.isTTY && process.stdin.isTTY
-      ? {
-          async onPlanReady(plan: EventPlanEntry[]) {
-            if (useIntegrationSpinner) {
-              spin.stop(theme.success("Placement plan ready"));
-            }
-            p.note(renderPlacementPlan(plan), "Placement plan");
+    // The plan is always shown — it's the last look at what's about to change
+    // in their code. It only becomes a question under --review-plan; the
+    // default run reads it out and keeps going.
+    async onPlanReady(plan: EventPlanEntry[]) {
+      if (useIntegrationSpinner) {
+        spin.stop(theme.success("Placement plan ready"));
+      }
+      p.note(renderPlacementPlan(plan), "Placement plan");
 
-            const placeEntries = plan.filter((entry) => entry.decision === "place");
-            let selectedEvents = placeEntries.map((entry) => entry.event);
-            if (placeEntries.length) {
-              const selection = await p.multiselect({
-                message: "Wire these events?",
-                options: placeEntries.map((entry) => ({
-                  value: entry.event,
-                  label: entry.event,
-                  hint: `${entry.file ?? "unknown file"}@${entry.anchor ?? "unknown anchor"}`,
-                })),
-                initialValues: selectedEvents,
-                required: false,
-              });
-              selectedEvents = p.isCancel(selection) ? [] : (selection as string[]);
-            }
+      const placeEntries = plan.filter((entry) => entry.decision === "place");
+      let selectedEvents = placeEntries.map((entry) => entry.event);
+      if (config.reviewPlan && interactive && placeEntries.length) {
+        const selection = await p.multiselect({
+          message: "Wire these events?",
+          options: placeEntries.map((entry) => ({
+            value: entry.event,
+            label: entry.event,
+            hint: `${entry.file ?? "unknown file"}@${entry.anchor ?? "unknown anchor"}`,
+          })),
+          initialValues: selectedEvents,
+          required: false,
+        });
+        selectedEvents = p.isCancel(selection) ? [] : (selection as string[]);
+      }
 
-            if (useIntegrationSpinner) {
-              spin.start(theme.bright("Continuing integration"));
-            }
-            return filterEventPlan(plan, selectedEvents);
-          },
-        }
-      : {}),
+      if (useIntegrationSpinner) {
+        spin.start(theme.bright("Continuing integration"));
+      }
+      return filterEventPlan(plan, selectedEvents);
+    },
+    async onOpportunitiesReady(raw) {
+      if (useIntegrationSpinner) spin.stop(theme.success("Planning done"));
+      const applied = await applyOpportunities({
+        config,
+        session,
+        playbook: chosen.playbook,
+        manifest,
+        fingerprint,
+        raw,
+        additions,
+      });
+      if (useIntegrationSpinner) spin.start(theme.bright("Continuing integration"));
+      return applied;
+    },
     progress: {
       onPhase(label) {
         phaseLabel = label;
@@ -259,13 +272,57 @@ export async function run(options: RunOptions): Promise<number> {
   });
 
   if (tick) clearInterval(tick);
+
+  // Everything the run report needs, filled in as the run proceeds. A run that
+  // dies is the one most worth seeing, so the report goes out on every exit
+  // below — not just the happy one.
+  let verified: boolean | null = null;
+  let reportEvents: ReportEvent[] = [];
+  let reported = false;
+  const reportRun = async (exitClass: ExitClass): Promise<void> => {
+    if (reported) return;
+    reported = true;
+    const result = await postRunReport(config, session, {
+      target: chosen.playbook.target.id,
+      repo_fingerprint: fingerprint,
+      identify_wired: outcome?.coreOk ?? false,
+      verified,
+      cost_usd: outcome?.costUsd ?? 0,
+      duration_ms: outcome?.durationMs ?? Date.now() - startedAt,
+      summary: scrubSummary(outcome?.summary ?? "").slice(0, 4000),
+      events: reportEvents,
+      wizard_version: packageVersion(),
+      planner_model: config.plannerModel,
+      editor_model: config.model,
+      effort: config.effort,
+      exit_class: exitClass,
+      phase_timings: outcome?.phaseTimings ?? [],
+      opportunities_proposed: additions.proposed,
+      opportunities_applied: additions.applied.length,
+    });
+    if (!result.ok) {
+      p.log.warn(
+        theme.warn("Couldn't record this run's coverage on the server") +
+          theme.muted(
+            ` (${formatReportFailure(result)}) — ` +
+              "future runs may re-propose events already wired here.",
+          ),
+      );
+    }
+  };
+
   if (!outcome) {
     if (useIntegrationSpinner) {
       spin.stop(theme.alert("Integration stopped"));
     } else {
       p.log.error(theme.alert("Integration stopped"));
     }
-    await maybeRevert(repoPath, checkpoint, "The run stopped before finishing.");
+    const reverted = await maybeRevert(
+      repoPath,
+      checkpoint,
+      "The run stopped before finishing.",
+    );
+    await reportRun(reverted ? "reverted" : "agent_error");
     return 1;
   }
 
@@ -284,10 +341,6 @@ export async function run(options: RunOptions): Promise<number> {
     p.log.success(stopLabel);
   }
 
-  // Collect any universe opportunities the review pass wrote (this also
-  // removes the proposals file so it never shows up in the customer's diff).
-  const opportunities = await collectOpportunities(repoPath, manifest, checkpoint);
-
   // 6. Show what changed + the agent's summary.
   let files = await changedFiles(repoPath, checkpoint);
   if (files.length) {
@@ -303,6 +356,7 @@ export async function run(options: RunOptions): Promise<number> {
       "The core setup didn't complete, so these changes may be incomplete.",
     );
     if (reverted) {
+      await reportRun("reverted");
       p.outro(theme.muted("Reverted — nothing was left in your working tree."));
       return 1;
     }
@@ -313,7 +367,6 @@ export async function run(options: RunOptions): Promise<number> {
   //     The agent is told not to build or run the analyzer — we own that check
   //     rather than trusting its self-report.
   // null = not run / couldn't conclude; true = passed; false = failed.
-  let verified: boolean | null = null;
   if (chosen.playbook.verifyCommand && files.length) {
     const cmd = chosen.playbook.verifyCommand;
     const vspin = p.spinner();
@@ -403,119 +456,36 @@ export async function run(options: RunOptions): Promise<number> {
           "The integration didn't pass its build/lint check, so the edits may be broken.",
         );
         if (reverted) {
+          await reportRun("reverted");
           p.outro(theme.muted("Reverted — nothing was left in your working tree."));
           return 1;
         }
-      }
-    }
-  }
-
-  // 6c. Universe opportunities: the agent may have proposed events /
-  //     interventions the onboarding plan misses. The user picks which to send
-  //     for dashboard approval. Older backends retain their additions +
-  //     bounded follow-up instrumentation behavior through capability fallback.
-  const { acceptedEvents, instrumentationSnapshot } = await offerOpportunities({
-    repoPath,
-    config,
-    session,
-    playbook: chosen.playbook,
-    manifest,
-    opportunities,
-    fingerprint,
-    checkpoint,
-    remainingBudgetUsd: config.budgetUsd - outcome.costUsd,
-    repoMap: outcome.repoMap,
-  });
-
-  // 6d. The instrumentation pass edits code AFTER the 6b check ran, so that
-  //     verdict no longer describes the working tree. Re-run the same verify
-  //     command so the reported `verified` reflects the final state — the 6b
-  //     result must never claim "verified" for a tree a later pass then broke.
-  if (instrumentationSnapshot && chosen.playbook.verifyCommand) {
-    const cmd = chosen.playbook.verifyCommand;
-    const preInstrumentationVerified = verified;
-    const vspin = p.spinner();
-    vspin.start(`Re-verifying after instrumenting the new events — ${theme.muted(cmd)}`);
-    const verdict = await runVerifyCommand(repoPath, cmd);
-    verified = verdictToVerified(verdict);
-    if (verdict.toolMissing) {
-      vspin.stop(
-        theme.warn("Couldn't re-verify automatically") +
-          theme.muted(` — \`${cmd}\` isn't available here. Run it yourself before committing.`),
-      );
-    } else if (verdict.timedOut) {
-      vspin.stop(
-        theme.warn(`Re-verification timed out — \`${cmd}\``) +
-          theme.muted(" — run it yourself before committing."),
-      );
-    } else if (verdict.ok) {
-      vspin.stop(theme.success("Verified ✓") + theme.muted(` (${cmd})`));
-    } else {
-      vspin.stop(theme.alert(`Verification failed after instrumenting the new events — ${cmd}`));
-      if (verdict.output) {
-        p.note(verdict.output, theme.warn("Verifier output"));
-      }
-      // Offer to undo ONLY the instrumentation pass — the integration that
-      // passed 6b stays, and the accepted events remain in the universe.
-      const doRevert = await p.confirm({
-        message:
-          "Instrumenting the new events didn't pass the build/lint check. " +
-          "Revert just those edits? (The events stay in your universe — wire them on a future run.)",
-        initialValue: true,
-      });
-      if (!p.isCancel(doRevert) && doRevert) {
-        if (await restoreToSnapshot(repoPath, checkpoint, instrumentationSnapshot)) {
-          verified = preInstrumentationVerified;
-          p.log.success(theme.success("Reverted the instrumentation edits."));
-        } else {
-          p.log.warn(
-            theme.warn("Couldn't revert automatically — undo manually: ") +
-              (revertHint(checkpoint) ?? "git reset --hard"),
-          );
-        }
-      } else {
-        p.log.info(
-          theme.muted("Left in your working tree — fix the verifier errors before committing."),
-        );
+        await reportRun("verify_failed");
       }
     }
   }
 
   // Derive which events actually got wired (from the diff) and record coverage
   // so future runs — including on other surfaces — know what this one handled.
-  // Recompute the diff: the additions pass may have touched more files.
-  const filesForScan = acceptedEvents.length
-    ? await changedFiles(repoPath, checkpoint)
-    : files;
+  // Newly added events are wired in the same pass as the manifest's own, so a
+  // single scan covers both.
+  const eventOutcomeByType = new Map(
+    outcome.eventOutcomes.map((event) => [event.event, event]),
+  );
   const eventTypesToScan = [
     ...manifest.events.map((e) => e.eventType),
-    ...acceptedEvents.map((e) => e.code),
+    ...additions.applied.map((e) => e.code),
   ];
-  const wiredMap = await scanWiredEvents(repoPath, filesForScan, eventTypesToScan);
-  const reportEvents: ReportEvent[] = eventTypesToScan.map((eventType) => ({
+  const wiredMap = await scanWiredEvents(repoPath, files, eventTypesToScan);
+  reportEvents = eventTypesToScan.map((eventType) => ({
     event_type: eventType,
     status: wiredMap.has(eventType) ? "wired" : "skipped",
     file: wiredMap.get(eventType),
+    // The agent's own words on why it skipped — the field that answers "why
+    // didn't it wire X" without anyone opening the repo.
+    reason: wiredMap.has(eventType) ? undefined : eventOutcomeByType.get(eventType)?.reason,
   }));
-  const reportResult = await postRunReport(config, session, {
-    target: chosen.playbook.target.id,
-    repo_fingerprint: fingerprint,
-    identify_wired: outcome.coreOk,
-    verified,
-    cost_usd: outcome.costUsd,
-    duration_ms: outcome.durationMs,
-    summary: scrubSummary(outcome.summary).slice(0, 4000),
-    events: reportEvents,
-  });
-  if (!reportResult.ok) {
-    p.log.warn(
-      theme.warn("Couldn't record this run's coverage on the server") +
-        theme.muted(
-          ` (${formatReportFailure(reportResult)}) — ` +
-            "future runs may re-propose events already wired here.",
-        ),
-    );
-  }
+  await reportRun(outcome.eventsComplete ? "completed" : "events_incomplete");
 
   // Approved events are already part of the normal manifest/instrumentation
   // flow. Reconcile only after final per-event outcomes are known; this is
@@ -571,15 +541,12 @@ export async function run(options: RunOptions): Promise<number> {
   if (eventLines) {
     p.note(eventLines, "Events");
   }
-  const eventOutcomeByType = new Map(
-    outcome.eventOutcomes.map((event) => [event.event, event]),
-  );
   const gapReport = buildGapReport({
     manifest,
     events: reportEvents.map((event) => ({
       eventType: event.event_type,
       status: event.status,
-      reason: eventOutcomeByType.get(event.event_type)?.reason,
+      reason: event.reason,
     })),
   });
   if (gapReport.hasContent) {
@@ -648,56 +615,61 @@ export async function run(options: RunOptions): Promise<number> {
 
 // --- helpers ---
 
+/** How a run ended, for the ledger. */
+type ExitClass =
+  | "completed"
+  /** Core landed but a pass stopped on its turn or spend limit before finishing. */
+  | "events_incomplete"
+  | "core_failed"
+  | "verify_failed"
+  | "reverted"
+  | "agent_error";
+
+/** Running tally of what this run proposed and what the universe kept. */
 interface AdditionsOutcome {
-  /** Events the backend actually applied to the universe. */
-  acceptedEvents: OpportunityEvent[];
-  /**
-   * Pre-instrumentation snapshot of the wizard's changes, set only when the
-   * instrumentation pass actually edited files. Non-null tells the caller the
-   * 6b verify verdict is stale and gives it the exact state to restore if the
-   * re-check fails.
-   */
-  instrumentationSnapshot: ChangesSnapshot | null;
+  proposed: number;
+  applied: OpportunityEvent[];
 }
 
-const NO_ADDITIONS: AdditionsOutcome = { acceptedEvents: [], instrumentationSnapshot: null };
-
 /**
- * Present the agent's universe opportunities and stage the confirmed ones for
- * dashboard approval. A backend without suggestions falls through to the
- * legacy additions + same-run instrumentation path. Never throws —
- * opportunities are additive and must not fail the run.
+ * Take the planner's raw proposals into the app's universe and report back the
+ * events that landed, so the wiring pass can instrument them in this same run.
+ *
+ * Two paths: by default proposals are added outright (the server owns dedupe;
+ * new interventions start paused and a live policy only ever gets a review
+ * draft, so nothing reaches a real user unreviewed). Under --propose-only they
+ * are staged for dashboard approval instead and nothing is wired now.
+ *
+ * Never throws — the integration itself must not fail over a proposal.
  */
-async function offerOpportunities(opts: {
-  repoPath: string;
+async function applyOpportunities(opts: {
   config: WizardConfig;
   session: WizardSession;
   playbook: Playbook;
   manifest: IntegrationManifest;
-  opportunities: UniverseOpportunities;
   fingerprint: string;
-  checkpoint: GitCheckpoint;
-  remainingBudgetUsd: number;
-  repoMap?: string;
-}): Promise<AdditionsOutcome> {
-  const { manifest, config, session } = opts;
+  raw: UniverseOpportunities;
+  additions: AdditionsOutcome;
+}): Promise<OpportunityEvent[]> {
+  const { config, session, playbook, manifest, fingerprint, raw, additions } = opts;
+
+  // The planner's JSON is unvalidated model output: coerce it, drop malformed
+  // entries, and pre-filter anything the manifest already covers.
+  const clean = sanitizeOpportunities(raw, manifest);
+
+  // Don't re-propose what's already sitting in the approval queue.
   const openSuggestions = await fetchSuggestions(config, session, ["proposed", "approved"]);
-  const openSuggestionKeys = new Set(
-    openSuggestions.map(
-      (suggestion) => `${suggestion.kind}:${normalizeCode(suggestion.code)}`,
-    ),
+  const openKeys = new Set(
+    openSuggestions.map((s) => `${s.kind}:${normalizeCode(s.code)}`),
   );
   const opportunities: UniverseOpportunities = {
-    events: opts.opportunities.events.filter(
-      (event) => !openSuggestionKeys.has(`event:${normalizeCode(event.code)}`),
-    ),
-    interventions: opts.opportunities.interventions.filter(
-      (intervention) =>
-        !openSuggestionKeys.has(`intervention:${normalizeCode(intervention.code)}`),
+    events: clean.events.filter((e) => !openKeys.has(`event:${normalizeCode(e.code)}`)),
+    interventions: clean.interventions.filter(
+      (i) => !openKeys.has(`intervention:${normalizeCode(i.code)}`),
     ),
   };
-  const total = opportunities.events.length + opportunities.interventions.length;
-  if (total === 0) return NO_ADDITIONS;
+  additions.proposed = opportunities.events.length + opportunities.interventions.length;
+  if (additions.proposed === 0) return [];
 
   const describe = (kind: string, code: string, why?: string) =>
     `${theme.muted(`${kind}: `)}${theme.bright(code)}${why ? theme.muted(` — ${why}`) : ""}`;
@@ -713,126 +685,25 @@ async function offerOpportunities(opts: {
 
   if (config.offline) {
     p.log.info(theme.muted("Offline mode — proposals shown only, nothing submitted."));
-    return NO_ADDITIONS;
-  }
-  if (!process.stdout.isTTY || !process.stdin.isTTY) {
-    p.log.info(
-      theme.muted("Non-interactive run — proposals were not submitted. Re-run interactively to add them."),
-    );
-    return NO_ADDITIONS;
+    return [];
   }
 
-  const selection = await p.multiselect({
-    message: "Send these to your dashboard for approval?",
-    options: [
-      ...opportunities.events.map((e) => ({
-        value: `e:${e.code}`,
-        label: `event · ${e.code}`,
-        hint: e.description ?? e.rationale,
-      })),
-      ...opportunities.interventions.map((i) => ({
-        value: `i:${i.code}`,
-        label: `intervention · ${i.code}`,
-        hint: i.description ?? i.rationale,
-      })),
-    ],
-    // Opt-in per item: nothing is pre-selected, so submitting a suggestion is
-    // an explicit choice rather than an opt-out the user has to notice and undo.
-    initialValues: [],
-    required: false,
-  });
-  if (p.isCancel(selection) || selection.length === 0) {
-    p.log.info(theme.muted("Skipped — your universe is unchanged."));
-    return NO_ADDITIONS;
+  if (config.proposeOnly) {
+    await stageOpportunities(config, session, playbook, fingerprint, opportunities);
+    return [];
   }
 
-  const chosenSet = new Set(selection as string[]);
-  const knownInterventionCodes = new Set(
-    manifest.events.flatMap((e) => e.interventions ?? []).map((i) => i.code),
-  );
-  const knownEventCodes = new Set(manifest.events.map((e) => e.eventType));
-  const pickedEvents = opportunities.events.filter((e) => chosenSet.has(`e:${e.code}`));
-  const pickedInterventions = opportunities.interventions.filter((i) =>
-    chosenSet.has(`i:${i.code}`),
-  );
-  // Drop links whose other end wasn't selected and doesn't already exist —
-  // the server would reject them as unknown references anyway.
-  const pickedInterventionCodes = new Set(pickedInterventions.map((i) => i.code));
-  const pickedEventCodes = new Set(pickedEvents.map((e) => e.code));
-  const submitted: UniverseOpportunities = {
-    events: pickedEvents.map((e) => ({
-      ...e,
-      links: e.links?.filter(
-        (l) => knownInterventionCodes.has(l.interventionCode) || pickedInterventionCodes.has(l.interventionCode),
-      ),
-    })),
-    interventions: pickedInterventions.map((i) => ({
-      ...i,
-      links: i.links?.filter(
-        (l) => knownEventCodes.has(l.eventCode) || pickedEventCodes.has(l.eventCode),
-      ),
-    })),
-  };
-
-  let stageResult: StageResult | null;
-  try {
-    stageResult = await withSpinner("Sending suggestions for approval", () =>
-      submitSuggestions(config, session, opts.playbook.target.id, opts.fingerprint, submitted),
-    );
-  } catch (err) {
-    p.log.warn(
-      theme.warn("Couldn't send the proposals") +
-        theme.muted(` — ${(err as Error).message}. Nothing was submitted.`),
-    );
-    return NO_ADDITIONS;
-  }
-
-  if (stageResult) {
-    const lines = stageResult.outcomes.map((outcome) => {
-      const mark =
-        outcome.status === "staged"
-          ? theme.success("✓")
-          : outcome.status === "duplicate"
-            ? theme.muted("=")
-            : theme.warn("✗");
-      const reason =
-        outcome.reason ??
-        (outcome.duplicateOf && outcome.duplicateOf !== outcome.code
-          ? `already queued as ${outcome.duplicateOf}`
-          : undefined);
-      const detail = reason ? theme.muted(` (${reason})`) : "";
-      return `${mark} ${outcome.kind} ${theme.bright(outcome.code)}${detail}`;
-    });
-    lines.push(
-      theme.muted(
-        `${stageResult.staged} staged · ${stageResult.duplicates} already queued · ${stageResult.invalid} rejected`,
-      ),
-    );
-    p.note(lines.join("\n"), theme.signal("Suggestions submitted"));
-    const where = stageResult.approvalsUrl
-      ? `approve at ${theme.bright(stageResult.approvalsUrl)}`
-      : "approve them in your Whisperr dashboard";
-    p.log.info(
-      theme.muted(
-        `${stageResult.staged} proposal${stageResult.staged === 1 ? "" : "s"} sent — ${where}. The next wizard run wires whatever you approve.`,
-      ),
-    );
-    return NO_ADDITIONS;
-  }
-
-  // Capability fallback for older backends. Keep the established additions
-  // merge and same-run instrumentation behavior intact below this point.
   let result;
   try {
     result = await withSpinner("Adding to your universe", () =>
-      submitAdditions(config, session, opts.playbook.target.id, opts.fingerprint, submitted),
+      submitAdditions(config, session, playbook.target.id, fingerprint, opportunities),
     );
   } catch (err) {
     p.log.warn(
       theme.warn("Couldn't add the proposals") +
         theme.muted(` — ${(err as Error).message}. Your universe is unchanged.`),
     );
-    return NO_ADDITIONS;
+    return [];
   }
 
   const lines = result.outcomes.map((o) => {
@@ -844,7 +715,9 @@ async function offerOpportunities(opts: {
           : theme.warn("✗");
     const detail =
       o.status === "duplicate"
-        ? theme.muted(` (already in your universe${o.duplicateOf && o.duplicateOf !== o.code ? ` as ${o.duplicateOf}` : ""})`)
+        ? theme.muted(
+            ` (already in your universe${o.duplicateOf && o.duplicateOf !== o.code ? ` as ${o.duplicateOf}` : ""})`,
+          )
         : o.status === "invalid" && o.reason
           ? theme.muted(` (${o.reason})`)
           : "";
@@ -855,7 +728,7 @@ async function offerOpportunities(opts: {
       `${result.applied} added · ${result.duplicates} already present · ${result.invalid} rejected`,
     ),
   );
-  if (submitted.interventions.length) {
+  if (opportunities.interventions.length) {
     lines.push(theme.muted("New interventions start paused — activate them in your dashboard."));
   }
   // The regen leg tells us whether live decisioning will actually see the
@@ -884,51 +757,72 @@ async function offerOpportunities(opts: {
     );
   }
 
-  const appliedEventCodes = new Set(
+  const appliedCodes = new Set(
     result.outcomes
       .filter((o) => o.kind === "event" && o.status === "applied")
       .map((o) => o.code),
   );
-  const acceptedEvents = pickedEvents.filter((e) => appliedEventCodes.has(e.code));
-  if (!acceptedEvents.length) return NO_ADDITIONS;
+  const applied = opportunities.events.filter((e) => appliedCodes.has(e.code));
+  additions.applied = applied;
+  return applied;
+}
 
-  // Wire the newly accepted events now — otherwise they'd exist in the plan
-  // but never fire from this surface. Snapshot the tree first: it's the state
-  // 6b verified, and the exact point to restore if this pass breaks the build.
-  const prePass = await snapshotChanges(opts.repoPath, opts.checkpoint);
-  const spin = p.spinner();
-  spin.start(theme.bright("Instrumenting the newly added events"));
+/** --propose-only: send proposals to the dashboard queue instead of the universe. */
+async function stageOpportunities(
+  config: WizardConfig,
+  session: WizardSession,
+  playbook: Playbook,
+  fingerprint: string,
+  opportunities: UniverseOpportunities,
+): Promise<void> {
+  let stageResult: StageResult | null;
   try {
-    const pass = await runAdditionsInstrumentationPass({
-      repoPath: opts.repoPath,
-      config,
-      session,
-      playbook: opts.playbook,
-      acceptedEvents,
-      budgetUsd: opts.remainingBudgetUsd,
-      repoMap: opts.repoMap,
-    });
-    if (pass.ran) {
-      spin.stop(theme.success("New events instrumented"));
-      logAgentSummary(pass.summary);
-    } else {
-      spin.stop(
-        theme.warn("Skipped instrumenting the new events") +
-          theme.muted(
-            " — the spend limit was reached. They're in your universe; wire them on a future run.",
-          ),
-      );
-    }
-  } catch (err) {
-    spin.stop(
-      theme.warn("Couldn't instrument the new events") +
-        theme.muted(` — ${(err as Error).message}. They're in your universe; wire them on a future run.`),
+    stageResult = await withSpinner("Sending suggestions for approval", () =>
+      submitSuggestions(config, session, playbook.target.id, fingerprint, opportunities),
     );
+  } catch (err) {
+    p.log.warn(
+      theme.warn("Couldn't send the proposals") +
+        theme.muted(` — ${(err as Error).message}. Nothing was submitted.`),
+    );
+    return;
   }
-  // Even a failed pass may have left partial edits behind — compare contents,
-  // not just the outcome, so the caller re-verifies exactly when needed.
-  const edited = !snapshotsEqual(prePass, await snapshotChanges(opts.repoPath, opts.checkpoint));
-  return { acceptedEvents, instrumentationSnapshot: edited ? prePass : null };
+  if (!stageResult) {
+    p.log.warn(
+      theme.warn("This Whisperr backend has no approval queue") +
+        theme.muted(" — nothing was submitted. Re-run without --propose-only to add them directly."),
+    );
+    return;
+  }
+
+  const lines = stageResult.outcomes.map((outcome) => {
+    const mark =
+      outcome.status === "staged"
+        ? theme.success("✓")
+        : outcome.status === "duplicate"
+          ? theme.muted("=")
+          : theme.warn("✗");
+    const reason =
+      outcome.reason ??
+      (outcome.duplicateOf && outcome.duplicateOf !== outcome.code
+        ? `already queued as ${outcome.duplicateOf}`
+        : undefined);
+    return `${mark} ${outcome.kind} ${theme.bright(outcome.code)}${reason ? theme.muted(` (${reason})`) : ""}`;
+  });
+  lines.push(
+    theme.muted(
+      `${stageResult.staged} staged · ${stageResult.duplicates} already queued · ${stageResult.invalid} rejected`,
+    ),
+  );
+  p.note(lines.join("\n"), theme.signal("Suggestions submitted"));
+  const where = stageResult.approvalsUrl
+    ? `approve at ${theme.bright(stageResult.approvalsUrl)}`
+    : "approve them in your Whisperr dashboard";
+  p.log.info(
+    theme.muted(
+      `${stageResult.staged} proposal${stageResult.staged === 1 ? "" : "s"} sent — ${where}. The next wizard run wires whatever you approve.`,
+    ),
+  );
 }
 
 /**
@@ -1141,12 +1035,10 @@ function logAgentSummary(summary: string): void {
 
 function shortPhaseLabel(phase: string): string {
   switch (phase) {
-    case "Mapping your codebase":
-      return "map";
+    case "Planning your integration":
+      return "plan";
     case "Installing the SDK & wiring identify()":
       return "core";
-    case "Planning event placements":
-      return "plan";
     case "Instrumenting planned events":
     case "Instrumenting your events":
       return "wire";

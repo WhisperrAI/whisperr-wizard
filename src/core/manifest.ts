@@ -55,9 +55,18 @@ export function mockManifest(
     appName: "Acme (dev)",
     ingestionApiKey: "wrk_offline_demo_key_do_not_use",
     ingestionBaseUrl: config.apiBaseUrl,
-    businessContext:
-      "B2C subscription app. Free trial converts to a paid monthly plan. " +
-      "Churn risk concentrates around trial end and the first failed payment.",
+    // Same labelled shape whisperr-go renders from the app's onboarding
+    // business context, so an offline run exercises the real prompt.
+    businessContext: [
+      "Product: Acme (Acme Inc)",
+      "What it does: B2C subscription app; a free trial converts to a paid monthly plan",
+      "Industry: Software / Productivity",
+      "Who the paying end user is: individual consumers on the trial-to-paid path",
+      "How it charges: monthly subscription",
+      "Activation moment: first project created after signup",
+      "Churn-risk signals onboarding identified: trial ending unused; first failed payment",
+      "Healthy-usage signals: weekly active project edits",
+    ].join("\n"),
     identify: {
       traits: [
         { name: "plan", description: "free | trial | pro" },

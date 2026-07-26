@@ -17,7 +17,7 @@ npx @whisperr/wizard
 ## What it does (the flow)
 
 ```
-detect stack ─▶ authenticate (browser) ─▶ load manifest ─▶ git checkpoint ─▶ agent edits ─▶ verify first event
+detect ─▶ authenticate ─▶ manifest ─▶ checkpoint ─▶ plan ─▶ install ─▶ wire ─▶ review ─▶ verify ─▶ report
 ```
 
 1. **Detect** the repo's language/framework (Flutter, Web/JS, Next.js, React
@@ -27,13 +27,24 @@ detect stack ─▶ authenticate (browser) ─▶ load manifest ─▶ git check
    session token bound to their app.
 3. **Load the integration manifest** from whisperr-go: the ingestion API key, the
    specific snake_case events to instrument, the interventions each event drives,
-   and `identify()` guidance — all derived from the user's onboarding.
+   `identify()` guidance, and the **business context** from onboarding (who the
+   paying end user is, how the product charges, what churn looks like here).
 4. **Checkpoint** with git so the auto-applied edits are reversible.
-5. **Run the coding agent** (Claude Agent SDK) inside the repo: add the SDK
-   dependency, initialize it, wire `identify()`, and place `track()` calls at the
-   correct call sites for each manifest event.
-6. **Verify** by polling for the first event — the "Whisperr is receiving
-   events ✓" moment, which also lights up the dashboard.
+5. **Plan** in one read-only pass on the planner model: map the repo, decide
+   where each event belongs, and note what the onboarding plan is missing. The
+   plan is printed; `--review-plan` turns it into a confirmation step.
+6. **Add** what the planner proposed to the app's universe (`--propose-only`
+   stages it for dashboard approval instead), so accepted events get wired in
+   this same run rather than the next one.
+7. **Install & wire** on the editor model: add the SDK, initialize it, wire
+   `identify()`, then place every planned `track()` call — manifest events and
+   newly added ones in a single pass.
+8. **Review** the resulting `git diff` and fix wrong subjects, wrong lifecycle
+   moments, and missing discriminators. `--strict-review` runs this deeper.
+9. **Verify** by running the playbook's build/lint command ourselves, then
+   polling for the first event — the "Whisperr is receiving events ✓" moment.
+10. **Report** the run to `POST /wizard/report`: per-event coverage with skip
+    reasons, phase timings, models, and how the run ended.
 
 ## Why it's better than a generic wizard
 
@@ -93,8 +104,16 @@ Anthropic key**:
   and run `--offline` to exercise the whole flow against a real model + a mock
   manifest, with no backend.
 
-Default model: `claude-sonnet-5` (override with `WHISPERR_WIZARD_MODEL`, e.g.
-`claude-opus-4-8` for the hardest repos).
+Two tiers, because planning and typing want different models:
+
+- **Planner** — `claude-opus-5` at high effort. Runs the single read-only pass
+  that maps the repo, places every event, and spots what the plan is missing.
+  Override with `WHISPERR_WIZARD_PLANNER_MODEL`.
+- **Editor** — `claude-sonnet-5`. Performs the mechanical edits at the sites the
+  planner already chose. Override with `WHISPERR_WIZARD_MODEL` or `--model`.
+
+The self-review pass runs on the editor model against `git diff` only;
+`--strict-review` promotes it to the planner model at full depth.
 
 ## Contributing / local dev
 
@@ -139,18 +158,12 @@ whisperr-go env to set:
 
 Run migration `0010_wizard_device_authorizations.sql` (`whisperr migrate up`).
 
-## Still to build
-
-- The `/wizard/activate` page in **whisperr-watch** (reuse existing Supabase
-  login; show the `user_code`, let the user pick an app, POST to
-  `/dashboard/wizard/approve`).
-- The `@whisperr/web` SDK (then flip the web/nextjs playbooks to `available`).
-
 ## Status
 
-- ✅ CLI: detection, playbook registry, terminal UX, agent runner, git
-  checkpoint, offline demo manifest. Typechecks + builds; npx-standalone.
-- ✅ whisperr-go backend: device auth, manifest (with key minting), first-event,
-  LLM gateway, migration. Builds + vets clean.
-- ⏳ whisperr-watch activate page.
+- ✅ CLI: detection, playbook registry, terminal UX, single-pass planner, agent
+  runner, git checkpoint, run reporting, offline demo manifest.
+- ✅ whisperr-go backend: device auth, manifest (key minting + business
+  context), first-event, universe additions/suggestions, run ledger with
+  telemetry, LLM gateway.
+- ✅ whisperr-watch activate page; backoffice wizard-run view.
 - ⏳ `@whisperr/web` SDK (Flutter is the first live target — SDK on pub.dev).

@@ -5,7 +5,21 @@ export interface ReportEvent {
   event_type: string;
   status: "wired" | "skipped";
   file?: string;
+  /**
+   * The agent's own explanation for a skip. Costs nothing to send and is the
+   * difference between "12/28 wired" and knowing why the other 16 weren't.
+   */
+  reason?: string;
 }
+
+/** Wall-clock cost of one agent pass, in execution order. */
+export interface ReportPhaseTiming {
+  phase: string;
+  ms: number;
+}
+
+/** How the run ended. Free-form on the wire so a newer CLI can add classes. */
+export type ReportExitClass = string;
 
 export interface RunReport {
   target: string;
@@ -21,6 +35,20 @@ export interface RunReport {
   duration_ms: number;
   summary: string;
   events: ReportEvent[];
+
+  /**
+   * Run telemetry. Enough to answer "what ran, on what, how long did each pass
+   * take, and how did it end" from the backoffice — deliberately no source, no
+   * diffs, no absolute paths.
+   */
+  wizard_version?: string;
+  planner_model?: string;
+  editor_model?: string;
+  effort?: string;
+  exit_class?: ReportExitClass;
+  phase_timings?: ReportPhaseTiming[];
+  opportunities_proposed?: number;
+  opportunities_applied?: number;
 }
 
 export type PostRunReportResult =

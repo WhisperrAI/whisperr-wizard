@@ -23,7 +23,7 @@ const DEFAULT_API_BASE = "https://api.whisperr.net";
 // Override the editor with WHISPERR_WIZARD_MODEL or --model. Override the
 // planner with WHISPERR_WIZARD_PLANNER_MODEL.
 const DEFAULT_MODEL = "claude-sonnet-5";
-const DEFAULT_PLANNER_MODEL = "claude-opus-4-8";
+const DEFAULT_PLANNER_MODEL = "claude-opus-5";
 // Reasoning effort (pairs with adaptive thinking). "high" — placement is a
 // reasoning task (which moment, which branch, which properties), so we give it
 // room to think. Drop to medium/low via WHISPERR_WIZARD_EFFORT for cheap runs.
@@ -44,6 +44,12 @@ export interface CliFlags {
   model?: string;
   /** Proceed even without a clean git working tree (no safe auto-undo). */
   force?: boolean;
+  /** Confirm the placement plan before wiring, instead of just running it. */
+  reviewPlan?: boolean;
+  /** Stage universe proposals for dashboard approval instead of adding them. */
+  proposeOnly?: boolean;
+  /** Run the self-review on the planner model at full depth. */
+  strictReview?: boolean;
 }
 
 export function resolveConfig(flags: CliFlags = {}): WizardConfig {
@@ -83,5 +89,8 @@ export function resolveConfig(flags: CliFlags = {}): WizardConfig {
     budgetUsd: Number(process.env.WHISPERR_WIZARD_BUDGET_USD) || 25,
     directAnthropicKey,
     offline,
+    reviewPlan: flags.reviewPlan ?? false,
+    proposeOnly: flags.proposeOnly ?? false,
+    strictReview: flags.strictReview ?? false,
   };
 }

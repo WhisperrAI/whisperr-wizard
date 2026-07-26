@@ -9,9 +9,8 @@ import type {
   WizardConfig,
   WizardSession,
 } from "../types.js";
-import type { OpportunityEvent } from "../types.js";
+import type { OpportunityEvent, UniverseOpportunities } from "../types.js";
 import { changedFiles, scanWiredEvents } from "./git.js";
-import { OPPORTUNITIES_FILE } from "./opportunities.js";
 import {
   BASE_WIZARD_PROMPT,
   renderEventsBrief,
@@ -39,8 +38,12 @@ export interface AgentRunOutcome {
   eventsComplete: boolean;
   /** Deterministic per-event result after planning, wiring, and scan reconciliation. */
   eventOutcomes: AgentEventOutcome[];
-  /** The read-only repository map from the planner pre-pass, if one was produced. */
+  /** The read-only repository map from the planning pass, if one was produced. */
   repoMap?: string;
+  /** Universe opportunities the planning pass proposed, before the server deduped them. */
+  opportunitiesProposed: number;
+  /** Opportunity events the server actually applied and this run then wired. */
+  opportunitiesApplied: number;
 }
 
 export interface AgentEventOutcome {
@@ -59,9 +62,25 @@ export interface EventPlanEntry {
 }
 
 /**
- * Run the integration as map -> core -> plan/wire events -> review. Opus handles
- * repo understanding and placement decisions; Sonnet performs the mechanical
- * edits at those planned sites.
+ * What the single read-only planning pass produces: how the repo is laid out,
+ * where each manifest event belongs, and which churn-relevant moments the repo
+ * has that the onboarding plan misses.
+ */
+export interface PlanningResult {
+  repoMap: string;
+  plan: EventPlanEntry[] | null;
+  opportunities: UniverseOpportunities;
+}
+
+/**
+ * Run the integration as plan -> core -> wire -> review. One read-only planner
+ * pass reads the repo and decides everything: how it's laid out, where each
+ * event belongs, and what the onboarding plan is missing. Sonnet then performs
+ * the mechanical edits at those planned sites.
+ *
+ * Planning runs FIRST, before any edit — it reasons about the customer's code,
+ * which our own changes don't affect, so there's nothing to gain by splitting it
+ * around the install.
  */
 export async function runIntegrationAgent(opts: {
   repoPath: string;
@@ -71,8 +90,27 @@ export async function runIntegrationAgent(opts: {
   manifest: IntegrationManifest;
   progress?: AgentProgress;
   onPlanReady?: (plan: EventPlanEntry[]) => Promise<EventPlanEntry[] | null>;
+  /**
+   * Hand the planner's universe proposals to the caller, which owns the API
+   * call that adds them, and get back the events the server actually applied.
+   * Those are folded into the same wiring pass as the manifest's own events, so
+   * a wizard-added event fires from this surface on this run rather than the
+   * next one. The agent stays dumb about the network; the CLI owns the write.
+   */
+  onOpportunitiesReady?: (
+    opportunities: UniverseOpportunities,
+  ) => Promise<OpportunityEvent[]>;
 }): Promise<AgentRunOutcome> {
-  const { repoPath, config, session, playbook, manifest, progress, onPlanReady } = opts;
+  const {
+    repoPath,
+    config,
+    session,
+    playbook,
+    manifest,
+    progress,
+    onPlanReady,
+    onOpportunitiesReady,
+  } = opts;
 
   applyModelAuthEnv(config, session);
   const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt].join("\n\n");
@@ -86,25 +124,53 @@ export async function runIntegrationAgent(opts: {
 
   const BUDGET_FLOOR = 0.25;
 
-  // ---- Pre-pass: read-only repository map ----
+  // ---- Planning: one read-only pass over the customer's code ----
+  // Map + placement plan + universe proposals come out of a single session, so
+  // the deep read of the repo is paid for once instead of three times.
+  let planning: PlanningResult = { repoMap: "", plan: null, opportunities: emptyOpportunities() };
   if (config.budgetUsd - costUsd > BUDGET_FLOOR) {
     try {
-      const map = await runTimedPass("Mapping your codebase", {
-        prompt: renderRepoMapPrompt(repoPath),
+      const pass = await runTimedPass("Planning your integration", {
+        prompt: renderPlanningPrompt(repoPath, playbook, manifest),
         systemPrompt,
         repoPath,
         model: config.plannerModel,
         effort: "high",
-        maxTurns: 40,
-        budgetUsd: Math.min(config.budgetUsd - costUsd, config.budgetUsd * 0.15),
+        maxTurns: 60,
+        budgetUsd: Math.min(config.budgetUsd - costUsd, config.budgetUsd * 0.3),
         allowedTools: READ_ONLY_TOOLS,
         progress,
       }, phaseTimings);
-      costUsd += map.costUsd;
-      repoMap = sliceRepoMap(map.summary);
+      costUsd += pass.costUsd;
+      planning = parsePlanningResult(pass.summary);
     } catch (err) {
-      debugNote(`repo map pass failed: ${(err as Error).message}`);
-      repoMap = "";
+      debugNote(`planning pass failed: ${(err as Error).message}`);
+    }
+  }
+  repoMap = planning.repoMap;
+
+  // Surface the plan while it's the freshest thing that happened and nothing
+  // has been edited yet — this is the last look before the agent touches their
+  // code, and under --review-plan it's where they can veto placements.
+  let scopedPlan: EventPlanEntry[] | null = null;
+  if (planning.plan) {
+    scopedPlan = planForManifest(planning.plan, manifest);
+    const reviewedPlan = await onPlanReady?.(scopedPlan);
+    if (reviewedPlan !== undefined && reviewedPlan !== null) {
+      scopedPlan = planForManifest(reviewedPlan, manifest);
+    }
+  }
+
+  // Proposals are additive: hand them over, take back whatever the server kept.
+  // A failure here must never cost us the integration itself.
+  let appliedOpportunityEvents: OpportunityEvent[] = [];
+  const opportunitiesProposed =
+    planning.opportunities.events.length + planning.opportunities.interventions.length;
+  if (onOpportunitiesReady && opportunitiesProposed > 0) {
+    try {
+      appliedOpportunityEvents = await onOpportunitiesReady(planning.opportunities);
+    } catch (err) {
+      debugNote(`universe additions failed: ${(err as Error).message}`);
     }
   }
 
@@ -168,21 +234,7 @@ export async function runIntegrationAgent(opts: {
         "Re-run with a higher WHISPERR_WIZARD_BUDGET_USD to instrument events.",
     );
   } else if (manifest.events.length > 0) {
-    const planPass = await runTimedPass("Planning event placements", {
-      prompt: renderEventPlanPrompt(repoPath, playbook, manifest, repoMap),
-      systemPrompt,
-      repoPath,
-      model: config.plannerModel,
-      effort: "high",
-      maxTurns: 40,
-      budgetUsd: config.budgetUsd - costUsd,
-      allowedTools: READ_ONLY_TOOLS,
-      progress,
-    }, phaseTimings);
-    costUsd += planPass.costUsd;
-    const plan = parseEventPlan(planPass.summary);
-
-    if (!plan) {
+    if (!scopedPlan) {
       debugNote("event plan parse failed; falling back to direct event wiring");
       progress?.onActivity?.("Event plan was not parseable; falling back to direct wiring");
       const direct = await runDirectEventsPass({
@@ -201,29 +253,31 @@ export async function runIntegrationAgent(opts: {
       eventOutcomes = direct.eventOutcomes;
       if (direct.pass.summary) summaries.push(`Events:\n${direct.pass.summary}`);
     } else {
-      let scopedPlan = planForManifest(plan, manifest);
-      const reviewedPlan = await onPlanReady?.(scopedPlan);
-      if (reviewedPlan !== undefined && reviewedPlan !== null) {
-        scopedPlan = planForManifest(reviewedPlan, manifest);
-      }
       const placeEntries = scopedPlan.filter((entry) => entry.decision === "place");
       const unsureEntries = scopedPlan.filter((entry) => entry.decision === "unsure");
 
       let wire: PassResult | undefined;
-      if (placeEntries.length && config.budgetUsd - costUsd > BUDGET_FLOOR) {
+      const hasWorkToWire = placeEntries.length > 0 || appliedOpportunityEvents.length > 0;
+      if (hasWorkToWire && config.budgetUsd - costUsd > BUDGET_FLOOR) {
         wire = await runTimedPass("Instrumenting planned events", {
-          prompt: renderEventWirePrompt(repoPath, playbook, repoMap, placeEntries),
+          prompt: renderEventWirePrompt(
+            repoPath,
+            playbook,
+            repoMap,
+            placeEntries,
+            appliedOpportunityEvents,
+          ),
           systemPrompt,
           repoPath,
           model: config.model,
-          effort: "high",
+          effort: "medium",
           maxTurns: config.maxTurns,
           budgetUsd: config.budgetUsd - costUsd,
           progress,
         }, phaseTimings);
         costUsd += wire.costUsd;
         if (wire.summary) summaries.push(`Events:\n${wire.summary}`);
-      } else if (!placeEntries.length) {
+      } else if (!hasWorkToWire) {
         summaries.push("Events: no events had a confident placement in this surface.");
       }
 
@@ -248,10 +302,7 @@ export async function runIntegrationAgent(opts: {
       }
 
       eventOutcomes = buildEventOutcomes(manifest, scopedPlan, wired);
-      eventsComplete =
-        !planPass.maxedOut &&
-        !(wire?.maxedOut ?? false) &&
-        !(followUp?.maxedOut ?? false);
+      eventsComplete = !(wire?.maxedOut ?? false) && !(followUp?.maxedOut ?? false);
     }
   }
 
@@ -259,6 +310,13 @@ export async function runIntegrationAgent(opts: {
   // Placement is where this fails, and the agent can catch its own mistakes
   // with fresh eyes on `git diff` far cheaper than a human can. Runs whenever
   // the core landed (so identify() is reviewed even with no events).
+  //
+  // Deliberately always-on rather than gated on a scan miss: scanWiredEvents is
+  // a grep, so it sees a MISSING event but never a call sitting on the admin
+  // path or firing on a renewal — which is exactly what this pass exists to
+  // catch. What's tuned instead is its cost: the editor model on a bounded
+  // `git diff`, not the planner re-reading the repo. --strict-review restores
+  // the deeper pass for a repo that warrants it.
   if (core.ok && config.budgetUsd - costUsd > BUDGET_FLOOR) {
     const reviewPrompt = [
       `You wired the Whisperr ${playbook.target.displayName} SDK into this repo.`,
@@ -266,7 +324,7 @@ export async function runIntegrationAgent(opts: {
       `Project root: ${repoPath}`,
       "",
       ...renderRepoMapSection(repoMap),
-      "Run `git diff` and read the surrounding code to see exactly what you added.",
+      "Run `git diff` and read ONLY the code immediately around each change.",
       "For every identify() and track() call, verify — and FIX in place:",
       "1. Subject — keys to the END USER, never an admin/staff/operator/seller.",
       "   identify() sits on the SAME surface as account_created (same person).",
@@ -280,22 +338,20 @@ export async function runIntegrationAgent(opts: {
       "   / payment_source / amount / plan). Add the ones you missed.",
       "4. Coverage — every gateway/callback path that should emit an event does;",
       "   no recurring or secondary path left as a dead zone.",
-      "Change ONLY what is genuinely wrong or incomplete — do not churn correct",
-      "calls or re-explore the whole repo. Be surgical.",
-      "",
-      renderOpportunitiesBrief(manifest, OPPORTUNITIES_FILE),
+      "Work from the diff. Do NOT re-explore the repository, do NOT propose new",
+      "events, and change ONLY what is genuinely wrong or incomplete. Be surgical.",
       "",
       "End with a one-line, plain-text note of what you corrected (or 'No",
-      "corrections needed.'), plus one line on what you proposed, if anything.",
+      "corrections needed.').",
     ].join("\n");
 
     const review = await runTimedPass("Reviewing & correcting placements", {
       prompt: reviewPrompt,
       systemPrompt,
       repoPath,
-      model: config.plannerModel,
+      model: config.strictReview ? config.plannerModel : config.model,
       effort: "medium",
-      maxTurns: 40,
+      maxTurns: config.strictReview ? 40 : 15,
       budgetUsd: config.budgetUsd - costUsd,
       progress,
     }, phaseTimings);
@@ -319,78 +375,9 @@ export async function runIntegrationAgent(opts: {
     eventsComplete,
     eventOutcomes,
     repoMap: repoMap || undefined,
+    opportunitiesProposed,
+    opportunitiesApplied: appliedOpportunityEvents.length,
   };
-}
-
-/**
- * One bounded follow-up pass: instrument the events that were just ACCEPTED
- * into the universe as wizard additions. Without this a wizard-added event
- * would exist in the plan but never fire. Same machinery as Phase 2, scoped to
- * only the accepted events.
- */
-export async function runAdditionsInstrumentationPass(opts: {
-  repoPath: string;
-  config: WizardConfig;
-  session: WizardSession;
-  playbook: Playbook;
-  acceptedEvents: OpportunityEvent[];
-  budgetUsd: number;
-  repoMap?: string;
-  progress?: AgentProgress;
-}): Promise<{ summary: string; costUsd: number; ran: boolean }> {
-  const { repoPath, config, session, playbook, acceptedEvents, budgetUsd, repoMap, progress } =
-    opts;
-  // `ran: false` = the pass never started (nothing to do / budget exhausted),
-  // so the caller must not report the events as instrumented.
-  if (!acceptedEvents.length || budgetUsd <= 0) {
-    return { summary: "", costUsd: 0, ran: false };
-  }
-
-  applyModelAuthEnv(config, session);
-  const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt].join("\n\n");
-
-  const eventLines: string[] = [];
-  for (const e of acceptedEvents) {
-    eventLines.push("");
-    eventLines.push(`■ ${e.code}${e.label ? `  (${e.label})` : ""}`);
-    if (e.description) eventLines.push(`  ${e.description}`);
-    if (e.rationale) eventLines.push(`  where: ${e.rationale}`);
-    if (e.properties?.length) {
-      eventLines.push("  properties to capture if available:");
-      for (const prop of e.properties) {
-        eventLines.push(`    · ${prop.name}${prop.required ? " (required)" : ""}${prop.description ? ` — ${prop.description}` : ""}`);
-      }
-    }
-  }
-
-  progress?.onPhase?.("Instrumenting the newly added events");
-  const prompt = [
-    "You proposed these events as universe opportunities while reviewing this",
-    "repo, and the user just APPROVED adding them to the plan. Instrument them",
-    "now with track(), exactly like the plan's other events: place each at the",
-    "real call site (your own rationale tells you where you saw it), attach the",
-    "properties available in scope, and skip anything that turns out not to have",
-    "a clear trigger after all. The SDK is already installed and initialized.",
-    `Project root: ${repoPath}`,
-    "",
-    ...renderRepoMapSection(repoMap),
-    "----- APPROVED NEW EVENTS -----",
-    ...eventLines,
-    "",
-    "----- END -----",
-  ].join("\n");
-
-  const pass = await runPass({
-    prompt,
-    systemPrompt,
-    repoPath,
-    model: config.model,
-    effort: config.effort,
-    maxTurns: 25,
-    budgetUsd,
-    progress,
-  });
-  return { summary: pass.summary, costUsd: pass.costUsd, ran: true };
 }
 
 /**
@@ -453,12 +440,103 @@ export async function runRepairPass(opts: {
 const READ_ONLY_TOOLS = ["Read", "Glob", "Grep"] as const;
 const FULL_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"] as const;
 
+/** Marks the end of the free-text repo map and the start of the JSON payload. */
+const PLANNING_JSON_FENCE = /```json\s*([\s\S]*?)```/;
+
+function emptyOpportunities(): UniverseOpportunities {
+  return { events: [], interventions: [] };
+}
+
+/**
+ * Parse the planning pass's output: a free-text repo map, then one fenced JSON
+ * block carrying the placement plan and any universe proposals.
+ *
+ * The map stays OUTSIDE the JSON deliberately — a multi-line map embedded as a
+ * JSON string is a newline-escaping minefield, and one bad escape would cost us
+ * the plan too. Out here, a malformed map is just a slightly worse prompt.
+ *
+ * Degrades in steps rather than all at once: fenced block, then the last
+ * balanced object anywhere in the text, then the legacy bare-array shape. Only
+ * when none of those parse does the caller fall back to a full re-explore.
+ */
+export function parsePlanningResult(text: string): PlanningResult {
+  const fenced = PLANNING_JSON_FENCE.exec(text);
+  const payload =
+    parseJsonObject(fenced?.[1]) ?? parseJsonObject(sliceLastJsonObject(text));
+
+  // The map is whatever prose came before the JSON — the fence when we found
+  // one, otherwise the whole response.
+  const mapText = fenced ? text.slice(0, fenced.index) : text;
+  const repoMap = sliceRepoMap(stripMapMarkers(mapText));
+
+  if (!payload) {
+    // Legacy shape: a bare plan array with no envelope.
+    return { repoMap, plan: parseEventPlan(text), opportunities: emptyOpportunities() };
+  }
+  return {
+    repoMap,
+    plan: Array.isArray(payload.plan) ? coerceEventPlan(payload.plan) : null,
+    opportunities: coerceOpportunities(payload.opportunities),
+  };
+}
+
+/**
+ * Parse an object and confirm it's actually the planning envelope. The check
+ * matters for the unfenced fallback: a bare plan ARRAY contains objects, and
+ * the first of those would otherwise be mistaken for the envelope — silently
+ * costing us the plan we could have read.
+ */
+function parseJsonObject(raw: string | null | undefined): Record<string, unknown> | null {
+  if (!raw?.trim()) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      if ("plan" in obj || "opportunities" in obj) return obj;
+    }
+  } catch {
+    /* fall through — the caller has a cheaper shape to try */
+  }
+  return null;
+}
+
+/** The last balanced `{...}` run in the text, for output that skipped the fence. */
+function sliceLastJsonObject(text: string): string | null {
+  const start = text.lastIndexOf("{\n");
+  const from = start >= 0 ? start : text.indexOf("{");
+  if (from < 0) return null;
+  return sliceBalanced(text, from, "{", "}");
+}
+
+function stripMapMarkers(text: string): string {
+  return text
+    .replace(/^-+\s*REPO MAP\s*-+$/gim, "")
+    .replace(/^-+\s*END REPO MAP\s*-+$/gim, "")
+    .trim();
+}
+
+/** Raw opportunity JSON straight from the model — validated later by the CLI. */
+function coerceOpportunities(raw: unknown): UniverseOpportunities {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return emptyOpportunities();
+  const doc = raw as Record<string, unknown>;
+  return {
+    events: (Array.isArray(doc.events) ? doc.events : []) as UniverseOpportunities["events"],
+    interventions: (Array.isArray(doc.interventions)
+      ? doc.interventions
+      : []) as UniverseOpportunities["interventions"],
+  };
+}
+
 export function parseEventPlan(text: string): EventPlanEntry[] | null {
   const parsed = parseFirstJsonArray(text);
   if (!Array.isArray(parsed)) return null;
+  return coerceEventPlan(parsed);
+}
 
+/** Validate an already-parsed plan array. Returns null if any entry is unusable. */
+function coerceEventPlan(items: unknown[]): EventPlanEntry[] | null {
   const entries: EventPlanEntry[] = [];
-  for (const item of parsed) {
+  for (const item of items) {
     if (!item || typeof item !== "object" || Array.isArray(item)) return null;
     const obj = item as Record<string, unknown>;
     const event = typeof obj.event === "string" ? obj.event.trim() : "";
@@ -494,7 +572,7 @@ export function parseEventPlan(text: string): EventPlanEntry[] | null {
 function parseFirstJsonArray(text: string): unknown | null {
   const start = text.indexOf("[");
   if (start < 0) return null;
-  const json = sliceJsonArray(text, start);
+  const json = sliceBalanced(text, start, "[", "]");
   if (!json) return null;
   try {
     return JSON.parse(json) as unknown;
@@ -503,7 +581,11 @@ function parseFirstJsonArray(text: string): unknown | null {
   }
 }
 
-function sliceJsonArray(text: string, start: number): string | null {
+/**
+ * Slice a balanced bracket run starting at `start`, ignoring brackets inside
+ * strings. Used to lift JSON out of prose without a real parser.
+ */
+function sliceBalanced(text: string, start: number, open: string, close: string): string | null {
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -522,31 +604,14 @@ function sliceJsonArray(text: string, start: number): string | null {
 
     if (ch === "\"") {
       inString = true;
-    } else if (ch === "[") {
+    } else if (ch === open) {
       depth++;
-    } else if (ch === "]") {
+    } else if (ch === close) {
       depth--;
       if (depth === 0) return text.slice(start, i + 1);
     }
   }
   return null;
-}
-
-function renderRepoMapPrompt(repoPath: string): string {
-  return [
-    "Map this repository for a Whisperr SDK integration. This is READ-ONLY.",
-    `Project root: ${repoPath}`,
-    "",
-    "Produce a concise structured repo map as final text with these exact sections:",
-    "- framework + entry points",
-    "- auth flows enumerated: END-USER vs admin/staff, with precise file paths",
-    "- billing/payment/webhook surfaces",
-    "- analytics/tracking wrapper if any",
-    "- state management",
-    "- directory guide: which dirs hold pages/controllers/services",
-    "",
-    "This map guides event placement. List file paths precisely. No prose beyond the map.",
-  ].join("\n");
 }
 
 function sliceRepoMap(map: string): string {
@@ -559,28 +624,50 @@ function renderRepoMapSection(repoMap: string | undefined): string[] {
   return ["----- REPO MAP -----", map, "----- END REPO MAP -----", ""];
 }
 
-function renderEventPlanPrompt(
+/**
+ * The one read-only pass. It reads the repo once and produces everything the
+ * editing passes need: the map, the per-event placement plan, and the universe
+ * proposals. Output is a free-text map followed by a single fenced JSON block —
+ * the map stays out of the JSON so a long, newline-heavy map can't break the
+ * plan's parse.
+ */
+function renderPlanningPrompt(
   repoPath: string,
   playbook: Playbook,
   manifest: IntegrationManifest,
-  repoMap: string,
 ): string {
   return [
-    `Plan Whisperr ${playbook.target.displayName} event placements. This is READ-ONLY.`,
+    `Plan the Whisperr ${playbook.target.displayName} integration for this repo.`,
+    "This pass is READ-ONLY — do not edit anything. You are deciding what the",
+    "editing passes will do, so be precise about files and anchors.",
     `Project root: ${repoPath}`,
     "",
-    ...renderRepoMapSection(repoMap),
-    "Use the repo map and the events brief to decide where each event belongs.",
-    "Return ONLY a JSON code block containing an array with this shape:",
-    '[{"event":"event_name","decision":"place|skip|unsure","file":"path","anchor":"function/route/handler","properties":["prop"],"reason":"short reason"}]',
+    "Produce your answer in TWO parts, in this order.",
     "",
-    "Rules:",
+    "PART 1 — the repo map, as plain text under these exact sections:",
+    "- framework + entry points",
+    "- auth flows enumerated: END-USER vs admin/staff, with precise file paths",
+    "- billing/payment/webhook surfaces",
+    "- analytics/tracking wrapper if any",
+    "- state management",
+    "- directory guide: which dirs hold pages/controllers/services",
+    "List file paths precisely. No prose beyond the map.",
+    "",
+    "PART 2 — a single ```json fenced block, and nothing after it:",
+    "{",
+    '  "plan": [{"event":"event_name","decision":"place|skip|unsure","file":"path",',
+    '            "anchor":"function/route/handler","properties":["prop"],"reason":"short reason"}],',
+    '  "opportunities": {"events": [], "interventions": []}',
+    "}",
+    "",
+    "Rules for `plan` — one entry per event in the brief below:",
     "- decision=place only when there is a concrete end-user call site in this repo.",
     "- decision=skip when the event clearly lives on another surface or does not exist here.",
     "- decision=unsure when there is a plausible surface but the exact anchor is not proven.",
     "- For place decisions, include file and anchor precisely.",
     "- properties should list only properties likely available at that anchor.",
-    "- No prose beyond the JSON code block.",
+    "",
+    renderOpportunitiesBrief(manifest),
     "",
     "----- EVENTS -----",
     renderEventsBrief(manifest),
@@ -593,6 +680,7 @@ function renderEventWirePrompt(
   playbook: Playbook,
   repoMap: string,
   entries: EventPlanEntry[],
+  addedEvents: OpportunityEvent[] = [],
 ): string {
   return [
     `The Whisperr ${playbook.target.displayName} SDK is installed and initialized.`,
@@ -607,7 +695,41 @@ function renderEventWirePrompt(
     "----- EVENT WIRING PLAN -----",
     ...renderPlanEntryLines(entries),
     "----- END EVENT WIRING PLAN -----",
+    // Events the planner proposed and the universe accepted this run. They have
+    // no plan entry (they weren't in the manifest when the plan was written), so
+    // the rationale carries the placement — the planner already saw the site.
+    ...(addedEvents.length
+      ? [
+          "",
+          "----- NEWLY ADDED EVENTS -----",
+          "You proposed these while planning and they are now part of this app's",
+          "universe. Wire them the same way — your own rationale says where you",
+          "saw each one. Skip any that turn out not to have a clear trigger.",
+          ...renderAddedEventLines(addedEvents),
+          "----- END NEWLY ADDED EVENTS -----",
+        ]
+      : []),
   ].join("\n");
+}
+
+function renderAddedEventLines(events: OpportunityEvent[]): string[] {
+  const lines: string[] = [];
+  for (const event of events) {
+    lines.push("");
+    lines.push(`■ ${event.code}${event.label ? `  (${event.label})` : ""}`);
+    if (event.description) lines.push(`  ${event.description}`);
+    if (event.rationale) lines.push(`  where: ${event.rationale}`);
+    if (event.properties?.length) {
+      lines.push("  properties to capture if available:");
+      for (const prop of event.properties) {
+        lines.push(
+          `    · ${prop.name}${prop.required ? " (required)" : ""}` +
+            `${prop.description ? ` — ${prop.description}` : ""}`,
+        );
+      }
+    }
+  }
+  return lines;
 }
 
 function renderEventReconcilePrompt(

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+- **One run, no interruptions.** The placement plan is printed and the run keeps
+  going instead of stopping to ask. `--review-plan` restores the confirmation
+  step for a repo you want to watch closely.
+- **Proposals go into your universe and get wired in the same run.** What the
+  agent spots beyond your onboarding plan is added directly (server-side dedupe;
+  new interventions still start paused and a live policy still only gets a
+  review draft). `--propose-only` restores staging for dashboard approval.
+- **One planning pass instead of three reads.** Repo map, event placements, and
+  proposals now come out of a single read-only pass on `claude-opus-5` at high
+  effort — one fewer model session per run, and the plan is made before any edit.
+- **The manifest finally carries your business context.** whisperr-go now sends
+  the onboarding-derived picture of the product — who the paying end user is,
+  how it charges, what churn looks like — which is what keeps `identify()` off
+  the admin login and grounds every proposal.
+- Runs report much more: models used, reasoning effort, per-phase timings, how
+  the run ended, opportunity counts, and the agent's own reason for each skipped
+  event. Failed and reverted runs now report too, instead of going dark.
+- The self-review pass is cheaper (editor model, `git diff` only) and still runs
+  on every integration; `--strict-review` promotes it to the planner model.
+
 ## 0.4.0
 
 - Opportunities now stage for **dashboard approval** instead of merging from

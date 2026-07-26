@@ -99,3 +99,77 @@ test("scrubSummary redacts Anthropic env variable values", () => {
     "ANTHROPIC_AUTH_TOKEN=[redacted] ANTHROPIC_API_KEY=[redacted]",
   );
 });
+
+// The telemetry fields are the whole point of the expanded report: if any of
+// them silently stops serializing, the backoffice row goes blank and nobody
+// notices until they need it. This pins the wire contract with whisperr-go.
+test("postRunReport serializes run telemetry and per-event skip reasons", async () => {
+  const realFetch = globalThis.fetch;
+  let sentBody: unknown;
+  globalThis.fetch = (async (_url: unknown, init: RequestInit) => {
+    sentBody = JSON.parse(String(init.body));
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    await postRunReport(config, session, {
+      ...report,
+      verified: false,
+      events: [
+        { event_type: "menu_viewed", status: "wired", file: "src/app/menu/page.tsx" },
+        {
+          event_type: "booking_started",
+          status: "skipped",
+          reason: "no clear trigger in this codebase",
+        },
+      ],
+      wizard_version: "0.4.0",
+      planner_model: "claude-opus-5",
+      editor_model: "claude-sonnet-5",
+      effort: "high",
+      exit_class: "verify_failed",
+      phase_timings: [{ phase: "Planning your integration", ms: 41230 }],
+      opportunities_proposed: 4,
+      opportunities_applied: 3,
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const body = sentBody as Record<string, unknown>;
+  assert.equal(body.wizard_version, "0.4.0");
+  assert.equal(body.planner_model, "claude-opus-5");
+  assert.equal(body.editor_model, "claude-sonnet-5");
+  assert.equal(body.effort, "high");
+  assert.equal(body.exit_class, "verify_failed");
+  assert.equal(body.opportunities_proposed, 4);
+  assert.equal(body.opportunities_applied, 3);
+  // false must survive as false — it means the build broke, which is not the
+  // same as null ("we couldn't tell").
+  assert.equal(body.verified, false);
+  assert.deepEqual(body.phase_timings, [{ phase: "Planning your integration", ms: 41230 }]);
+
+  const events = body.events as Array<Record<string, unknown>>;
+  assert.equal(events[1]?.reason, "no clear trigger in this codebase");
+});
+
+// An older backend ignores unknown keys, but a run with nothing to report
+// shouldn't invent values either — omitted stays omitted.
+test("postRunReport omits telemetry the run never produced", async () => {
+  const realFetch = globalThis.fetch;
+  let sentBody: Record<string, unknown> = {};
+  globalThis.fetch = (async (_url: unknown, init: RequestInit) => {
+    sentBody = JSON.parse(String(init.body));
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    await postRunReport(config, session, report);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  for (const key of ["exit_class", "phase_timings", "opportunities_proposed"]) {
+    assert.equal(key in sentBody, false, `${key} should not be sent when unset`);
+  }
+});

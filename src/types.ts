@@ -295,4 +295,18 @@ export interface WizardConfig {
   directAnthropicKey?: string;
   /** Skip the browser/device flow and use a fake manifest (local dev). */
   offline: boolean;
+  /**
+   * Pause on the placement plan and let the user deselect events before the
+   * agent wires them. Off by default: the run's job is to just do it, and the
+   * plan is printed either way so nothing is hidden.
+   */
+  reviewPlan: boolean;
+  /**
+   * Stage universe proposals for dashboard approval instead of adding them
+   * outright. Off by default — a proposal backed by code evidence is worth more
+   * in the universe now than in a queue nobody opens.
+   */
+  proposeOnly: boolean;
+  /** Run the self-review on the planner model at full depth. */
+  strictReview: boolean;
 }

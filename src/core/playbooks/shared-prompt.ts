@@ -200,65 +200,60 @@ export function renderEventsBrief(m: IntegrationManifest): string {
 }
 
 /**
- * Phase 3 add-on: ask the agent to surface universe OPPORTUNITIES — genuine
- * lifecycle moments / messaging strategies this codebase supports that the
- * onboarding plan misses — as a structured JSON file the CLI collects. This is
- * deliberately a separate channel from instrumentation: track() calls still use
- * ONLY the exact event names in the plan; proposals go in the file and are
- * added to the plan (after human confirmation) rather than invented inline.
+ * Ask the planner to surface universe OPPORTUNITIES — genuine lifecycle moments
+ * and messaging strategies this codebase supports that the onboarding plan
+ * misses. They ride the planning pass's JSON payload under `opportunities`.
+ *
+ * Proposing stays a separate channel from instrumenting: track() calls use ONLY
+ * event names that are in the plan. A proposal enters the universe first (the
+ * CLI posts it, the server dedupes it), and only what comes back accepted gets
+ * wired — so the agent never invents an event name into the customer's code.
  */
-export function renderOpportunitiesBrief(
-  m: IntegrationManifest,
-  opportunitiesFile: string,
-): string {
+export function renderOpportunitiesBrief(m: IntegrationManifest): string {
   const eventCodes = m.events.map((e) => e.eventType);
   const interventionCodes = [
-    ...new Set(m.events.flatMap((e) => e.interventions ?? []).map((i) => i.code)),
+    ...new Set([
+      ...m.events.flatMap((e) => e.interventions ?? []).map((i) => i.code),
+      ...(m.interventions ?? []).map((i) => i.code),
+    ]),
   ];
   return [
-    "UNIVERSE OPPORTUNITIES (do this LAST, after your corrections):",
-    "While auditing you read this app's real lifecycle. Now sweep it",
-    "deliberately: walk each surface the plan should care about — signup and",
-    "auth, billing/payments (renewals, failures, upgrades, downgrades,",
-    "cancellation), the core engagement loop, support/feedback/refund flows,",
-    "sharing/invites, and any expiry or dormancy mechanics you saw — and for",
-    "each one ask: does a churn-relevant moment happen here that the plan does",
-    "NOT cover? Record those as PROPOSALS. Do NOT add track() calls for them.",
-    `Write a single JSON file at the repo root named ${opportunitiesFile}:`,
+    "Rules for `opportunities` — what this app's plan is MISSING:",
+    "You are reading this app's real lifecycle anyway. Sweep it deliberately:",
+    "walk each surface the plan should care about — signup and auth,",
+    "billing/payments (renewals, failures, upgrades, downgrades, cancellation),",
+    "the core engagement loop, support/feedback/refund flows, sharing/invites,",
+    "and any expiry or dormancy mechanics you see — and for each ask: does a",
+    "churn-relevant moment happen here that the plan does NOT cover?",
     "",
-    "{",
-    '  "events": [{',
-    '    "code": "snake_case_event", "label": "...", "description": "...",',
+    "Entry shapes:",
+    '  events: [{"code": "snake_case_event", "label": "...", "description": "...",',
     '    "side": "frontend|backend|either", "rationale": "what in the code shows this",',
     '    "expectedEffect": "one sentence: what improves if this is adopted",',
     '    "confidence": 0.0-1.0,',
     '    "properties": [{"name": "...", "description": "...", "required": false}],',
-    '    "links": [{"interventionCode": "existing_or_proposed", "weight": 0.0-1.0}]',
-    "  }],",
-    '  "interventions": [{',
-    '    "code": "snake_case_strategy", "label": "...", "description": "...",',
-    '    "rationale": "...", "confidence": 0.0-1.0,',
-    '    "expectedEffect": "one sentence: what improves if this is adopted",',
-    '    "links": [{"eventCode": "existing_or_proposed", "weight": 0.0-1.0}]',
-    "  }]",
-    "}",
+    '    "links": [{"interventionCode": "existing_or_proposed", "weight": 0.0-1.0}]}]',
+    '  interventions: [{"code": "snake_case_strategy", "label": "...", "description": "...",',
+    '    "rationale": "...", "confidence": 0.0-1.0, "expectedEffect": "...",',
+    '    "links": [{"eventCode": "existing_or_proposed", "weight": 0.0-1.0}]}]',
     "",
-    "Rules:",
     `- The plan already covers these events: ${eventCodes.join(", ") || "(none)"}.`,
     `  And these interventions: ${interventionCodes.join(", ") || "(none)"}.`,
     "  Propose ONLY what is genuinely missing — never re-propose or rename these.",
-    "- Every proposal needs concrete code evidence in its rationale (file/flow),",
-    "  not speculation. VERIFY before you write: re-open the file you are citing",
-    "  and confirm the flow exists as described — a false suggestion costs more",
-    "  trust than a missed one, so drop anything you cannot point at real code.",
+    "- These go straight into the customer's universe, and the events you propose",
+    "  get instrumented in this same run. That raises the bar on evidence, not the",
+    "  volume: every proposal needs concrete code backing in its rationale, with",
+    "  the file/flow named. VERIFY before you write it — re-open the file you are",
+    "  citing and confirm the flow exists as you describe. Drop anything you",
+    "  cannot point at real code; a false proposal costs more trust than a missed one.",
+    "- Say where you saw it in `rationale` precisely enough to wire from later —",
+    "  it is the only placement note the wiring pass will have for these.",
     "- Be thorough, not shy: a feature-rich product typically yields 3-6 solid",
-    "  event proposals and 1-3 interventions. An empty file is only the right",
-    "  answer when the plan genuinely already covers the product's lifecycle —",
-    "  never because you stopped looking early.",
-    "- Every proposal should include expectedEffect: one sentence explaining what adoption should improve.",
+    "  event proposals and 1-3 interventions. Empty is only right when the plan",
+    "  genuinely covers the product's lifecycle — never because you stopped early.",
+    "- Every proposal should include expectedEffect: one sentence on what adoption improves.",
     "- Link each proposed event to the intervention(s) it should feed (existing",
-    "  codes or ones you propose in the same file).",
-    "- This file is metadata for the wizard, not app code — write it and move on.",
+    "  codes or ones you propose alongside it).",
   ].join("\n");
 }
 
