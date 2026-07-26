@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - **One run, no interruptions.** The placement plan is printed and the run keeps
   going instead of stopping to ask. `--review-plan` restores the confirmation
