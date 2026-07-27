@@ -1,3 +1,5 @@
+import type { ZodRawShape } from "zod";
+
 export type EngineRole = "survey" | "design" | "edit" | "review";
 
 export const ENGINE_PHASES = [
@@ -27,7 +29,7 @@ export type EngineModelConfig = Record<EngineRole, RoleModelConfig>;
 export interface EngineTool {
   name: string;
   description: string;
-  inputSchema: Record<string, unknown>;
+  inputSchema: ZodRawShape;
   handler: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
 }
 
