@@ -200,3 +200,71 @@ test("item idempotency keys are stable and kind-scoped", () => {
   assert.notEqual(first, itemIdempotencyKey("event", "food_logged", "link:extra"));
   assert.equal(first.length, 32);
 });
+
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+
+import {
+  applyPatchToRepo,
+  createWorktree,
+  removeWorktree,
+  savePartialPatch,
+  worktreePatch,
+  WorktreeError,
+} from "../src/engine/worktree.js";
+
+function initRepo(): string {
+  const repo = mkdtempSync(join(tmpdir(), "wizard-repo-"));
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: repo, stdio: "pipe" });
+  git("init", "-q");
+  git("config", "user.email", "test@example.com");
+  git("config", "user.name", "Test");
+  writeFileSync(join(repo, "app.ts"), "export const a = 1;\n");
+  git("add", "-A");
+  git("commit", "-q", "-m", "init");
+  return repo;
+}
+
+test("worktree isolates edits and applies them atomically", async () => {
+  const repo = initRepo();
+  const handle = await createWorktree(repo);
+  writeFileSync(join(handle.path, "app.ts"), "export const a = 2;\n");
+  writeFileSync(join(handle.path, "events.ts"), "export const EVENTS = [\"checkout_started\"];\n");
+
+  const untouched = await readFile(join(repo, "app.ts"), "utf8");
+  assert.equal(untouched, "export const a = 1;\n");
+
+  const patch = await worktreePatch(handle);
+  assert.ok(patch.includes("events.ts"));
+  await applyPatchToRepo(handle, patch);
+  assert.equal(await readFile(join(repo, "app.ts"), "utf8"), "export const a = 2;\n");
+  assert.ok(existsSync(join(repo, "events.ts")));
+
+  await removeWorktree(handle);
+  assert.ok(!existsSync(handle.path));
+});
+
+test("dirty repositories are refused without force", async () => {
+  const repo = initRepo();
+  writeFileSync(join(repo, "app.ts"), "export const a = 99;\n");
+  await assert.rejects(
+    () => createWorktree(repo),
+    (error: unknown) => error instanceof WorktreeError && error.code === "dirty_repo",
+  );
+  const forced = await createWorktree(repo, true);
+  assert.ok(existsSync(forced.path));
+  await removeWorktree(forced);
+});
+
+test("partial patches persist for failed runs", async () => {
+  const repo = initRepo();
+  const handle = await createWorktree(repo);
+  writeFileSync(join(handle.path, "partial.ts"), "export const partial = true;\n");
+  const dest = join(mkdtempSync(join(tmpdir(), "wizard-partial-")), "partial.patch");
+  const saved = await savePartialPatch(handle, dest);
+  assert.equal(saved, dest);
+  assert.ok((await readFile(dest, "utf8")).includes("partial.ts"));
+  await removeWorktree(handle);
+});
