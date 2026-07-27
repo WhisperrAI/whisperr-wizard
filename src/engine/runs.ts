@@ -17,16 +17,18 @@ export interface RunRecord {
   phase: string;
 }
 
-export interface RunSnapshotItem {
+export interface RunSnapshotEvent {
   id: string;
   code: string;
+  name: string;
+  reasoning: string;
+  projectId: string;
+  payloadSchema: Record<string, string>;
 }
 
 export interface RunSnapshot {
-  interventionGroups: RunSnapshotItem[];
-  interventions: RunSnapshotItem[];
-  events: RunSnapshotItem[];
-  links: { id: string }[];
+  setupStatus: string;
+  events: RunSnapshotEvent[];
 }
 
 export interface RunBootstrap {
@@ -40,7 +42,7 @@ export interface RunBootstrap {
   ingestion: { apiKey: string; baseUrl: string };
 }
 
-export type ItemKind = "group" | "intervention" | "event" | "link";
+export type ItemKind = "event";
 
 export interface ItemWriteResult {
   kind: ItemKind;
