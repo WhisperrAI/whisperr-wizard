@@ -153,15 +153,27 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         state.tombstonedCodes,
         input.sink,
       );
-      if (selection.outcome !== "completed" && selection.proposed.length === 0) {
-        await failRun(`selection ${selection.outcome}`);
-        return { kind: "aborted", reason: `selection ${selection.outcome}` };
+      if (!selection.finished) {
+        const reason =
+          selection.outcome === "completed"
+            ? "selection did not call finish_selection"
+            : `selection ${selection.outcome}`;
+        await failRun(reason);
+        return { kind: "aborted", reason };
+      }
+      if (selection.proposed.length === 0) {
+        await failRun("selection finished with no accepted events");
+        return { kind: "aborted", reason: "selection finished with no accepted events" };
       }
 
       const approved = await input.callbacks.reviewEvents(selection.proposed);
       if (approved === null) {
         await failRun("selection rejected by user");
         return { kind: "aborted", reason: "selection rejected by user" };
+      }
+      if (approved.length === 0) {
+        await failRun("no events accepted for instrumentation");
+        return { kind: "aborted", reason: "no events accepted for instrumentation" };
       }
       const approvedCodes = new Set(approved.map((event) => event.code));
       for (const event of selection.proposed) {
@@ -187,25 +199,8 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   }
 
   if (registered.length === 0) {
-    await patchPhase("reporting", "no events registered for this project");
-    try {
-      await completeRun(runs, runId, [], new Map(), [], true, "unavailable", undefined);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      await failRun(`completion failed: ${reason}`);
-      return { kind: "aborted", reason: `completion failed: ${reason}` };
-    }
-    return {
-      kind: "completed",
-      runId,
-      registered,
-      eventStatuses: new Map(),
-      reportEvents: [],
-      changedFiles: [],
-      identifyWired: false,
-      applied: false,
-      summary: "No important events found for this project; nothing was instrumented.",
-    };
+    await failRun("no events registered for this project");
+    return { kind: "aborted", reason: "no events registered for this project" };
   }
 
   await patchPhase("binding");

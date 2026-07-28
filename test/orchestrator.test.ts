@@ -210,11 +210,67 @@ test("orchestrator marks the run failed when completion is rejected", async () =
     config: { apiBaseUrl: `http://127.0.0.1:${port}` } as WizardConfig,
     session: { token: "tok", appId: "app_completion", expiresAt: 0 },
     provider: {
-      name: "empty",
+      name: "scripted",
       async invoke(invocation) {
-        return invocation.role === "survey"
-          ? { kind: "completed", text: "survey", costUsd: 0, turns: 1 }
-          : { kind: "completed", text: "no events", costUsd: 0, turns: 1 };
+        if (invocation.role === "survey") {
+          return { kind: "completed", text: "survey", costUsd: 0, turns: 1 };
+        }
+        if (invocation.role === "design") {
+          const propose = invocation.tools.find((tool) => tool.name === "propose_event")!;
+          await propose.handler({
+            code: "signup_completed", name: "Signup completed", reasoning: "Activation.",
+            anchorFile: "signup.swift", payloadSchema: {},
+          });
+          const finish = invocation.tools.find((tool) => tool.name === "finish_selection")!;
+          await finish.handler({ summary: "one event" });
+          return { kind: "completed", text: "done", costUsd: 0, turns: 2 };
+        }
+        if (invocation.role === "edit") {
+          writeFileSync(join(invocation.cwd, "signup.swift"),
+            "func completeSignup() { WhisperrEvents.signupCompleted() }\n");
+          return { kind: "completed", text: "edited", costUsd: 0, turns: 1 };
+        }
+        return { kind: "completed", text: "VERDICT: pass", costUsd: 0, turns: 1 };
+      },
+    },
+    models,
+    target: "swift",
+    projectKind: "frontend",
+    playbookSystemPrompt: "system",
+    sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
+    callbacks: { reviewEvents: async (proposed) => proposed, confirmApply: async () => true },
+  });
+  server.close();
+  assert.equal(result.kind, "partial");
+  assert.equal(state.completions.length, 0);
+  assert.ok(state.patches.some((patch) => patch.status === "failed"));
+});
+
+test("orchestrator fails design when finish_selection never runs", async () => {
+  const repo = initRepo();
+  process.env.WHISPERR_WIZARD_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-state-"));
+  const state: MockState = { items: [], completions: [], patches: [], snapshotEvents: [] };
+  const { server, port } = await startMockRuntime(state);
+  const result = await runEngine({
+    repoPath: repo,
+    repoFingerprint: "missing-finish",
+    config: { apiBaseUrl: `http://127.0.0.1:${port}` } as WizardConfig,
+    session: { token: "tok", appId: "app_missing_finish", expiresAt: 0 },
+    provider: {
+      name: "scripted",
+      async invoke(invocation) {
+        if (invocation.role === "survey") {
+          return { kind: "completed", text: "survey", costUsd: 0, turns: 1 };
+        }
+        if (invocation.role === "design") {
+          const propose = invocation.tools.find((tool) => tool.name === "propose_event")!;
+          await propose.handler({
+            code: "signup_completed", name: "Signup completed", reasoning: "Activation.",
+            anchorFile: "signup.swift", payloadSchema: {},
+          });
+          return { kind: "completed", text: "stream ended without finish", costUsd: 0, turns: 2 };
+        }
+        return { kind: "completed", text: "unused", costUsd: 0, turns: 0 };
       },
     },
     models,
@@ -226,5 +282,51 @@ test("orchestrator marks the run failed when completion is rejected", async () =
   });
   server.close();
   assert.equal(result.kind, "aborted");
+  if (result.kind === "aborted") {
+    assert.match(result.reason, /finish_selection/);
+  }
+  assert.equal(state.items.length, 0);
+  assert.equal(state.completions.length, 0);
+  assert.ok(state.patches.some((patch) => patch.status === "failed"));
+});
+
+test("orchestrator fails design when selection finishes with zero events", async () => {
+  const repo = initRepo();
+  process.env.WHISPERR_WIZARD_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-state-"));
+  const state: MockState = { items: [], completions: [], patches: [], snapshotEvents: [] };
+  const { server, port } = await startMockRuntime(state);
+  const result = await runEngine({
+    repoPath: repo,
+    repoFingerprint: "zero-events",
+    config: { apiBaseUrl: `http://127.0.0.1:${port}` } as WizardConfig,
+    session: { token: "tok", appId: "app_zero", expiresAt: 0 },
+    provider: {
+      name: "scripted",
+      async invoke(invocation) {
+        if (invocation.role === "survey") {
+          return { kind: "completed", text: "survey", costUsd: 0, turns: 1 };
+        }
+        if (invocation.role === "design") {
+          const finish = invocation.tools.find((tool) => tool.name === "finish_selection")!;
+          await finish.handler({ summary: "nothing to instrument" });
+          return { kind: "completed", text: "done", costUsd: 0, turns: 1 };
+        }
+        return { kind: "completed", text: "unused", costUsd: 0, turns: 0 };
+      },
+    },
+    models,
+    target: "swift",
+    projectKind: "frontend",
+    playbookSystemPrompt: "system",
+    sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
+    callbacks: { reviewEvents: async (proposed) => proposed, confirmApply: async () => false },
+  });
+  server.close();
+  assert.equal(result.kind, "aborted");
+  if (result.kind === "aborted") {
+    assert.match(result.reason, /no accepted events/);
+  }
+  assert.equal(state.items.length, 0);
+  assert.equal(state.completions.length, 0);
   assert.ok(state.patches.some((patch) => patch.status === "failed"));
 });

@@ -6,6 +6,11 @@ export type ToolPolicyDecision =
 
 export interface ToolPolicyContext {
   repoPath: string;
+  /**
+   * Exact tool names the current invocation may call beyond the repository
+   * allowlist (e.g. `mcp__engine__propose_event`). Prefix matching is never used.
+   */
+  trustedTools?: ReadonlySet<string>;
 }
 
 export const SECRET_MATERIAL_DENIAL =
@@ -23,6 +28,17 @@ const BASH_ALLOWLIST_DENIAL =
 const CHAINED_COMMAND_DENIAL =
   "blocked: chained or substituted shell command - run one command at a time";
 
+/** Claude Agent SDK name for an in-process engine MCP tool. */
+export function engineMcpToolName(toolName: string): string {
+  return `mcp__engine__${toolName}`;
+}
+
+/** Exact trusted MCP tool names for the engine tools on this invocation. */
+export function trustedEngineMcpTools(
+  tools: ReadonlyArray<{ name: string }>,
+): ReadonlySet<string> {
+  return new Set(tools.map((tool) => engineMcpToolName(tool.name)));
+}
 const ENV_EXAMPLES = new Set([".env.example", ".env.sample", ".env.template"]);
 const SECRET_DIRECTORIES = new Set([".aws", ".ssh", ".gnupg"]);
 const SECRET_EXACT_FILES = new Set([".netrc", ".npmrc", ".pypirc"]);
@@ -53,6 +69,10 @@ export function evaluateToolUse(
   input: Record<string, unknown>,
   context: ToolPolicyContext,
 ): ToolPolicyDecision {
+  if (context.trustedTools?.has(toolName)) {
+    return { behavior: "allow" };
+  }
+
   switch (toolName) {
     case "Read":
       return evaluateReadLike(readPathInputs(input), readPathInputs(input), context);

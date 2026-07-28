@@ -28,6 +28,8 @@ export interface ProposedEvent {
 
 export interface SelectionResult {
   outcome: RoleOutcome["kind"];
+  /** True only when finish_selection ran successfully — not when the model stream ended. */
+  finished: boolean;
   proposed: ProposedEvent[];
   summary: string;
   surveyReport: string;
@@ -152,6 +154,7 @@ export async function runSelection(
   const seen = new Set<string>();
   const rejected = new Set(rejectedCodes);
   let summary = "";
+  let finished = false;
 
   const proposeTool: EngineTool = {
     name: "propose_event",
@@ -219,6 +222,7 @@ export async function runSelection(
     },
     handler: async (input) => {
       summary = String(input.summary ?? "");
+      finished = true;
       return { ok: true };
     },
   };
@@ -244,6 +248,7 @@ export async function runSelection(
 
   return {
     outcome: outcome.kind,
+    finished,
     proposed,
     summary,
     surveyReport,

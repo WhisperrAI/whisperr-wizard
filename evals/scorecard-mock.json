@@ -1,13 +1,13 @@
 {
   "mode": "mock",
-  "generatedAt": "2026-07-28T07:08:59.117Z",
+  "generatedAt": "2026-07-28T12:38:56.339Z",
   "results": [
     {
       "fixture": "sparse",
       "passed": true,
       "failures": [],
       "registered": 0,
-      "runKind": "completed"
+      "runKind": "aborted"
     },
     {
       "fixture": "webapp",

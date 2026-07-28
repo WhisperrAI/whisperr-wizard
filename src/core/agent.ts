@@ -1094,7 +1094,10 @@ async function runPass(opts: RunPassOptions): Promise<PassResult> {
   return { summary, costUsd, ok, maxedOut };
 }
 
-export function buildToolPolicyHooks(repoPath: string): { PreToolUse: HookCallbackMatcher[] } {
+export function buildToolPolicyHooks(
+  repoPath: string,
+  trustedTools?: ReadonlySet<string>,
+): { PreToolUse: HookCallbackMatcher[] } {
   return {
     PreToolUse: [
       {
@@ -1103,6 +1106,7 @@ export function buildToolPolicyHooks(repoPath: string): { PreToolUse: HookCallba
             if (input.hook_event_name !== "PreToolUse") return { continue: true };
             const decision = evaluateToolUse(input.tool_name, toolInputRecord(input.tool_input), {
               repoPath,
+              trustedTools,
             });
             if (decision.behavior === "allow") {
               // Keep this as a bare continue so canUseTool still runs on SDK ask-path calls.
@@ -1122,9 +1126,12 @@ export function buildToolPolicyHooks(repoPath: string): { PreToolUse: HookCallba
   };
 }
 
-export function createToolPermissionCallback(repoPath: string): CanUseTool {
+export function createToolPermissionCallback(
+  repoPath: string,
+  trustedTools?: ReadonlySet<string>,
+): CanUseTool {
   return async (toolName, input, options) => {
-    const decision = evaluateToolUse(toolName, input, { repoPath });
+    const decision = evaluateToolUse(toolName, input, { repoPath, trustedTools });
     return decision.behavior === "allow"
       ? { behavior: "allow", toolUseID: options.toolUseID }
       : {

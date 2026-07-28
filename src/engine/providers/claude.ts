@@ -5,6 +5,7 @@ import {
   buildToolPolicyHooks,
   createToolPermissionCallback,
 } from "../../core/agent.js";
+import { trustedEngineMcpTools } from "../../core/toolPolicy.js";
 import type { WizardConfig, WizardSession } from "../../types.js";
 import { classifyFailure } from "../budgets.js";
 import type {
@@ -51,9 +52,10 @@ export function createClaudeProvider(
           return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
         }),
       );
+      const trustedTools = trustedEngineMcpTools(invocation.tools);
       const allowedTools = [
         ...(invocation.allowRepoWrite ? EDIT_TOOLS : READ_ONLY_TOOLS),
-        ...invocation.tools.map((engineTool) => `mcp__engine__${engineTool.name}`),
+        ...trustedTools,
       ];
 
       let sessionId = invocation.resumeSessionId;
@@ -85,14 +87,13 @@ export function createClaudeProvider(
             ...(hostTools.length > 0
               ? { mcpServers: { engine: createSdkMcpServer({ name: "engine", tools: hostTools }) } }
               : {}),
-            hooks: buildToolPolicyHooks(invocation.cwd),
-            canUseTool: createToolPermissionCallback(invocation.cwd),
+            hooks: buildToolPolicyHooks(invocation.cwd, trustedTools),
+            canUseTool: createToolPermissionCallback(invocation.cwd, trustedTools),
             maxTurns: roleConfig.maxTurns,
             ...(invocation.resumeSessionId ? { resume: invocation.resumeSessionId } : {}),
             settingSources: [],
           },
         });
-
         for await (const raw of response as AsyncIterable<StreamMessage>) {
           if (raw.session_id) {
             sessionId = raw.session_id;
