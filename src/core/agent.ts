@@ -1143,7 +1143,7 @@ function toolInputRecord(input: unknown): Record<string, unknown> {
 }
 
 /** Configure where the Agent SDK sends model calls (gateway or direct key). */
-function applyModelAuthEnv(config: WizardConfig, session: WizardSession): void {
+export function applyModelAuthEnv(config: WizardConfig, session: WizardSession): void {
   if (config.directAnthropicKey) {
     process.env.ANTHROPIC_API_KEY = config.directAnthropicKey;
     delete process.env.ANTHROPIC_AUTH_TOKEN;
