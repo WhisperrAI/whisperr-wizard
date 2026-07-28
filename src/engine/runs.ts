@@ -49,6 +49,7 @@ export interface ItemWriteResult {
   created: boolean;
   id: string;
   code?: string;
+  item?: { id: string; code?: string };
 }
 
 export interface IntegrationEventEvidence {
@@ -124,11 +125,11 @@ export class RunsClient {
     target: string;
     kind: string;
   }): Promise<RunBootstrap> {
-    return this.request<RunBootstrap>("POST", "/wizard/runs", { ...input });
+    return this.request<unknown>("POST", "/wizard/runs", { ...input }).then(normalizeRunBootstrap);
   }
 
   getRun(runId: string): Promise<RunBootstrap> {
-    return this.request<RunBootstrap>("GET", `/wizard/runs/${runId}`);
+    return this.request<unknown>("GET", `/wizard/runs/${runId}`).then(normalizeRunBootstrap);
   }
 
   patchRun(
@@ -151,11 +152,11 @@ export class RunsClient {
     idempotencyExtra = "",
   ): Promise<ItemWriteResult> {
     const code = typeof payload.code === "string" ? payload.code : JSON.stringify(payload);
-    return this.request<ItemWriteResult>("POST", `/wizard/runs/${runId}/items`, {
+    return this.request<unknown>("POST", `/wizard/runs/${runId}/items`, {
       idempotencyKey: itemIdempotencyKey(kind, code, idempotencyExtra),
       kind,
       payload,
-    });
+    }).then(normalizeItemWriteResult);
   }
 
   completeRun(
@@ -174,4 +175,84 @@ export class RunsClient {
       { ...completion },
     );
   }
+}
+
+function normalizeItemWriteResult(payload: unknown): ItemWriteResult {
+  const value = record(payload);
+  const item = record(value?.item);
+  const id = stringValue(value?.id) || stringValue(item?.id);
+  if (!value || value.kind !== "event" || typeof value.created !== "boolean" || !id) {
+    throw new RunsApiError("runs API returned an invalid item write response");
+  }
+  return {
+    kind: "event",
+    created: value.created,
+    id,
+    ...(typeof value.code === "string" ? { code: value.code } : {}),
+    ...(item && typeof item.id === "string"
+      ? { item: { id: item.id, ...(typeof item.code === "string" ? { code: item.code } : {}) } }
+      : {}),
+  };
+}
+
+/** Accept both the current nested snapshot and the legacy flattened runs response. */
+export function normalizeRunBootstrap(payload: unknown): RunBootstrap {
+  const value = record(payload);
+  if (!value) {
+    throw new RunsApiError("runs API returned an invalid run bootstrap response");
+  }
+  const snapshotSource = record(value.snapshot) ?? value;
+  const events = Array.isArray(snapshotSource.events) ? snapshotSource.events : undefined;
+  const run = record(value.run);
+  const project = record(value.project);
+  const ingestion = record(value.ingestion);
+  if (
+    !run ||
+    typeof run.id !== "string" ||
+    !project ||
+    typeof project.id !== "string" ||
+    !events ||
+    events.some((event) => !isSnapshotEvent(event)) ||
+    !ingestion ||
+    typeof ingestion.apiKey !== "string" ||
+    typeof ingestion.baseUrl !== "string"
+  ) {
+    throw new RunsApiError("runs API returned an invalid run bootstrap response");
+  }
+  return {
+    project: {
+      id: project.id,
+      repoFingerprint: stringValue(project.repoFingerprint),
+      displayName: stringValue(project.displayName),
+      target: stringValue(project.target),
+      kind: stringValue(project.kind),
+    },
+    run: { id: run.id, status: stringValue(run.status), phase: stringValue(run.phase) },
+    resumed: value.resumed === true,
+    universeMode: stringValue(value.universeMode),
+    ...(record(value.onboardingContext) ? { onboardingContext: record(value.onboardingContext)! } : {}),
+    app: record(value.app) ?? {},
+    snapshot: {
+      setupStatus: stringValue(snapshotSource.setupStatus),
+      events,
+    },
+    ingestion: { apiKey: ingestion.apiKey, baseUrl: ingestion.baseUrl },
+  };
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function isSnapshotEvent(value: unknown): value is RunSnapshotEvent {
+  const event = record(value);
+  return !!event && typeof event.id === "string" && typeof event.code === "string" &&
+    typeof event.name === "string" && typeof event.reasoning === "string" &&
+    typeof event.projectId === "string" && !!record(event.payloadSchema);
 }

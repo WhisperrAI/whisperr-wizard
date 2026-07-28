@@ -109,72 +109,78 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     }
   };
 
-  let state =
-    loadRunState(input.config.apiBaseUrl, input.session.appId, input.repoFingerprint) ??
-    freshState(input, runId);
-  if (state.runId !== runId) {
-    state = freshState(input, runId);
+  let state: EngineRunState;
+  try {
+    state =
+      loadRunState(input.config.apiBaseUrl, input.session.appId, input.repoFingerprint) ??
+      freshState(input, runId);
+    if (state.runId !== runId) {
+      state = freshState(input, runId);
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    await failRun(`state initialization failed: ${reason}`);
+    return { kind: "aborted", reason: `state initialization failed: ${reason}` };
   }
   const persist = () => saveRunState(state);
 
   let registered: RegisteredEvent[];
   if (!state.designComplete) {
-    await patchPhase("surveying");
-    const survey = await runSurvey(
-      input.provider,
-      input.models,
-      input.repoPath,
-      bootstrap,
-      input.sink,
-      state.providerSessions.survey,
-    );
-    if (survey.outcome.kind !== "completed") {
-      await failRun(`survey ${survey.outcome.kind}`);
-      return { kind: "aborted", reason: `survey ${survey.outcome.kind}` };
-    }
-    state.providerSessions.survey = survey.outcome.sessionId;
-    persist();
-
-    await patchPhase("designing");
-    const selection = await runSelection(
-      input.provider,
-      input.models,
-      input.repoPath,
-      bootstrap,
-      survey.report,
-      state.tombstonedCodes,
-      input.sink,
-    );
-    if (selection.outcome !== "completed" && selection.proposed.length === 0) {
-      await failRun(`selection ${selection.outcome}`);
-      return { kind: "aborted", reason: `selection ${selection.outcome}` };
-    }
-
-    const approved = await input.callbacks.reviewEvents(selection.proposed);
-    if (approved === null) {
-      await failRun("selection rejected by user");
-      return { kind: "aborted", reason: "selection rejected by user" };
-    }
-    const approvedCodes = new Set(approved.map((event) => event.code));
-    for (const event of selection.proposed) {
-      if (!approvedCodes.has(event.code) && !state.tombstonedCodes.includes(event.code)) {
-        state.tombstonedCodes.push(event.code);
-      }
-    }
-    persist();
-
-    await patchPhase("persisting", `registering ${approved.length} events`);
     try {
+      await patchPhase("surveying");
+      const survey = await runSurvey(
+        input.provider,
+        input.models,
+        input.repoPath,
+        bootstrap,
+        input.sink,
+        state.providerSessions.survey,
+      );
+      if (survey.outcome.kind !== "completed") {
+        await failRun(`survey ${survey.outcome.kind}`);
+        return { kind: "aborted", reason: `survey ${survey.outcome.kind}` };
+      }
+      state.providerSessions.survey = survey.outcome.sessionId;
+      persist();
+
+      await patchPhase("designing");
+      const selection = await runSelection(
+        input.provider,
+        input.models,
+        input.repoPath,
+        bootstrap,
+        survey.report,
+        state.tombstonedCodes,
+        input.sink,
+      );
+      if (selection.outcome !== "completed" && selection.proposed.length === 0) {
+        await failRun(`selection ${selection.outcome}`);
+        return { kind: "aborted", reason: `selection ${selection.outcome}` };
+      }
+
+      const approved = await input.callbacks.reviewEvents(selection.proposed);
+      if (approved === null) {
+        await failRun("selection rejected by user");
+        return { kind: "aborted", reason: "selection rejected by user" };
+      }
+      const approvedCodes = new Set(approved.map((event) => event.code));
+      for (const event of selection.proposed) {
+        if (!approvedCodes.has(event.code) && !state.tombstonedCodes.includes(event.code)) {
+          state.tombstonedCodes.push(event.code);
+        }
+      }
+      persist();
+
+      await patchPhase("persisting", `registering ${approved.length} events`);
       registered = await registerApprovedEvents(runs, runId, approved, input.sink);
+      state.designComplete = true;
+      state.clusters = deriveClusters(placementsFor(registered));
+      persist();
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      await failRun(`event registration failed: ${reason}`);
-      persist();
-      return { kind: "aborted", reason: `event registration failed: ${reason}` };
+      await failRun(`design failed: ${reason}`);
+      return { kind: "aborted", reason: `design failed: ${reason}` };
     }
-    state.designComplete = true;
-    state.clusters = deriveClusters(placementsFor(registered));
-    persist();
   } else {
     registered = rebuildRegistered(state, bootstrap);
     input.sink.emit({ phase: "designing", action: `resumed with ${registered.length} registered events` });
@@ -182,7 +188,13 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
 
   if (registered.length === 0) {
     await patchPhase("reporting", "no events registered for this project");
-    await completeRun(runs, runId, [], new Map(), [], true, "unavailable", undefined);
+    try {
+      await completeRun(runs, runId, [], new Map(), [], true, "unavailable", undefined);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await failRun(`completion failed: ${reason}`);
+      return { kind: "aborted", reason: `completion failed: ${reason}` };
+    }
     return {
       kind: "completed",
       runId,
@@ -369,17 +381,13 @@ async function completeRun(
   verificationStatus: string,
   verificationCommand: string | undefined,
 ): Promise<void> {
-  try {
-    await runs.completeRun(runId, {
-      changedFiles,
-      identifyWired,
-      verificationStatus,
-      ...(verificationCommand ? { verificationCommand } : {}),
-      events: evidence,
-    });
-  } catch {
-    /* completion failure is reported by the server-side status; run stays resumable */
-  }
+  await runs.completeRun(runId, {
+    changedFiles,
+    identifyWired,
+    verificationStatus,
+    ...(verificationCommand ? { verificationCommand } : {}),
+    events: evidence,
+  });
 }
 
 function buildReportEvents(
