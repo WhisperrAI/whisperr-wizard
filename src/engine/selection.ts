@@ -168,6 +168,22 @@ export async function runSelection(
         .optional()
         .describe("important payload fields: name -> short description; no personal identifiers"),
     },
+    jsonSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "lowercase snake_case event code" },
+        name: { type: "string", description: "short human-readable name" },
+        reasoning: { type: "string", description: "why this event matters for this business" },
+        anchorFile: { type: "string", description: "repository file where the committed action happens" },
+        anchorSymbol: { type: "string", description: "function/symbol at the anchor" },
+        payloadSchema: {
+          type: "object",
+          additionalProperties: { type: "string" },
+          description: "important payload fields: name -> short description; no personal identifiers",
+        },
+      },
+      required: ["code", "name", "reasoning", "anchorFile"],
+    },
     handler: async (input) => {
       const candidate: ProposedEvent = {
         code: String(input.code ?? ""),
@@ -196,6 +212,11 @@ export async function runSelection(
     name: "finish_selection",
     description: "Signal that every important event has been proposed.",
     inputSchema: { summary: z.string().describe("one line on what was selected and why") },
+    jsonSchema: {
+      type: "object",
+      properties: { summary: { type: "string", description: "one line on what was selected and why" } },
+      required: ["summary"],
+    },
     handler: async (input) => {
       summary = String(input.summary ?? "");
       return { ok: true };

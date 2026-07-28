@@ -30,6 +30,7 @@ export interface EngineTool {
   name: string;
   description: string;
   inputSchema: ZodRawShape;
+  jsonSchema: Record<string, unknown>;
   handler: (input: Record<string, unknown>) => Promise<Record<string, unknown>>;
 }
 
@@ -51,6 +52,7 @@ export type RoleOutcome =
 
 export interface EngineProvider {
   name: string;
+  onRunReady?(runId: string): void;
   invoke(
     invocation: RoleInvocation,
     config: RoleModelConfig,

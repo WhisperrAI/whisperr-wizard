@@ -93,6 +93,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   }
 
   const runId = bootstrap.run.id;
+  input.provider.onRunReady?.(runId);
   const patchPhase = async (phase: EnginePhase, message?: string) => {
     try {
       await runs.patchRun(runId, { phase, ...(message ? { message } : {}) });

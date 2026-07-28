@@ -6,6 +6,8 @@ import type { Playbook, WizardConfig, WizardSession } from "../types.js";
 import { createProgressSink } from "./output.js";
 import { runEngine } from "./orchestrator.js";
 import { createClaudeProvider } from "./providers/claude.js";
+import { createOpenAIProvider } from "./providers/openai.js";
+import { createRoutedProvider } from "./providers/router.js";
 import type { ProposedEvent } from "./selection.js";
 import type { EngineModelConfig } from "./types.js";
 
@@ -20,6 +22,16 @@ export function engineModelConfig(config: WizardConfig): EngineModelConfig {
     edit: { model: model("edit", config.model), effort: config.effort, maxTurns: 50, maxMs: 15 * MINUTE },
     review: { model: model("review", config.model), effort: "medium", maxTurns: 15, maxMs: 8 * MINUTE },
   };
+}
+
+export function engineProvider(config: WizardConfig, session: WizardSession) {
+  const claude = createClaudeProvider(config, session);
+  const preset = process.env.WHISPERR_WIZARD_PRESET?.trim() ?? "claude-default";
+  if (preset === "sol-design") {
+    const openai = createOpenAIProvider(config, session);
+    return createRoutedProvider({ survey: openai, design: openai, review: openai }, claude);
+  }
+  return claude;
 }
 
 export interface EngineFlowResult {
@@ -48,7 +60,7 @@ export async function tryEngineFlow(options: {
     repoFingerprint: fingerprint,
     config,
     session,
-    provider: createClaudeProvider(config, session),
+    provider: engineProvider(config, session),
     models: engineModelConfig(config),
     target: playbook.target.id,
     projectKind: ["node", "python", "php", "go", "express", "django", "fastapi", "laravel", "spring-boot"].includes(
