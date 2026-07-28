@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.3
+
+- Run every default Wizard engine role on Claude Opus 5 with Anthropic fast
+  mode enabled.
+- Expand surveying and event selection to cover the complete observable
+  end-user lifecycle across every meaningful product area.
+- Apply the shared secret-material policy to OpenAI file tools and block reads
+  or writes of environment, credential, and service-account files.
+
 ## 0.7.2
 
 - Allow only the exact engine MCP tools for the current invocation through the
