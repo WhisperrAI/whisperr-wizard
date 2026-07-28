@@ -7,6 +7,7 @@ import { detectStack } from "./core/detect.js";
 import { playbookByTargetId, ALL_PLAYBOOKS } from "./core/playbooks/index.js";
 import { authenticate, startDeviceAuth, startSessionKeepalive } from "./core/auth.js";
 import { fetchManifest } from "./core/manifest.js";
+import { tryEngineFlow } from "./engine/cli.js";
 import {
   runIntegrationAgent,
   runRepairPass,
@@ -118,9 +119,24 @@ export async function run(options: RunOptions): Promise<number> {
   // it never outlives the process.
   startSessionKeepalive(config, session);
 
-  // 3. Pull the integration manifest (events/interventions/key), telling the
-  //    backend which surface this is so it can mark what's already covered.
+  // 3. Wizard-mode apps (ruling R1) register events through the engine; the
+  //    server decides by universe mode. Generated-mode apps fall through to the
+  //    legacy manifest flow unchanged.
   const fingerprint = await repoFingerprint(repoPath);
+  if (!config.offline) {
+    const engineOutcome = await tryEngineFlow({
+      repoPath,
+      fingerprint,
+      config,
+      session,
+      playbook: chosen.playbook,
+      theme,
+    });
+    if (engineOutcome.handled) {
+      return engineOutcome.exitCode;
+    }
+  }
+
   const manifest = await withSpinner("Loading your onboarding context", () =>
     fetchManifest(config, session, chosen.playbook.target.id, fingerprint),
   );
