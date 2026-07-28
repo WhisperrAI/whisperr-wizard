@@ -1,7 +1,7 @@
 {
   "name": "@whisperr/wizard",
   "version": "0.6.0",
-  "description": "Whisperr Wizard — one command to integrate the Whisperr SDK into your app. Authenticates with your onboarded account and uses an AI coding agent to wire up identify() and your business events automatically.",
+  "description": "Whisperr Wizard \u2014 one command to integrate the Whisperr SDK into your app. Authenticates with your onboarded account and uses an AI coding agent to wire up identify() and your business events automatically.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/WhisperrAI/whisperr-wizard.git"
@@ -29,7 +29,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "prepublishOnly": "npm run build",
-    "dev:local": "tsx src/index.ts"
+    "dev:local": "tsx src/index.ts",
+    "eval:mock": "tsx evals/runner.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.168",

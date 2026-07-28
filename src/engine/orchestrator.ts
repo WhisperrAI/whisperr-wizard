@@ -163,7 +163,14 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     persist();
 
     await patchPhase("persisting", `registering ${approved.length} events`);
-    registered = await registerApprovedEvents(runs, runId, approved, input.sink);
+    try {
+      registered = await registerApprovedEvents(runs, runId, approved, input.sink);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await failRun(`event registration failed: ${reason}`);
+      persist();
+      return { kind: "aborted", reason: `event registration failed: ${reason}` };
+    }
     state.designComplete = true;
     state.clusters = deriveClusters(placementsFor(registered));
     persist();
