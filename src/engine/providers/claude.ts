@@ -17,6 +17,11 @@ import type {
 
 const READ_ONLY_TOOLS = ["Read", "Glob", "Grep"] as const;
 const EDIT_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"] as const;
+const FAST_MODE_MODELS = new Set(["claude-opus-5", "claude-opus-4-8"]);
+
+export function supportsClaudeFastMode(model: string): boolean {
+  return FAST_MODE_MODELS.has(model);
+}
 
 interface StreamTextBlock {
   type: string;
@@ -90,6 +95,9 @@ export function createClaudeProvider(
             hooks: buildToolPolicyHooks(invocation.cwd, trustedTools),
             canUseTool: createToolPermissionCallback(invocation.cwd, trustedTools),
             maxTurns: roleConfig.maxTurns,
+            ...(supportsClaudeFastMode(roleConfig.model)
+              ? { settings: { fastMode: true } }
+              : {}),
             ...(invocation.resumeSessionId ? { resume: invocation.resumeSessionId } : {}),
             settingSources: [],
           },
