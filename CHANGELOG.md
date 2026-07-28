@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0
+
+- **Engine v2 for wizard-mode apps.** Whisperr apps onboarded in wizard mode get
+  the new flow: a read-only survey, event selection you review in the terminal
+  before anything is registered, typed event bindings with a queue-until-ready
+  adapter, and worktree-isolated instrumentation applied atomically at the end.
+- **Cluster-bounded integration.** Events are wired in small file clusters with
+  fresh model context, per-cluster verification and review, and honest statuses;
+  a context overflow fails one cluster as resumable instead of killing the run.
+- **Resumable by design.** Interrupt at any point and rerun: registered events,
+  cluster progress, and provider sessions are reconciled from the server and a
+  local state file — nothing is redone, nothing duplicates.
+- **Provider presets.** `WHISPERR_WIZARD_PRESET=sol-design` routes survey,
+  selection, and review through gpt-5.6-sol via the server-side OpenAI gateway;
+  edits stay on Claude. Default remains all-Claude.
+- **Automatic fallback.** Generated-mode apps get the unchanged 0.6 flow — the
+  server decides per app, the command stays `npx @whisperr/wizard`.
+- Mock eval harness under `evals/` (`npm run eval:mock`) gates engine changes.
+
 ## 0.6.0
 
 - **One run, no interruptions.** The placement plan is printed and the run keeps
