@@ -17,8 +17,8 @@ import {
   transitionCluster,
 } from "../src/engine/clusters.js";
 import { createProgressSink, formatProgressLine } from "../src/engine/output.js";
-import { itemIdempotencyKey } from "../src/engine/runs.js";
-import { loadRunState, saveRunState, statePath } from "../src/engine/state.js";
+import { itemIdempotencyKey, normalizeRunBootstrap, RunsApiError } from "../src/engine/runs.js";
+import { loadRunState, saveRunState, stateDirectory, statePath } from "../src/engine/state.js";
 import type { EngineRunState, EventPlacement } from "../src/engine/types.js";
 
 function placement(code: string, file: string): EventPlacement {
@@ -130,6 +130,26 @@ test("run state round-trips atomically with restrictive permissions", () => {
   assert.notEqual(loaded.updatedAt, "2026-01-01T00:00:00.000Z");
 });
 
+test("run state falls back when the configured home state path cannot be created", () => {
+  const directory = mkdtempSync(join(tmpdir(), "wizard-state-blocked-"));
+  const blockedPath = join(directory, "not-a-directory");
+  writeFileSync(blockedPath, "blocked");
+  const originalOverride = process.env.WHISPERR_WIZARD_STATE_DIR;
+  process.env.WHISPERR_WIZARD_STATE_DIR = join(blockedPath, "wizard-runs");
+  try {
+    const state = sampleState(process.env.WHISPERR_WIZARD_STATE_DIR);
+    saveRunState(state);
+    assert.notEqual(stateDirectory(), process.env.WHISPERR_WIZARD_STATE_DIR);
+    assert.ok(loadRunState(state.apiBaseUrl, state.appId, state.repoFingerprint));
+  } finally {
+    if (originalOverride === undefined) {
+      delete process.env.WHISPERR_WIZARD_STATE_DIR;
+    } else {
+      process.env.WHISPERR_WIZARD_STATE_DIR = originalOverride;
+    }
+  }
+});
+
 test("corrupted or mismatched state is ignored", () => {
   const directory = mkdtempSync(join(tmpdir(), "wizard-state-"));
   const state = sampleState(directory);
@@ -199,6 +219,18 @@ test("item idempotency keys are stable and kind-scoped", () => {
   assert.notEqual(first, itemIdempotencyKey("intervention", "food_logged"));
   assert.notEqual(first, itemIdempotencyKey("event", "food_logged", "link:extra"));
   assert.equal(first.length, 32);
+});
+
+test("run bootstrap accepts nested and legacy snapshots, and rejects malformed responses", () => {
+  const base = {
+    project: { id: "project", repoFingerprint: "fp", displayName: "App", target: "swift", kind: "frontend" },
+    run: { id: "run", status: "running", phase: "surveying" },
+    ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
+  };
+  const event = { id: "event", code: "saved", name: "Saved", reasoning: "r", projectId: "project", payloadSchema: {} };
+  assert.equal(normalizeRunBootstrap({ ...base, snapshot: { setupStatus: "running", events: [event] } }).snapshot.events[0].code, "saved");
+  assert.equal(normalizeRunBootstrap({ ...base, setupStatus: "running", events: [event] }).snapshot.events[0].code, "saved");
+  assert.throws(() => normalizeRunBootstrap({ ...base, events: "not-an-array" }), RunsApiError);
 });
 
 import { execFileSync } from "node:child_process";

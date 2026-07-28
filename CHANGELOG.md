@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.1
+
+- Accept both nested and legacy flattened wizard-run snapshots, with clear
+  validation errors for malformed runtime responses.
+- Fall back to a secure temporary run-state directory when the configured or
+  home directory cannot be created.
+- Mark runs failed when survey, design, state persistence, or completion fails,
+  instead of leaving the dashboard indefinitely stuck on an active phase.
+
 ## 0.7.0
 
 - **Engine v2 for wizard-mode apps.** Whisperr apps onboarded in wizard mode get

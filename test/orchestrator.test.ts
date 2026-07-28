@@ -28,6 +28,7 @@ interface MockState {
   completions: Array<Record<string, unknown>>;
   patches: Array<Record<string, unknown>>;
   snapshotEvents: Array<Record<string, unknown>>;
+  failCompletion?: boolean;
 }
 
 function startMockRuntime(state: MockState): Promise<{ server: Server; port: number }> {
@@ -66,6 +67,11 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
         return;
       }
       if (request.method === "POST" && url.endsWith("/complete")) {
+        if (state.failCompletion) {
+          response.statusCode = 500;
+          send({ message: "completion unavailable" });
+          return;
+        }
         state.completions.push(JSON.parse(body) as Record<string, unknown>);
         send({ setupStatus: "complete" });
         return;
@@ -191,4 +197,34 @@ test("orchestrator falls back on wrong universe mode", async () => {
   });
   server.close();
   assert.equal(result.kind, "wrong_mode");
+});
+
+test("orchestrator marks the run failed when completion is rejected", async () => {
+  const repo = initRepo();
+  process.env.WHISPERR_WIZARD_STATE_DIR = mkdtempSync(join(tmpdir(), "orch-state-"));
+  const state: MockState = { items: [], completions: [], patches: [], snapshotEvents: [], failCompletion: true };
+  const { server, port } = await startMockRuntime(state);
+  const result = await runEngine({
+    repoPath: repo,
+    repoFingerprint: "completion-failure",
+    config: { apiBaseUrl: `http://127.0.0.1:${port}` } as WizardConfig,
+    session: { token: "tok", appId: "app_completion", expiresAt: 0 },
+    provider: {
+      name: "empty",
+      async invoke(invocation) {
+        return invocation.role === "survey"
+          ? { kind: "completed", text: "survey", costUsd: 0, turns: 1 }
+          : { kind: "completed", text: "no events", costUsd: 0, turns: 1 };
+      },
+    },
+    models,
+    target: "swift",
+    projectKind: "frontend",
+    playbookSystemPrompt: "system",
+    sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
+    callbacks: { reviewEvents: async (proposed) => proposed, confirmApply: async () => false },
+  });
+  server.close();
+  assert.equal(result.kind, "aborted");
+  assert.ok(state.patches.some((patch) => patch.status === "failed"));
 });

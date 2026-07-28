@@ -271,8 +271,7 @@ export async function registerApprovedEvents(
         ? { payloadSchema: event.payloadSchema }
         : {}),
     });
-    const item = (result as { item?: { id?: string } }).item;
-    registered.push({ ...event, eventId: item?.id ?? result.id ?? "" });
+    registered.push({ ...event, eventId: result.id || result.item?.id || "" });
     sink.emit({ phase: "persisting", file: event.anchorFile, action: `registered ${event.code}` });
   }
   return registered;

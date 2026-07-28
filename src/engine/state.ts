@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { EngineRunState } from "./types.js";
@@ -8,10 +8,21 @@ import { ENGINE_PHASES } from "./types.js";
 
 export function stateDirectory(): string {
   const override = process.env.WHISPERR_WIZARD_STATE_DIR?.trim();
-  if (override) {
-    return override;
+  const preferred = override || join(homedir(), ".whisperr", "wizard-runs");
+  if (canCreateStateDirectory(preferred)) {
+    return preferred;
   }
-  return join(homedir(), ".whisperr", "wizard-runs");
+
+  // CLI runs can have a synthetic or read-only home directory (for example in
+  // a dev container). A per-user temp directory keeps resumable state working
+  // without making the integration itself fail after the read-only survey.
+  const user = typeof process.getuid === "function" ? process.getuid() : "user";
+  const fallback = join(tmpdir(), `whisperr-${user}`, "wizard-runs");
+  if (canCreateStateDirectory(fallback)) {
+    return fallback;
+  }
+
+  throw new Error("Whisperr Wizard could not create a directory for run state");
 }
 
 export function stateKey(apiBaseUrl: string, appId: string, repoFingerprint: string): string {
@@ -26,12 +37,21 @@ export function statePath(apiBaseUrl: string, appId: string, repoFingerprint: st
 }
 
 export function saveRunState(state: EngineRunState): void {
-  const path = statePath(state.apiBaseUrl, state.appId, state.repoFingerprint);
-  mkdirSync(stateDirectory(), { recursive: true, mode: 0o700 });
+  const directory = stateDirectory();
+  const path = join(directory, `${stateKey(state.apiBaseUrl, state.appId, state.repoFingerprint)}.json`);
   const payload = JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2);
   const temporary = `${path}.tmp`;
   writeFileSync(temporary, payload, { mode: 0o600 });
   renameSync(temporary, path);
+}
+
+function canCreateStateDirectory(directory: string): boolean {
+  try {
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function loadRunState(
