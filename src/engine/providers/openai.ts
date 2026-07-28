@@ -1,6 +1,10 @@
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 
+import {
+  evaluateToolUse,
+  isSecretPathLike,
+} from "../../core/toolPolicy.js";
 import type { WizardConfig, WizardSession } from "../../types.js";
 import { classifyFailure } from "../budgets.js";
 import type {
@@ -33,7 +37,26 @@ function jailedPath(cwd: string, candidate: string): string {
   return resolved;
 }
 
-function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
+function guardedPath(
+  cwd: string,
+  toolName: "Read" | "Glob" | "Write" | "Edit",
+  candidate: string,
+): string {
+  const path = jailedPath(cwd, candidate);
+  const decision = evaluateToolUse(
+    toolName,
+    toolName === "Glob"
+      ? { path: candidate, pattern: "*" }
+      : { file_path: candidate },
+    { repoPath: cwd },
+  );
+  if (decision.behavior === "deny") {
+    throw new Error(decision.message);
+  }
+  return path;
+}
+
+export function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
   const tools: EngineTool[] = [
     {
       name: "read_file",
@@ -45,7 +68,8 @@ function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
         required: ["path"],
       },
       handler: async (input) => {
-        const content = readFileSync(jailedPath(cwd, String(input.path ?? "")), "utf8");
+        const path = guardedPath(cwd, "Read", String(input.path ?? ""));
+        const content = readFileSync(path, "utf8");
         return { content: content.slice(0, 40_000) };
       },
     },
@@ -59,11 +83,13 @@ function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
         required: ["path"],
       },
       handler: async (input) => {
-        const target = jailedPath(cwd, String(input.path ?? "."));
-        const entries = readdirSync(target).map((entry) => {
-          const kind = statSync(join(target, entry)).isDirectory() ? "dir" : "file";
-          return `${kind}:${entry}`;
-        });
+        const target = guardedPath(cwd, "Glob", String(input.path ?? "."));
+        const entries = readdirSync(target)
+          .filter((entry) => !isSecretPathLike(entry))
+          .map((entry) => {
+            const kind = statSync(join(target, entry)).isDirectory() ? "dir" : "file";
+            return `${kind}:${entry}`;
+          });
         return { entries: entries.slice(0, 500) };
       },
     },
@@ -80,7 +106,8 @@ function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
           required: ["path", "content"],
         },
         handler: async (input) => {
-          writeFileSync(jailedPath(cwd, String(input.path ?? "")), String(input.content ?? ""));
+          const path = guardedPath(cwd, "Write", String(input.path ?? ""));
+          writeFileSync(path, String(input.content ?? ""));
           return { ok: true };
         },
       },
@@ -98,7 +125,7 @@ function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
           required: ["path", "oldText", "newText"],
         },
         handler: async (input) => {
-          const path = jailedPath(cwd, String(input.path ?? ""));
+          const path = guardedPath(cwd, "Edit", String(input.path ?? ""));
           const content = readFileSync(path, "utf8");
           const oldText = String(input.oldText ?? "");
           if (!content.includes(oldText)) {

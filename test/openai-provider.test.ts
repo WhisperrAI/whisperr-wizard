@@ -5,12 +5,36 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { createOpenAIProvider } from "../src/engine/providers/openai.js";
+import { createOpenAIProvider, fileTools } from "../src/engine/providers/openai.js";
 import { createRoutedProvider } from "../src/engine/providers/router.js";
 import type { EngineProvider, RoleModelConfig } from "../src/engine/types.js";
 import type { WizardConfig, WizardSession } from "../src/types.js";
 
 const roleConfig: RoleModelConfig = { model: "gpt-5.6-sol", effort: "high", maxTurns: 6, maxMs: 30_000 };
+
+test("OpenAI file tools hide and deny secret material", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "openai-secrets-"));
+  writeFileSync(join(cwd, ".env.local"), "SECRET=local");
+  writeFileSync(join(cwd, ".env.example"), "SECRET=example");
+  writeFileSync(join(cwd, "visible.txt"), "safe");
+
+  const tools = fileTools(cwd, true);
+  const read = tools.find((tool) => tool.name === "read_file")!;
+  const list = tools.find((tool) => tool.name === "list_dir")!;
+  const write = tools.find((tool) => tool.name === "write_file")!;
+  const replace = tools.find((tool) => tool.name === "replace_in_file")!;
+
+  await assert.rejects(read.handler({ path: ".env.local" }), /secret material/);
+  await assert.rejects(read.handler({ path: ".env.example" }), /secret material/);
+  await assert.rejects(write.handler({ path: ".env.local", content: "changed" }), /secret material/);
+  await assert.rejects(
+    replace.handler({ path: ".env.example", oldText: "SECRET", newText: "KEY" }),
+    /secret material/,
+  );
+
+  const listing = await list.handler({ path: "." }) as { entries: string[] };
+  assert.deepEqual(listing.entries, ["file:visible.txt"]);
+});
 
 test("openai provider binds a conversation and loops function calls", async () => {
   const seen: Array<{ path: string; body: Record<string, unknown> }> = [];

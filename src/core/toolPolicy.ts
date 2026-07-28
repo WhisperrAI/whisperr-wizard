@@ -14,7 +14,7 @@ export interface ToolPolicyContext {
 }
 
 export const SECRET_MATERIAL_DENIAL =
-  "blocked: secret material - reference the variable name in .env.example instead of reading the real file";
+  "blocked: secret material must not be accessed";
 
 const WRITE_OUTSIDE_REPO_DENIAL =
   "blocked: writes must stay inside the target repository";
@@ -39,9 +39,24 @@ export function trustedEngineMcpTools(
 ): ReadonlySet<string> {
   return new Set(tools.map((tool) => engineMcpToolName(tool.name)));
 }
-const ENV_EXAMPLES = new Set([".env.example", ".env.sample", ".env.template"]);
-const SECRET_DIRECTORIES = new Set([".aws", ".ssh", ".gnupg"]);
-const SECRET_EXACT_FILES = new Set([".netrc", ".npmrc", ".pypirc"]);
+const SECRET_DIRECTORIES = new Set([
+  ".aws",
+  ".ssh",
+  ".gnupg",
+  ".azure",
+  ".docker",
+  ".kube",
+  ".secrets",
+  "secrets",
+]);
+const SECRET_EXACT_FILES = new Set([
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  "auth.json",
+  "google-services.json",
+  "googleservice-info.plist",
+]);
 const SENSITIVE_WRITE_DIRECTORIES = new Set([".git", ".circleci", ".buildkite"]);
 const SENSITIVE_WRITE_EXACT_FILES = new Set([
   ".gitlab-ci.yml",
@@ -57,6 +72,7 @@ const SECRET_SUFFIXES = [
   ".pfx",
   ".jks",
   ".keystore",
+  ".kdbx",
   ".tfvars",
 ];
 
@@ -98,7 +114,6 @@ export function isSecretPathLike(value: string): boolean {
   for (const rawPart of parts) {
     const part = stripOuterQuotes(rawPart.trim().toLowerCase());
     if (!part || part === "." || part === "**") continue;
-    if (ENV_EXAMPLES.has(part)) continue;
     if (SECRET_DIRECTORIES.has(part)) return true;
     if (SECRET_EXACT_FILES.has(part)) return true;
     if (
@@ -118,6 +133,7 @@ export function isSecretPathLike(value: string): boolean {
     }
     if (part.includes("credentials")) return true;
     if (part.startsWith("secrets.")) return true;
+    if (part.startsWith("service-account") && part.endsWith(".json")) return true;
     if (SECRET_SUFFIXES.some((suffix) => part.endsWith(suffix))) return true;
   }
   return false;
@@ -166,6 +182,9 @@ function evaluateWrite(
   }
   if (!isPathInsideRepo(pathValue, context.repoPath)) {
     return { behavior: "deny", message: WRITE_OUTSIDE_REPO_DENIAL };
+  }
+  if (isSecretPathLike(pathValue)) {
+    return { behavior: "deny", message: SECRET_MATERIAL_DENIAL };
   }
   if (isSensitiveWritePath(pathValue, context.repoPath)) {
     return { behavior: "deny", message: SENSITIVE_WRITE_DENIAL };
