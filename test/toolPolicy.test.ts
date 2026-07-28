@@ -14,8 +14,11 @@ test(".env is denied", () => {
   assert.equal(policy("Read", { file_path: ".env" }).behavior, "deny");
 });
 
-test(".env.example is allowed", () => {
-  assert.equal(policy("Read", { file_path: ".env.example" }).behavior, "allow");
+test("all .env variants are denied, including examples and local files", () => {
+  for (const file_path of [".env", ".env.local", ".env.example", ".env.sample", ".env.template"]) {
+    assert.equal(policy("Read", { file_path }).behavior, "deny");
+    assert.equal(policy("Edit", { file_path }).behavior, "deny");
+  }
 });
 
 test("nested config/.env.production is denied", () => {

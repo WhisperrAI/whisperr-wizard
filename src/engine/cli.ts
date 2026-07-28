@@ -17,7 +17,7 @@ export function engineModelConfig(config: WizardConfig): EngineModelConfig {
   const model = (role: string, fallback: string) =>
     process.env[`WHISPERR_WIZARD_ENGINE_${role.toUpperCase()}_MODEL`]?.trim() || fallback;
   return {
-    survey: { model: model("survey", "claude-sonnet-5"), effort: "medium", maxTurns: 40, maxMs: 12 * MINUTE },
+    survey: { model: model("survey", config.model), effort: "medium", maxTurns: 40, maxMs: 12 * MINUTE },
     design: { model: model("design", config.plannerModel), effort: "high", maxTurns: 40, maxMs: 15 * MINUTE },
     edit: { model: model("edit", config.model), effort: config.effort, maxTurns: 50, maxMs: 15 * MINUTE },
     review: { model: model("review", config.model), effort: "medium", maxTurns: 15, maxMs: 8 * MINUTE },
