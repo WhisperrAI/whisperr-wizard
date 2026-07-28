@@ -114,9 +114,46 @@ test("runSelection collects valid proposals and blocks rejected codes", async ()
     provider, models, "/repo", bootstrap(["existing_event"]), "survey report", ["noisy_event"], sink,
   );
   assert.equal(result.outcome, "completed");
+  assert.equal(result.finished, true);
   assert.equal(result.proposed.length, 1);
   assert.equal(result.proposed[0].code, "trial_started");
   assert.equal(result.summary, "one activation event");
+});
+
+test("runSelection stays unfinished when finish_selection is never called", async () => {
+  const provider = scriptedProvider(async (invocation) => {
+    const propose = invocation.tools.find((tool) => tool.name === "propose_event")!;
+    await propose.handler({
+      code: "trial_started",
+      name: "Trial started",
+      reasoning: "Activation moment.",
+      anchorFile: "src/auth/signup.ts",
+      payloadSchema: {},
+    });
+  });
+
+  const result = await runSelection(
+    provider, models, "/repo", bootstrap(), "survey report", [], sink,
+  );
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.finished, false);
+  assert.equal(result.proposed.length, 1);
+  assert.equal(result.summary, "");
+});
+
+test("runSelection can finish with zero proposals", async () => {
+  const provider = scriptedProvider(async (invocation) => {
+    const finish = invocation.tools.find((tool) => tool.name === "finish_selection")!;
+    await finish.handler({ summary: "nothing important enough" });
+  });
+
+  const result = await runSelection(
+    provider, models, "/repo", bootstrap(), "survey report", [], sink,
+  );
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.finished, true);
+  assert.equal(result.proposed.length, 0);
+  assert.equal(result.summary, "nothing important enough");
 });
 
 test("registerApprovedEvents writes idempotently and yields placements", async () => {

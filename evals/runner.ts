@@ -195,8 +195,9 @@ async function runFixture(name: string, fixtureDir: string): Promise<FixtureResu
     check(original === after, `forbidden file ${forbidden} was modified`);
   }
   if (expectations.expectedEvents.length === 0) {
-    check(result.kind === "completed", `sparse fixture ended ${result.kind}`);
-    check(state.completions.length === 1, "sparse fixture did not complete honestly");
+    check(result.kind === "aborted", `sparse fixture ended ${result.kind}, expected aborted`);
+    check(state.completions.length === 0, "sparse fixture must not call /complete");
+    check(state.items.length === 0, "sparse fixture must not register events");
   } else {
     check(result.kind === "completed", `run ended ${result.kind}`);
     const completion = state.completions[0] as { events?: Array<{ status: string }> } | undefined;

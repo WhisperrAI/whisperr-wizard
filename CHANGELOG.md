@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.2
+
+- Allow only the exact engine MCP tools for the current invocation through the
+  tool-policy hooks and permission callback (no `mcp__engine__*` prefix allow).
+- Require a successful `finish_selection` before design can proceed; stream
+  completion alone is no longer treated as a finished selection.
+- Fail clearly during design when selection never finishes or no events are
+  accepted, and never POST `/wizard/runs/:id/complete` with an empty design.
+
 ## 0.7.1
 
 - Accept both nested and legacy flattened wizard-run snapshots, with clear
