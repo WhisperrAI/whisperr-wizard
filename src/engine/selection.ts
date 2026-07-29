@@ -7,7 +7,7 @@ import {
   selectionUserPrompt,
   surveyUserPrompt,
 } from "./prompts.js";
-import type { RunBootstrap, RunsClient } from "./runs.js";
+import { RunsApiError, type RunBootstrap, type RunsClient } from "./runs.js";
 import type { ProgressSink } from "./output.js";
 import type {
   EngineProvider,
@@ -268,14 +268,31 @@ export async function registerApprovedEvents(
 ): Promise<RegisteredEvent[]> {
   const registered: RegisteredEvent[] = [];
   for (const event of approved) {
-    const result = await runs.writeItem(runId, "event", {
-      code: event.code,
-      name: event.name,
-      reasoning: event.reasoning,
-      ...(Object.keys(event.payloadSchema).length > 0
-        ? { payloadSchema: event.payloadSchema }
-        : {}),
-    });
+    let result;
+    try {
+      result = await runs.writeItem(runId, "event", {
+        code: event.code,
+        name: event.name,
+        reasoning: event.reasoning,
+        ...(Object.keys(event.payloadSchema).length > 0
+          ? { payloadSchema: event.payloadSchema }
+          : {}),
+      });
+    } catch (error) {
+      // Another project in this app already owns the code (multi-repo apps:
+      // the backend registered it first). Selection saw the app-wide snapshot
+      // and should not have re-proposed it, but the race is real when projects
+      // run in parallel — skip the event instead of aborting the whole run.
+      if (error instanceof RunsApiError && error.code === "wizard_project_conflict") {
+        sink.emit({
+          phase: "persisting",
+          file: event.anchorFile,
+          action: `skipped ${event.code} — already registered by another project`,
+        });
+        continue;
+      }
+      throw error;
+    }
     registered.push({ ...event, eventId: result.id || result.item?.id || "" });
     sink.emit({ phase: "persisting", file: event.anchorFile, action: `registered ${event.code}` });
   }
