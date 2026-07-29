@@ -212,43 +212,24 @@ export async function run(options: RunOptions): Promise<number> {
 
   // Tracks what the run proposed and what the universe kept, for the report.
   const additions: AdditionsOutcome = { proposed: 0, applied: [] };
-  const interactive = Boolean(process.stdout.isTTY && process.stdin.isTTY);
-
   const outcome = await runIntegrationAgent({
     repoPath,
     config,
     session,
     playbook: chosen.playbook,
     manifest,
-    // The plan is always shown — it's the last look at what's about to change
-    // in their code. It only becomes a question under --review-plan; the
-    // default run reads it out and keeps going.
+    // The plan is informational. Event selection is frozen automatically, so
+    // integration never pauses at a terminal approval prompt.
     async onPlanReady(plan: EventPlanEntry[]) {
       if (useIntegrationSpinner) {
         spin.stop(theme.success("Placement plan ready"));
       }
       p.note(renderPlacementPlan(plan), "Placement plan");
 
-      const placeEntries = plan.filter((entry) => entry.decision === "place");
-      let selectedEvents = placeEntries.map((entry) => entry.event);
-      if (config.reviewPlan && interactive && placeEntries.length) {
-        const selection = await p.multiselect({
-          message: "Wire these events?",
-          options: placeEntries.map((entry) => ({
-            value: entry.event,
-            label: entry.event,
-            hint: `${entry.file ?? "unknown file"}@${entry.anchor ?? "unknown anchor"}`,
-          })),
-          initialValues: selectedEvents,
-          required: false,
-        });
-        selectedEvents = p.isCancel(selection) ? [] : (selection as string[]);
-      }
-
       if (useIntegrationSpinner) {
         spin.start(theme.bright("Continuing integration"));
       }
-      return filterEventPlan(plan, selectedEvents);
+      return plan;
     },
     async onOpportunitiesReady(raw) {
       if (useIntegrationSpinner) spin.stop(theme.success("Planning done"));
@@ -1022,18 +1003,6 @@ export function formatDuration(ms: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = String(totalSeconds % 60).padStart(2, "0");
   return `${minutes}m${seconds}s`;
-}
-
-export function filterEventPlan(
-  plan: EventPlanEntry[],
-  selectedEvents: readonly string[],
-): EventPlanEntry[] {
-  const selected = new Set(selectedEvents);
-  return plan.map((entry) =>
-    entry.decision === "place" && !selected.has(entry.event)
-      ? { ...entry, decision: "skip", reason: "Deselected in plan review." }
-      : entry,
-  );
 }
 
 function renderPlacementPlan(plan: EventPlanEntry[]): string {

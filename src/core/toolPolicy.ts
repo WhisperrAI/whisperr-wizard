@@ -11,6 +11,8 @@ export interface ToolPolicyContext {
    * allowlist (e.g. `mcp__engine__propose_event`). Prefix matching is never used.
    */
   trustedTools?: ReadonlySet<string>;
+  /** Exact repository-relative paths available to a constrained invocation. */
+  allowedFiles?: ReadonlySet<string>;
 }
 
 export const SECRET_MATERIAL_DENIAL =
@@ -167,6 +169,12 @@ function evaluateReadLike(
         message: "blocked: reads must stay inside the target repository",
       };
     }
+    if (context.allowedFiles && !allowedPath(value, context)) {
+      return {
+        behavior: "deny",
+        message: "blocked: this task may only access its explicitly supplied repository files",
+      };
+    }
   }
 
   return { behavior: "allow" };
@@ -189,7 +197,19 @@ function evaluateWrite(
   if (isSensitiveWritePath(pathValue, context.repoPath)) {
     return { behavior: "deny", message: SENSITIVE_WRITE_DENIAL };
   }
+  if (context.allowedFiles && !allowedPath(pathValue, context)) {
+    return {
+      behavior: "deny",
+      message: "blocked: this task may only edit its explicitly supplied repository files",
+    };
+  }
   return { behavior: "allow" };
+}
+
+function allowedPath(pathValue: string, context: ToolPolicyContext): boolean {
+  if (!context.allowedFiles) return true;
+  const relativePath = repoRelativePath(pathValue, context.repoPath);
+  return context.allowedFiles.has(relativePath);
 }
 
 function evaluateBash(input: Record<string, unknown>): ToolPolicyDecision {

@@ -13,7 +13,7 @@ test("fast mode is enabled only for supported Opus models", () => {
   assert.equal(supportsClaudeFastMode("custom-opus-model"), false);
 });
 
-test("hybrid task defaults route Terra and Opus with the required processing modes", () => {
+test("default pipeline pins Opus low/fast, Terra medium/priority, and Sol medium/priority", () => {
   const roleKeys = ["SURVEY", "DESIGN", "SDK_SETUP", "CLUSTER_EDIT", "REPAIR", "REVIEW"].map(
     (role) => `WHISPERR_WIZARD_ENGINE_${role}_MODEL`,
   );
@@ -26,22 +26,28 @@ test("hybrid task defaults route Terra and Opus with the required processing mod
       plannerModel: "claude-opus-5",
       effort: "high",
     } as WizardConfig);
-    for (const task of ["survey", "cluster_edit"] as const) {
-      assert.equal(models[task]?.model, "gpt-5.6-terra");
-      assert.equal(models[task]?.effort, "medium");
-      assert.equal(models[task]?.serviceTier, "priority");
-    }
-    for (const task of ["design", "sdk_setup", "repair", "review"] as const) {
+    for (const task of ["survey", "design", "sdk_setup"] as const) {
       assert.equal(models[task]?.model, "claude-opus-5");
-      assert.equal(models[task]?.effort, "medium");
+      assert.equal(models[task]?.effort, "low");
       assert.equal(models[task]?.fastMode, true);
       assert.equal(supportsClaudeFastMode(models[task]!.model), true);
     }
-    assert.equal(models.cluster_edit?.maxTurns, 30);
-    assert.equal(models.cluster_edit?.maxMs, 5 * 60_000);
-    assert.equal(models.design?.maxTurns, 80);
-    assert.equal(models.sdk_setup?.maxTurns, 60);
-    assert.equal(models.review?.maxTurns, 30);
+    assert.equal(models.cluster_edit?.model, "gpt-5.6-terra");
+    assert.equal(models.cluster_edit?.effort, "medium");
+    assert.equal(models.cluster_edit?.serviceTier, "priority");
+    assert.equal(models.cluster_edit?.maxTurns, 20);
+    assert.equal(models.cluster_edit?.maxMs, 4 * 60_000);
+    assert.equal(models.cluster_edit?.maxOutputTokens, 8_000);
+    for (const task of ["repair", "review"] as const) {
+      assert.equal(models[task]?.model, "gpt-5.6-sol");
+      assert.equal(models[task]?.effort, "medium");
+      assert.equal(models[task]?.serviceTier, "priority");
+    }
+    assert.equal(models.design?.maxTurns, 20);
+    assert.equal(models.sdk_setup?.maxTurns, 30);
+    assert.equal(models.review?.maxTurns, 8);
+    assert.equal(models.review?.maxOutputTokens, 4_000);
+    assert.equal(models.repair?.maxOutputTokens, 12_000);
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];

@@ -1,11 +1,14 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
+
+import { z } from "zod";
 
 import { eventWrapperName, generateBindings, type GeneratedBindings } from "./bindings.js";
 import { MAX_CLUSTER_ATTEMPTS, classifyFailure, nextClusterStatusAfterFailure } from "./budgets.js";
 import { clustersComplete, nextPendingCluster, transitionCluster } from "./clusters.js";
 import type { ProgressSink } from "./output.js";
-import type { RegisteredEvent } from "./selection.js";
+import type { RegisteredEvent, SurveyArtifact } from "./selection.js";
 import type {
   Cluster,
   EngineModelConfig,
@@ -32,6 +35,8 @@ export interface IntegrationDeps {
   playbookSystemPrompt: string;
   registered: RegisteredEvent[];
   ingestion: { apiKey: string; baseUrl: string };
+  survey?: SurveyArtifact;
+  allowedRepairFiles?: string[];
   sink: ProgressSink;
   saveClusters: (clusters: Cluster[]) => void;
   discardChanges: () => Promise<void>;
@@ -70,33 +75,106 @@ export async function writeBindingsModule(
   return bindings;
 }
 
-export async function runSdkSetupPass(deps: IntegrationDeps, bindings: GeneratedBindings): Promise<boolean> {
+export async function runSdkSetupPass(
+  deps: IntegrationDeps,
+  bindings: GeneratedBindings,
+  validate?: () => Promise<boolean>,
+): Promise<boolean> {
   deps.sink.emit({ phase: "binding", action: "installing SDK and wiring identify()" });
-  const outcome = await deps.provider.invoke(
-    {
-      role: "edit",
-      task: "sdk_setup",
-      sessionKey: "sdk_setup",
-      systemPrompt: deps.playbookSystemPrompt,
-      userPrompt: [
-        "CORE SETUP for the Whisperr SDK in this repository. Do exactly this, then stop:",
-        "1. Add and install the Whisperr SDK dependency for this stack.",
-        `2. Initialize it once at app startup with API key ${deps.ingestion.apiKey} and base URL ${deps.ingestion.baseUrl}.`,
-        `3. The generated bindings module at ${bindings.relativePath} queues events until bound.`,
-        `   ${bindings.bindInstruction}`,
-        "   You may move the generated file to the idiomatic source directory (fix imports), but never edit its generated content.",
-        "4. Wire identify() for the END USER (paying customer) at login success and session restore; reset() on logout.",
-        "   Never instrument admin/staff/operator paths.",
-        "Do not instrument product events yet. Do not run builds.",
-      ].join("\n"),
-      tools: [],
-      allowRepoWrite: true,
-      cwd: deps.worktree.path,
-    },
+  const allowedFiles = await sdkSetupFiles(deps.worktree.path, deps.survey, bindings.relativePath);
+  const invocation: RoleInvocation = {
+    role: "edit",
+    task: "sdk_setup",
+    sessionKey: "sdk_setup",
+    systemPrompt: deps.playbookSystemPrompt,
+    userPrompt: [
+      "CORE SETUP for the Whisperr SDK in this repository. Do exactly this, then stop:",
+      "1. Add and install the Whisperr SDK dependency for this stack.",
+      `2. Initialize it once at app startup with API key ${deps.ingestion.apiKey} and base URL ${deps.ingestion.baseUrl}.`,
+      `3. The deterministic bindings module at ${bindings.relativePath} queues events until bound.`,
+      `   ${bindings.bindInstruction}`,
+      "   Never edit the generated bindings content.",
+      "4. Wire identify() for the END USER (paying customer) at login success AND session restoration.",
+      "5. Wire reset() at every end-user logout anchor.",
+      "Never instrument admin/staff/operator paths. Do not insert any product event calls. Do not run builds.",
+      "",
+      `Saved stack and identity anchors:\n${JSON.stringify({
+        stack: deps.survey?.stack,
+        identifyAnchors: deps.survey?.identifyAnchors ?? [],
+        logoutAnchors: deps.survey?.logoutAnchors ?? [],
+      })}`,
+      "",
+      `You may access only:\n${allowedFiles.map((file) => `- ${file}`).join("\n")}`,
+    ].join("\n"),
+    tools: [],
+    repositoryAccess: { mode: "sdk_setup", allowedFiles },
+    allowRepoWrite: true,
+    cwd: deps.worktree.path,
+  };
+  let outcome = await deps.provider.invoke(
+    invocation,
     modelConfigFor(deps.models, "sdk_setup", "edit"),
     (action) => deps.sink.emit({ phase: "binding", action }),
   );
-  return outcome.kind === "completed";
+  const passesValidation = async () => {
+    if (!validate) return true;
+    try {
+      return await validate();
+    } catch {
+      return false;
+    }
+  };
+  let valid = outcome.kind === "completed" && await passesValidation();
+  if (!valid && deps.provider.invokeFallback) {
+    await deps.discardChanges();
+    await writeFile(join(deps.worktree.path, bindings.relativePath), bindings.content);
+    deps.sink.emit({ phase: "binding", action: "Opus setup rolled back; retrying with Sol" });
+    outcome = await deps.provider.invokeFallback(
+      { ...invocation, sessionKey: "sdk_setup:sol" },
+      modelConfigFor(deps.models, "repair", "edit"),
+      (action) => deps.sink.emit({ phase: "binding", action }),
+    );
+    valid = outcome.kind === "completed" && await passesValidation();
+  }
+  return valid;
+}
+
+async function sdkSetupFiles(
+  repoPath: string,
+  survey: SurveyArtifact | undefined,
+  bindingsFile: string,
+): Promise<string[]> {
+  const candidates = new Set<string>([
+    bindingsFile,
+    ...(survey?.stack.entryPoints ?? []),
+    ...(survey?.identifyAnchors.map((anchor) => anchor.file) ?? []),
+    ...(survey?.logoutAnchors.map((anchor) => anchor.file) ?? []),
+    ...(survey?.featureAreas.flatMap((area) =>
+      area.files.filter(isSdkConfigurationFile)
+    ) ?? []),
+    "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "bun.lock", "bun.lockb", "pyproject.toml", "requirements.txt", "Pipfile",
+    "Package.swift", "Podfile", "pubspec.yaml", "go.mod", "composer.json",
+    "tsconfig.json", "next.config.js", "next.config.mjs", "next.config.ts",
+    "vite.config.js", "vite.config.ts", "app.json", "Info.plist",
+  ]);
+  const available: string[] = [];
+  for (const file of candidates) {
+    try {
+      if ((await stat(join(repoPath, file))).isFile()) available.push(file.replaceAll("\\", "/"));
+    } catch {
+      // Stack manifests are optional and the constrained model cannot discover
+      // files beyond the saved survey.
+    }
+  }
+  return [...new Set(available)].sort();
+}
+
+function isSdkConfigurationFile(file: string): boolean {
+  const normalized = file.replaceAll("\\", "/");
+  return /(^|\/)(?:[^/]*config[^/]*|settings[^/]*|Info\.plist|AndroidManifest\.xml|Podfile|pubspec\.yaml)$/.test(
+    normalized,
+  );
 }
 
 function clusterPrompt(
@@ -129,47 +207,10 @@ function clusterPrompt(
   ].join("\n");
 }
 
-async function reviewCluster(
-  deps: IntegrationDeps,
-  cluster: Cluster,
-  diff: string,
-): Promise<{ ok: boolean; notes: string }> {
-  const outcome = await deps.provider.invoke(
-    {
-      role: "review",
-      task: "review",
-      sessionKey: `review:${cluster.id}`,
-      systemPrompt: [
-        "You review an instrumentation diff against a strict checklist. Answer with a verdict line",
-        "`VERDICT: pass` or `VERDICT: fail`, then bullet notes for anything wrong.",
-      ].join("\n"),
-      userPrompt: [
-        "Checklist:",
-        REVIEW_CHECKLIST,
-        "",
-        `Events expected: ${cluster.events.map((event) => event.eventCode).join(", ")}`,
-        "",
-        "Diff:",
-        diff.length > 60_000 ? diff.slice(0, 60_000) + "\n…(truncated)" : diff,
-      ].join("\n"),
-      tools: [],
-      allowRepoWrite: false,
-      cwd: deps.worktree.path,
-    },
-    modelConfigFor(deps.models, "review", "review"),
-    (action) => deps.sink.emit({ phase: "reviewing", action }),
-  );
-  if (outcome.kind !== "completed") {
-    return { ok: false, notes: `review pass did not complete (${outcome.kind})` };
-  }
-  const ok = /verdict:\s*pass/i.test(outcome.text);
-  return { ok, notes: outcome.text.trim() };
-}
-
 export async function runClusterIntegration(
   deps: IntegrationDeps,
   initialClusters: Cluster[],
-  clusterDiff: (files: string[]) => Promise<string>,
+  _clusterDiff: (files: string[]) => Promise<string>,
 ): Promise<{ clusters: Cluster[]; eventStatuses: Map<string, EventIntegrationStatus> }> {
   let clusters = initialClusters;
   const eventStatuses = new Map<string, EventIntegrationStatus>();
@@ -198,6 +239,7 @@ export async function runClusterIntegration(
         systemPrompt: deps.playbookSystemPrompt,
         userPrompt: clusterPrompt(cluster, deps.registered, bindings),
         tools: [],
+        repositoryAccess: { mode: "cluster", allowedFiles: cluster.files },
         allowRepoWrite: true,
         cwd: deps.worktree.path,
       };
@@ -208,27 +250,25 @@ export async function runClusterIntegration(
         deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
     );
 
-    let escalated = false;
     let structural = edit.kind === "completed"
       ? await structuralClusterCheck(deps.worktree.path, cluster)
       : { ok: false, notes: `edit ${edit.kind}` };
     if ((!structural.ok || edit.kind !== "completed") && deps.provider.invokeFallback) {
       await deps.discardChanges();
-      escalated = true;
       deps.sink.emit({
         phase: "integrating",
         cluster: { index, total },
-        action: "Terra attempt rolled back; retrying with Opus",
+        action: "Terra attempt rolled back; retrying the clean cluster with Sol",
       });
       edit = await deps.provider.invokeFallback(
-        { ...invocation, task: "repair", sessionKey: `escalation:${cluster.id}` },
-        modelConfigFor(deps.models, "sdk_setup", "edit"),
+        { ...invocation, task: "repair", sessionKey: `cluster_sol:${cluster.id}` },
+        modelConfigFor(deps.models, "repair", "edit"),
         (action) =>
           deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
       );
       structural = edit.kind === "completed"
         ? await structuralClusterCheck(deps.worktree.path, cluster)
-        : { ok: false, notes: `Opus escalation ${edit.kind}` };
+        : { ok: false, notes: `Sol escalation ${edit.kind}` };
     }
 
     if (edit.kind !== "completed" || !structural.ok) {
@@ -253,48 +293,8 @@ export async function runClusterIntegration(
       continue;
     }
 
+    const finalStatus: EventIntegrationStatus = "syntax_verified";
     clusters = transitionCluster(clusters, cluster.id, "verified");
-    deps.saveClusters(clusters);
-
-    const diff = await clusterDiff(cluster.files);
-    let review = await reviewCluster(deps, cluster, diff);
-    if (!review.ok && !escalated && deps.provider.invokeFallback) {
-      await deps.discardChanges();
-      deps.sink.emit({
-        phase: "reviewing",
-        cluster: { index, total },
-        action: "Terra diff rejected; retrying the clean cluster with Opus",
-      });
-      edit = await deps.provider.invokeFallback(
-        { ...invocation, task: "repair", sessionKey: `review-retry:${cluster.id}` },
-        modelConfigFor(deps.models, "sdk_setup", "edit"),
-        (action) => deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
-      );
-      structural = edit.kind === "completed"
-        ? await structuralClusterCheck(deps.worktree.path, cluster)
-        : { ok: false, notes: `Opus review retry ${edit.kind}` };
-      if (edit.kind === "completed" && structural.ok) {
-        review = await reviewCluster(deps, cluster, await clusterDiff(cluster.files));
-      }
-    }
-    if (!structural.ok || !review.ok) {
-      clusters = transitionCluster(
-        clusters,
-        cluster.id,
-        "blocked",
-        (!structural.ok ? structural.notes : review.notes).slice(0, 500),
-      );
-      for (const placement of cluster.events) {
-        eventStatuses.set(placement.eventCode, "failed");
-      }
-      await deps.discardChanges();
-      continue;
-    }
-    const statuses: EventIntegrationStatus = "reviewed";
-    const finalStatus: EventIntegrationStatus = review.ok
-      ? statuses
-      : statuses;
-    clusters = transitionCluster(clusters, cluster.id, "reviewed", review.ok ? undefined : review.notes.slice(0, 500));
     deps.saveClusters(clusters);
     for (const placement of cluster.events) {
       eventStatuses.set(placement.eventCode, finalStatus);
@@ -327,8 +327,21 @@ export async function structuralClusterCheck(
         continue;
       }
       const content = await readFile(path, "utf8");
-      if (!content.includes(eventWrapperName(placement.eventCode))) {
+      const wrapper = eventWrapperName(placement.eventCode);
+      if (!content.includes(wrapper)) {
         missing.push(`${placement.eventCode}: wrapper call missing from ${placement.file}`);
+      }
+      if (content.includes("<<<<<<<") || content.includes(">>>>>>>")) {
+        missing.push(`${placement.eventCode}: merge conflict marker in ${placement.file}`);
+      }
+      if (/\.(?:ts|tsx|js|jsx|swift|dart|kt|java|go|py|php)$/.test(placement.file) &&
+        !balancedSourceDelimiters(content)) {
+        missing.push(`${placement.eventCode}: basic syntax delimiters are unbalanced in ${placement.file}`);
+      }
+      if (/\.(?:ts|tsx|js|jsx)$/.test(placement.file) &&
+        content.includes("WhisperrEvents.") &&
+        !/import[\s\S]{0,300}\bWhisperrEvents\b/.test(content)) {
+        missing.push(`${placement.eventCode}: WhisperrEvents import is missing from ${placement.file}`);
       }
     } catch {
       missing.push(`${placement.eventCode}: cannot read ${placement.file}`);
@@ -340,12 +353,227 @@ export async function structuralClusterCheck(
   };
 }
 
+function balancedSourceDelimiters(content: string): boolean {
+  const stack: string[] = [];
+  const pairs: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+  let quote = "";
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index]!;
+    const next = content[index + 1] ?? "";
+    if (lineComment) {
+      if (char === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "'" || char === "\"" || char === "`") {
+      quote = char;
+      continue;
+    }
+    if (char === "(" || char === "[" || char === "{") stack.push(char);
+    if (pairs[char] && stack.pop() !== pairs[char]) return false;
+  }
+  return stack.length === 0 && !quote && !blockComment;
+}
+
+export interface SemanticReviewIssue {
+  eventCode: string;
+  reason: string;
+}
+
+export interface SemanticReviewResult {
+  ok: boolean;
+  issues: SemanticReviewIssue[];
+  notes: string;
+}
+
+export async function reviewIntegratedFile(
+  deps: IntegrationDeps,
+  file: string,
+  events: RegisteredEvent[],
+  sessionSuffix = "",
+): Promise<SemanticReviewResult> {
+  let verdict: "pass" | "fail" | undefined;
+  let issues: SemanticReviewIssue[] = [];
+  let notes = "";
+  const expectedCodes = new Set(events.map((event) => event.code));
+  const finishTool = {
+    name: "finish_review",
+    description: "Return the semantic verdict for this one file and its exact event contracts.",
+    inputSchema: {
+      verdict: z.enum(["pass", "fail"]),
+      issues: z.array(z.object({
+        eventCode: z.string(),
+        reason: z.string(),
+      })).max(100),
+      notes: z.string().optional(),
+    },
+    jsonSchema: {
+      type: "object",
+      properties: {
+        verdict: { type: "string", enum: ["pass", "fail"] },
+        issues: {
+          type: "array",
+          maxItems: 100,
+          items: {
+            type: "object",
+            properties: {
+              eventCode: { type: "string" },
+              reason: { type: "string" },
+            },
+            required: ["eventCode", "reason"],
+          },
+        },
+        notes: { type: "string" },
+      },
+      required: ["verdict", "issues"],
+    },
+    handler: async (input: Record<string, unknown>) => {
+      const rawIssues = Array.isArray(input.issues) ? input.issues : [];
+      const normalized: SemanticReviewIssue[] = [];
+      for (const candidate of rawIssues) {
+        const issue = candidate as Record<string, unknown>;
+        const eventCode = String(issue.eventCode ?? "").trim();
+        const reason = String(issue.reason ?? "").trim();
+        if (!expectedCodes.has(eventCode) || !reason) {
+          return { ok: false, reason: "issues must name an expected event and a concrete reason" };
+        }
+        normalized.push({ eventCode, reason });
+      }
+      verdict = input.verdict === "pass" ? "pass" : "fail";
+      issues = normalized;
+      notes = String(input.notes ?? "").trim();
+      if (verdict === "pass" && issues.length > 0) {
+        return { ok: false, reason: "a passing verdict cannot include issues" };
+      }
+      return { ok: true };
+    },
+  };
+  const content = await readFile(resolve(deps.worktree.path, file), "utf8");
+  const contracts = events.map((event) => ({
+    code: event.code,
+    reasoning: event.reasoning,
+    anchorFile: event.anchorFile,
+    anchorSymbol: event.anchorSymbol,
+    payloadSchema: event.payloadSchema,
+  }));
+  const surveyAnchors = deps.survey?.integratableCallSites.filter((anchor) => anchor.file === file) ?? [];
+  const key = createHash("sha256").update(file).digest("hex").slice(0, 12);
+  const outcome = await deps.provider.invoke(
+    {
+      role: "review",
+      task: "review",
+      sessionKey: `review:${key}${sessionSuffix}`,
+      systemPrompt: [
+        "You are the file-isolated semantic review pass for product analytics instrumentation.",
+        "Use finish_review exactly once. Do not browse the repository and do not edit files.",
+      ].join("\n"),
+      userPrompt: [
+        "Validate every expected wrapper call for:",
+        "- placement after the confirmed outcome rather than intent",
+        "- deduplication, especially view/render/navigation events",
+        "- payload correctness against the exact contract",
+        "- absence of personal identifiers",
+        "- generated wrapper usage rather than raw track calls",
+        "",
+        `Event contracts:\n${JSON.stringify(contracts)}`,
+        `Saved survey anchors:\n${JSON.stringify(surveyAnchors)}`,
+        "",
+        `Expanded context for ${file}:\n${content.slice(0, 60_000)}`,
+      ].join("\n"),
+      tools: [finishTool],
+      repositoryAccess: { mode: "review" },
+      allowRepoWrite: false,
+      cwd: deps.worktree.path,
+    },
+    modelConfigFor(deps.models, "review", "review"),
+    (action) => deps.sink.emit({ phase: "reviewing", file, action }),
+  );
+  if (outcome.kind !== "completed" || verdict === undefined) {
+    return {
+      ok: false,
+      issues: events.map((event) => ({
+        eventCode: event.code,
+        reason: `semantic review did not finish (${outcome.kind})`,
+      })),
+      notes: `semantic review did not finish (${outcome.kind})`,
+    };
+  }
+  return { ok: verdict === "pass" && issues.length === 0, issues, notes };
+}
+
+export async function repairIntegratedFile(
+  deps: IntegrationDeps,
+  file: string,
+  events: RegisteredEvent[],
+  review: SemanticReviewResult,
+): Promise<boolean> {
+  const key = createHash("sha256").update(file).digest("hex").slice(0, 12);
+  deps.sink.emit({ phase: "reviewing", file, action: "Sol is repairing semantic review failures" });
+  const outcome = await deps.provider.invoke(
+    {
+      role: "edit",
+      task: "repair",
+      sessionKey: `semantic_repair:${key}`,
+      systemPrompt: deps.playbookSystemPrompt,
+      userPrompt: [
+        `Repair only ${file}.`,
+        "Preserve the exact event set and generated wrappers. Do not add events or edit other files.",
+        "Correct placement timing, deduplication, payloads, PII safety, and wrapper usage as reported.",
+        `Issues:\n${JSON.stringify(review.issues)}`,
+        `Contracts:\n${JSON.stringify(events.map((event) => ({
+          code: event.code,
+          anchorSymbol: event.anchorSymbol,
+          payloadSchema: event.payloadSchema,
+          reasoning: event.reasoning,
+        })))}`,
+      ].join("\n"),
+      tools: [],
+      repositoryAccess: { mode: "repair", allowedFiles: [file] },
+      allowRepoWrite: true,
+      cwd: deps.worktree.path,
+    },
+    modelConfigFor(deps.models, "repair", "edit"),
+    (action) => deps.sink.emit({ phase: "reviewing", file, action }),
+  );
+  return outcome.kind === "completed";
+}
+
 export async function finalizeIntegration(
   deps: IntegrationDeps,
+  verifyCwd = deps.worktree.path,
 ): Promise<{ results: VerifyStepResult[]; status: "pending" | "passed" | "failed" | "unavailable"; command?: string }> {
-  const steps = resolveVerifySteps(deps.worktree.path, deps.target);
+  const steps = resolveVerifySteps(verifyCwd, deps.target);
   deps.sink.emit({ phase: "verifying", action: "final verification pass" });
-  const results = await runVerifySteps(deps.worktree.path, steps);
+  const results = await runVerifySteps(verifyCwd, steps);
   return {
     results,
     status: runVerificationStatus(results),
@@ -356,15 +584,17 @@ export async function finalizeIntegration(
 export async function repairVerification(
   deps: IntegrationDeps,
   results: VerifyStepResult[],
+  cycle = 1,
 ): Promise<boolean> {
   const failed = results.filter((result) => !result.ok);
   if (failed.length === 0) return true;
-  deps.sink.emit({ phase: "verifying", action: "Opus is repairing final verification failures" });
+  deps.sink.emit({ phase: "verifying", action: "Sol is repairing final verification failures" });
+  const allowedFiles = deps.allowedRepairFiles ?? deps.registered.map((event) => event.anchorFile);
   const outcome = await deps.provider.invoke(
     {
       role: "edit",
       task: "repair",
-      sessionKey: "final_repair",
+      sessionKey: `final_repair:${cycle}`,
       systemPrompt: deps.playbookSystemPrompt,
       userPrompt: [
         "The one final repository verification failed after all instrumentation patches were merged.",
@@ -374,6 +604,7 @@ export async function repairVerification(
         failed.map((result) => `$ ${result.command} ${result.args.join(" ")}\n${result.output}`).join("\n\n").slice(0, 30_000),
       ].join("\n"),
       tools: [],
+      repositoryAccess: { mode: "repair", allowedFiles },
       allowRepoWrite: true,
       cwd: deps.worktree.path,
     },

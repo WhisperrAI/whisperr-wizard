@@ -37,10 +37,7 @@ export interface ProviderRoute {
 }
 
 function shouldFallback(outcome: RoleOutcome): boolean {
-  if (outcome.kind === "context_overflow" || outcome.kind === "budget_exhausted") {
-    return true;
-  }
-  return outcome.kind === "failed" && classifyFailure(outcome.error) !== "fatal";
+  return outcome.kind !== "completed";
 }
 
 function shouldDisableProvider(outcome: RoleOutcome): boolean {
@@ -63,16 +60,18 @@ export function createRoutedProvider(
     fallback,
     ...[...normalized.values()].map((route) => route.provider),
   ]);
-  const semaphores = new Map<EngineProvider, Semaphore>();
-  const disabledProviders = new Set<EngineProvider>();
-  const semaphoreFor = (provider: EngineProvider, concurrency?: number) => {
-    let semaphore = semaphores.get(provider);
+  const semaphores = new Map<string, Semaphore>();
+  const disabledRoutes = new Set<string>();
+  const semaphoreFor = (key: string, concurrency?: number) => {
+    let semaphore = semaphores.get(key);
     if (!semaphore) {
-      semaphore = new Semaphore(concurrency ?? (provider === fallback ? fallbackConcurrency : 4));
-      semaphores.set(provider, semaphore);
+      semaphore = new Semaphore(concurrency ?? fallbackConcurrency);
+      semaphores.set(key, semaphore);
     }
     return semaphore;
   };
+  const invocationRouteKey = (invocation: RoleInvocation, config: RoleModelConfig) =>
+    `${invocation.task ?? invocation.role}:${config.model}`;
   const routeFor = (invocation: RoleInvocation): ProviderRoute | undefined =>
     normalized.get(invocation.task ?? invocation.role) ?? normalized.get(invocation.role);
   const call = (
@@ -81,12 +80,18 @@ export function createRoutedProvider(
     invocation: RoleInvocation,
     config: RoleModelConfig,
     onProgress: (action: string) => void,
-  ) => semaphoreFor(provider, concurrency).run(() => provider.invoke(invocation, config, onProgress));
+    key = invocationRouteKey(invocation, config),
+  ) => semaphoreFor(key, concurrency).run(() => provider.invoke(invocation, config, onProgress));
+  const fallbackInvocation = (invocation: RoleInvocation): RoleInvocation => ({
+    ...invocation,
+    fallback: true,
+    sessionKey: `fallback:${invocation.sessionKey ?? invocation.task ?? invocation.role}`,
+  });
 
   return {
     name: "routed",
     onRunReady(runId: string, resumeSessionId?: string): void {
-      disabledProviders.clear();
+      disabledRoutes.clear();
       for (const provider of providers) {
         provider.onRunReady?.(runId, resumeSessionId);
       }
@@ -100,13 +105,15 @@ export function createRoutedProvider(
       if (!route) {
         return call(fallback, fallbackConcurrency, invocation, config, onProgress);
       }
-      if (disabledProviders.has(route.provider)) {
+      const routeKey = invocationRouteKey(invocation, config);
+      if (disabledRoutes.has(routeKey)) {
         return call(
           fallback,
           fallbackConcurrency,
-          invocation,
+          fallbackInvocation(invocation),
           route.fallbackConfig ?? config,
           onProgress,
+          `fallback:${routeKey}`,
         );
       }
       return call(route.provider, route.concurrency, invocation, config, onProgress).then(
@@ -114,16 +121,17 @@ export function createRoutedProvider(
           // Read-only tasks are safe to retry immediately. Editing tasks must
           // first be rolled back by the cluster orchestrator.
           if (shouldDisableProvider(outcome)) {
-            disabledProviders.add(route.provider);
+            disabledRoutes.add(routeKey);
           }
           if (!invocation.allowRepoWrite && shouldFallback(outcome)) {
             onProgress(`${route.provider.name} unavailable; continuing with ${fallback.name}`);
             return call(
               fallback,
               fallbackConcurrency,
-              invocation,
+              fallbackInvocation(invocation),
               route.fallbackConfig ?? config,
               onProgress,
+              `fallback:${routeKey}`,
             );
           }
           return outcome;
@@ -135,7 +143,14 @@ export function createRoutedProvider(
       config: RoleModelConfig,
       onProgress: (action: string) => void,
     ): Promise<RoleOutcome> {
-      return call(fallback, fallbackConcurrency, invocation, config, onProgress);
+      return call(
+        fallback,
+        fallbackConcurrency,
+        fallbackInvocation(invocation),
+        config,
+        onProgress,
+        `fallback:${invocationRouteKey(invocation, config)}`,
+      );
     },
   };
 }

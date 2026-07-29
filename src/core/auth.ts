@@ -112,9 +112,8 @@ export async function startDeviceAuth(
  * Wizard sessions slide server-side: every authenticated call (including each
  * LLM gateway request the agent makes) extends the session's 30-minute idle
  * window, up to an absolute cap. Agent phases therefore keep the session
- * alive through their own traffic — the only dead zone is the user parked on
- * an interactive prompt (plan review, opportunities multiselect). This
- * keepalive covers that: a cheap authed ping every few minutes. Failures are
+ * alive through their own traffic. A cheap authenticated ping also covers
+ * quiet local repository phases. Failures are
  * swallowed (purely best-effort) and the timer is unref'd so it never holds
  * the process open.
  */

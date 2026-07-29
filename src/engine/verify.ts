@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { EventIntegrationStatus } from "./types.js";
 
 export interface VerifyStep {
-  kind: "analyze" | "typecheck" | "build";
+  kind: "analyze" | "typecheck" | "lint" | "build";
   command: string;
   args: string[];
 }
@@ -29,7 +29,10 @@ export function resolveVerifySteps(repoPath: string, target: string): VerifyStep
     } else if (hasTsconfig(repoPath)) {
       steps.push({ kind: "typecheck", command: "npx", args: ["--no-install", "tsc", "--noEmit"] });
     }
-    if (steps.length === 0 && scripts.build) {
+    if (scripts.lint) {
+      steps.push({ kind: "lint", command: npmCommand(), args: ["run", "lint"] });
+    }
+    if (scripts.build) {
       steps.push({ kind: "build", command: npmCommand(), args: ["run", "build"] });
     }
     return steps;
@@ -114,7 +117,9 @@ export function verifiedStatus(results: VerifyStepResult[]): EventIntegrationSta
   if (results.some((result) => result.kind === "build")) {
     return "build_verified";
   }
-  if (results.some((result) => result.kind === "typecheck" || result.kind === "analyze")) {
+  if (results.some(
+    (result) => result.kind === "typecheck" || result.kind === "lint" || result.kind === "analyze",
+  )) {
     return "type_verified";
   }
   return "syntax_verified";

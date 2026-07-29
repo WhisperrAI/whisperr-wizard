@@ -29,6 +29,8 @@ export interface RoleModelConfig {
   effort?: string;
   serviceTier?: "default" | "priority";
   fastMode?: boolean;
+  /** Provider-side cap for one response/task, independent of turn limits. */
+  maxOutputTokens?: number;
   maxTurns: number;
   maxMs: number;
 }
@@ -54,12 +56,33 @@ export interface RoleInvocation {
   task?: EngineTask;
   /** Stable within a run; isolates concurrent OpenAI conversations. */
   sessionKey?: string;
+  /** Explicit repository boundary for this invocation. */
+  repositoryAccess?: RepositoryAccess;
+  /** True when this call is an escalated route rather than the primary model. */
+  fallback?: boolean;
   systemPrompt: string;
   userPrompt: string;
   tools: EngineTool[];
   allowRepoWrite: boolean;
   cwd: string;
   resumeSessionId?: string;
+}
+
+export type RepositoryAccessMode =
+  | "none"
+  | "survey"
+  | "sdk_setup"
+  | "cluster"
+  | "review"
+  | "repair";
+
+export interface RepositoryAccess {
+  mode: RepositoryAccessMode;
+  /**
+   * Repository-relative files available to constrained setup/edit/repair
+   * invocations. Survey is the sole mode allowed to explore broadly.
+   */
+  allowedFiles?: string[];
 }
 
 export type RoleOutcome =

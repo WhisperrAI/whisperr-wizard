@@ -3,18 +3,19 @@ import { basename, resolve, sep } from "node:path";
 
 import type { ReportEvent } from "../core/report.js";
 import type { WizardConfig, WizardSession } from "../types.js";
-import { eventWrapperName } from "./bindings.js";
+import { eventWrapperName, generateBindings } from "./bindings.js";
 import {
-  clustersComplete,
+  clusterIdFor,
   deriveClusters,
-  nextConcurrentClusters,
-  transitionCluster,
 } from "./clusters.js";
 import {
   finalizeIntegration,
+  repairIntegratedFile,
   repairVerification,
+  reviewIntegratedFile,
   runClusterIntegration,
   runSdkSetupPass,
+  structuralClusterCheck,
   writeBindingsModule,
   type IntegrationDeps,
 } from "./integrate.js";
@@ -22,17 +23,18 @@ import type { ProgressSink } from "./output.js";
 import {
   RunsApiError,
   RunsClient,
+  artifactContentHash,
   type IntegrationEventEvidence,
   type IntegrationProgress,
   type RunBootstrap,
 } from "./runs.js";
 import {
   placementsFor,
-  registerApprovedEvents,
   runSelection,
   runSurvey,
   type ProposedEvent,
   type RegisteredEvent,
+  type SurveyArtifact,
 } from "./selection.js";
 import type {
   Cluster,
@@ -43,18 +45,13 @@ import type {
 } from "./types.js";
 import {
   applyPatchToRepo,
-  commitWorktreeCheckpoint,
   createWorktree,
   discardWorktreeChanges,
   removeWorktree,
+  reversePatchInRepo,
   worktreePatch,
-  WorktreeError,
   type WorktreeHandle,
 } from "./worktree.js";
-
-export interface EngineCallbacks {
-  reviewEvents: (proposed: ProposedEvent[]) => Promise<ProposedEvent[] | null>;
-}
 
 export interface EngineRunInput {
   repoPath: string;
@@ -67,7 +64,6 @@ export interface EngineRunInput {
   projectKind: "frontend" | "backend" | "fullstack";
   playbookSystemPrompt: string;
   sink: ProgressSink;
-  callbacks: EngineCallbacks;
   force?: boolean;
 }
 
@@ -85,10 +81,39 @@ export type EngineRunResult =
       applied: boolean;
       partialPatchPath?: string;
       summary: string;
+      verificationStatus: "passed" | "failed" | "unavailable" | "pending";
+      phaseTimings: Array<{ phase: string; ms: number }>;
+      modelRoutes: Record<string, Record<string, unknown>>;
     };
+
+interface OwnedPatch {
+  patch: string;
+  files: string[];
+  eventCodes: string[];
+  kind: "setup" | "cluster" | "semantic" | "verification";
+  rolledBack?: boolean;
+}
+
+interface ClusterWorkerResult {
+  cluster: Cluster;
+  handle?: WorktreeHandle;
+  integration?: Awaited<ReturnType<typeof runClusterIntegration>>;
+  patch: string;
+  error?: string;
+}
 
 export async function runEngine(input: EngineRunInput): Promise<EngineRunResult> {
   const runs = new RunsClient(input.config, input.session);
+  const phaseTimings: Array<{ phase: string; ms: number }> = [];
+  let activePhase: EnginePhase = "authorizing";
+  let phaseStartedAt = Date.now();
+  let timingsFinished = false;
+  const finishTimings = () => {
+    if (!timingsFinished) {
+      phaseTimings.push({ phase: activePhase, ms: Date.now() - phaseStartedAt });
+      timingsFinished = true;
+    }
+  };
   let bootstrap: RunBootstrap;
   try {
     bootstrap = await runs.createOrResumeRun({
@@ -107,6 +132,11 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   const runId = bootstrap.run.id;
   input.provider.onRunReady?.(runId, bootstrap.run.modelConversationId);
   const patchPhase = async (phase: EnginePhase, message?: string) => {
+    if (phase !== activePhase) {
+      phaseTimings.push({ phase: activePhase, ms: Date.now() - phaseStartedAt });
+      activePhase = phase;
+      phaseStartedAt = Date.now();
+    }
     try {
       await runs.patchRun(runId, { phase, ...(message ? { message } : {}) });
     } catch {
@@ -121,6 +151,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     }
   };
 
+  let survey = artifactContent<SurveyArtifact>(bootstrap, "survey");
   let registered: RegisteredEvent[];
   try {
     const projectEvents = bootstrap.snapshot.events.filter(
@@ -136,17 +167,24 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
           ? "no saved progress found; starting a fresh survey"
           : "saved events need placement recovery; verifying the repository",
       });
-      await patchPhase("surveying");
-      const survey = await runSurvey(
-        input.provider,
-        input.models,
-        input.repoPath,
-        bootstrap,
-        input.sink,
-      );
-      if (survey.outcome.kind !== "completed") {
-        await failRun(`survey ${survey.outcome.kind}`);
-        return { kind: "aborted", reason: `survey ${survey.outcome.kind}` };
+      if (!survey) {
+        await patchPhase("surveying");
+        const surveyRun = await runSurvey(
+          input.provider,
+          input.models,
+          input.repoPath,
+          bootstrap,
+          input.sink,
+        );
+        if (surveyRun.outcome.kind !== "completed" || !surveyRun.finished || !surveyRun.survey) {
+          await failRun(`survey ${surveyRun.outcome.kind}`);
+          return { kind: "aborted", reason: `survey ${surveyRun.outcome.kind}` };
+        }
+        survey = surveyRun.survey;
+        const config = modelConfigForTask(input.models, "survey", "survey");
+        await runs.persistSurveyArtifact(runId, survey, modelMetadata(config));
+      } else {
+        input.sink.emit({ phase: "surveying", action: "reusing the saved immutable survey" });
       }
 
       await patchPhase("designing");
@@ -159,15 +197,16 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         input.models,
         input.repoPath,
         bootstrap,
-        survey.report,
+        survey,
         [],
         input.sink,
         existingCodes,
+        [...recoverableCodes],
       );
       if (!selection.finished) {
         const reason = selection.outcome === "completed"
-          ? "selection did not call finish_selection"
-          : `selection ${selection.outcome}`;
+          ? "design did not call finish_event_design"
+          : `design ${selection.outcome}`;
         await failRun(reason);
         return { kind: "aborted", reason };
       }
@@ -176,19 +215,34 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         return { kind: "aborted", reason: "selection finished with no accepted events" };
       }
 
-      const approved = await input.callbacks.reviewEvents(selection.proposed);
-      if (approved === null) {
-        await failRun("selection rejected by user");
-        return { kind: "aborted", reason: "selection rejected by user" };
-      }
-      if (approved.length === 0) {
-        await failRun("no events accepted for instrumentation");
-        return { kind: "aborted", reason: "no events accepted for instrumentation" };
+      if (
+        recoverableCodes.size > 0 &&
+        (selection.proposed.length !== recoverableCodes.size ||
+          selection.proposed.some((event) => !recoverableCodes.has(event.code)))
+      ) {
+        throw new Error("placement recovery must cover the frozen event set exactly");
       }
 
-      await patchPhase("persisting", `registering ${approved.length} events`);
-      const newlyRegistered = await registerApprovedEvents(runs, runId, approved, input.sink);
-      registered = mergeRegistered(placed, newlyRegistered);
+      await patchPhase("persisting", `registering ${selection.proposed.length} events`);
+      const design = {
+        surveyHash: artifactContentHash(survey),
+        summary: selection.summary,
+        events: [...selection.proposed].sort((a, b) => a.code.localeCompare(b.code)),
+      };
+      const config = modelConfigForTask(input.models, "design", "design");
+      const committed = await runs.commitDesign(
+        runId,
+        design,
+        design.events.map(eventRequest),
+        modelMetadata(config),
+      );
+      registered = registeredFromSnapshot(
+        committed.events.filter((event) => event.projectId === bootstrap.project.id),
+      );
+      input.sink.emit({
+        phase: "persisting",
+        action: `designed and registered ${selection.proposed.length} events`,
+      });
       const unresolved = projectEvents
         .filter((event) => !registered.some((candidate) => candidate.code === event.code))
         .map((event) => event.code);
@@ -217,6 +271,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   const changedFiles = new Set(prior?.changedFiles ?? []);
   const eventStatuses = await reconcileProgress(input.repoPath, registered, prior, input.sink);
   const eventFailureReasons = new Map<string, string>();
+  let verificationStatus: "pending" | "passed" | "failed" | "unavailable" = "pending";
   for (const event of registered) {
     const status = eventStatuses.get(event.code) ?? "planned";
     if (status !== "planned" && status !== "failed" && status !== "unsupported") {
@@ -224,12 +279,12 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     }
   }
   let identifyWired = prior?.identifyWired === true &&
-    await setupLooksPresent(input.repoPath, changedFiles);
+    await setupLooksPresent(input.repoPath, changedFiles, survey);
 
   const progress = (): IntegrationProgress => ({
     changedFiles: [...changedFiles].sort(),
     identifyWired,
-    verificationStatus: "pending",
+    verificationStatus,
     events: buildEvidence(registered, eventStatuses),
   });
   const saveProgress = async () => {
@@ -244,7 +299,8 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   }
 
   await patchPhase("binding");
-  let worktree: WorktreeHandle;
+  let worktree: WorktreeHandle | undefined;
+  const ownedPatches: OwnedPatch[] = [];
   try {
     worktree = await createWorktree(
       input.repoPath,
@@ -256,9 +312,14 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     await failRun(reason);
     return { kind: "aborted", reason };
   }
+  const setupWorktree = worktree;
 
-  const checkpoint = async (): Promise<string[]> => {
-    const patch = await worktreePatch(worktree);
+  const checkpoint = async (
+    handle: WorktreeHandle,
+    kind: "setup" | "cluster" | "semantic" | "verification",
+    eventCodes: string[] = [],
+  ): Promise<string[]> => {
+    const patch = await worktreePatch(handle);
     if (patch.trim() === "") {
       return [];
     }
@@ -269,161 +330,136 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     // Save the file allowlist before applying. If the process exits between the
     // next two calls, the next run can safely accept and verify those dirty files.
     await saveProgress();
-    await applyPatchToRepo(worktree, patch);
-    await commitWorktreeCheckpoint(worktree);
+    await applyPatchToRepo(handle, patch);
+    ownedPatches.push({ patch, files, eventCodes, kind });
     return files;
   };
 
   try {
-    const bindings = await writeBindingsModule(worktree, input.target, registered);
+    const bindings = await writeBindingsModule(setupWorktree, input.target, registered);
     if (!identifyWired) {
+      const validateSetup = async () => {
+        if (
+          await readFile(resolve(setupWorktree.path, bindings.relativePath), "utf8") !==
+            bindings.content
+        ) {
+          return false;
+        }
+        const candidatePatch = await worktreePatch(setupWorktree);
+        if (patchAddsProductEvents(candidatePatch, bindings.relativePath, registered)) {
+          return false;
+        }
+        return setupLooksPresent(
+          setupWorktree.path,
+          new Set(patchFiles(candidatePatch)),
+          survey,
+        );
+      };
       const setupCompleted = await runSdkSetupPass({
         provider: input.provider,
         models: input.models,
-        worktree,
+        worktree: setupWorktree,
         target: input.target,
         playbookSystemPrompt: input.playbookSystemPrompt,
         registered,
         ingestion: bootstrap.ingestion,
+        survey,
         sink: input.sink,
         saveClusters: () => {},
-        discardChanges: async () => discardWorktreeChanges(worktree),
+        discardChanges: async () => discardWorktreeChanges(setupWorktree),
         onClusterIntegrated: async () => {},
-      }, bindings);
+      }, bindings, validateSetup);
       if (!setupCompleted) {
-        throw new Error("SDK setup did not complete");
+        throw new Error("SDK setup did not complete or failed deterministic validation");
       }
-      await checkpoint();
-      identifyWired = await setupLooksPresent(input.repoPath, changedFiles);
+      const setupPatch = await worktreePatch(setupWorktree);
+      const setupFiles = patchFiles(setupPatch);
+      if (!await setupLooksPresent(setupWorktree.path, new Set(setupFiles), survey)) {
+        throw new Error("SDK initialization, identify(), session restoration, or logout reset() could not be verified");
+      }
+      await checkpoint(setupWorktree, "setup");
+      identifyWired = await setupLooksPresent(input.repoPath, changedFiles, survey);
       if (!identifyWired) {
-        throw new Error("SDK initialization, bindings, or identify() could not be verified");
+        throw new Error("SDK initialization, bindings, identify(), and reset() could not be verified");
       }
       await saveProgress();
     } else {
       // The generated bindings may gain events after placement recovery.
-      await checkpoint();
+      await checkpoint(setupWorktree, "setup");
     }
 
     const pending = registered.filter((event) => {
       const status = eventStatuses.get(event.code) ?? "planned";
       return status === "planned" || status === "failed";
     });
-    let clusters = deriveClusters(placementsFor(pending));
+    const clusters = deriveClusters(placementsFor(pending));
     await patchPhase("integrating");
-    // The setup worktree has served its purpose. Every cluster gets a fresh,
-    // isolated worktree seeded from the customer checkout and the saved
-    // allowlist. Four model tasks run at once; their disjoint patches are then
-    // applied serially so the checkout and server ledger advance together.
-    await removeWorktree(worktree).catch(() => {});
-    while (!clustersComplete(clusters)) {
-      const wave = nextConcurrentClusters(clusters);
-      if (wave.length === 0) {
-        break;
+    await removeWorktree(setupWorktree).catch(() => {});
+    worktree = undefined;
+    const queue = [...clusters];
+    const active = new Map<number, Promise<ClusterWorkerResult>>();
+    const lockedFiles = new Set<string>();
+    let workerSequence = 0;
+    while (queue.length > 0 || active.size > 0) {
+      while (active.size < 4) {
+        const nextIndex = queue.findIndex((cluster) => !lockedFiles.has(cluster.files[0]!));
+        if (nextIndex < 0) break;
+        const cluster = queue.splice(nextIndex, 1)[0]!;
+        const file = cluster.files[0]!;
+        lockedFiles.add(file);
+        const id = workerSequence++;
+        active.set(id, runClusterWorker(input, bootstrap, registered, survey, changedFiles, cluster));
       }
-      const prepared: Array<{ cluster: Cluster; handle?: WorktreeHandle; error?: string }> = [];
-      for (const cluster of wave) {
-        try {
-          prepared.push({
-            cluster,
-            handle: await createWorktree(input.repoPath, input.force ?? false, [...changedFiles]),
-          });
-        } catch (error) {
-          prepared.push({
-            cluster,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-      const completed = await Promise.all(prepared.map(async (worker) => {
-        if (!worker.handle) {
-          return { ...worker, integration: undefined, patch: "" };
-        }
-        const workerDeps: IntegrationDeps = {
-          provider: input.provider,
-          models: input.models,
-          worktree: worker.handle,
-          target: input.target,
-          playbookSystemPrompt: input.playbookSystemPrompt,
-          registered,
-          ingestion: bootstrap.ingestion,
-          sink: input.sink,
-          saveClusters: () => {},
-          discardChanges: async () => discardWorktreeChanges(worker.handle!),
-          onClusterIntegrated: async () => {},
-        };
-        try {
-          const integration = await runClusterIntegration(
-            workerDeps,
-            [worker.cluster],
-            async () => worktreePatch(worker.handle!),
-          );
-          return {
-            ...worker,
-            integration,
-            patch: await worktreePatch(worker.handle),
-          };
-        } catch (error) {
-          return {
-            ...worker,
-            integration: undefined,
-            patch: "",
-            error: error instanceof Error ? error.message : String(error),
-          };
-        }
-      }));
-
-      for (const worker of completed) {
-        const returned = worker.integration?.clusters[0];
-        if (returned) {
-          clusters = clusters.map((cluster) => cluster.id === returned.id ? returned : cluster);
+      if (active.size === 0) break;
+      const { id, result: worker } = await Promise.race(
+        [...active.entries()].map(async ([id, task]) => ({ id, result: await task })),
+      );
+      active.delete(id);
+      lockedFiles.delete(worker.cluster.files[0]!);
+      const returned = worker.integration?.clusters[0];
+      let applied = false;
+      let failure = worker.error ?? returned?.note ?? "cluster patch could not be merged";
+      if (returned?.status === "verified" && worker.handle) {
+        const files = patchFiles(worker.patch);
+        const unexpected = files.filter((file) => !worker.cluster.files.includes(file));
+        if (unexpected.length === 0) {
+          try {
+            for (const file of files) changedFiles.add(file);
+            await saveProgress();
+            await applyPatchToRepo(worker.handle, worker.patch);
+            ownedPatches.push({
+              patch: worker.patch,
+              files,
+              eventCodes: worker.cluster.events.map((event) => event.eventCode),
+              kind: "cluster",
+            });
+            applied = true;
+          } catch (error) {
+            failure = `serial patch merge failed: ${error instanceof Error ? error.message : String(error)}`;
+          }
         } else {
-          clusters = transitionCluster(
-            clusters,
-            worker.cluster.id,
-            "blocked",
-            worker.error ?? "cluster worker failed",
-          );
+          failure = `cluster edited files outside its isolation boundary: ${unexpected.join(", ")}`;
         }
-        let applied = false;
-        if (returned?.status === "reviewed") {
-          const files = patchFiles(worker.patch);
-          const unexpected = files.filter((file) => !worker.cluster.files.includes(file));
-          if (unexpected.length > 0) {
-            clusters = transitionCluster(
-              clusters,
-              worker.cluster.id,
-              "blocked",
-              `cluster edited files outside its isolation boundary: ${unexpected.join(", ")}`,
-            );
-          } else {
-            try {
-              for (const file of files) changedFiles.add(file);
-              // Persist the dirty-file allowlist before the checkout mutation.
-              await saveProgress();
-              await applyPatchToRepo(worker.handle!, worker.patch);
-              applied = true;
-            } catch (error) {
-              clusters = transitionCluster(
-                clusters,
-                worker.cluster.id,
-                "blocked",
-                `serial patch merge failed: ${error instanceof Error ? error.message : String(error)}`,
-              );
-            }
-          }
-        }
+      }
+      if (!applied && worker.cluster.events.length > 1) {
+        const singles = worker.cluster.events.map((event, index) => ({
+          id: clusterIdFor([event.file], [event.eventId || event.eventCode], index),
+          files: [event.file],
+          events: [event],
+          status: "pending" as const,
+          attempts: 0,
+        }));
+        queue.push(...singles);
+        input.sink.emit({
+          phase: "integrating",
+          file: worker.cluster.files[0],
+          action: "Sol could not finish the cluster; retrying each event independently",
+        });
+      } else {
         for (const placement of worker.cluster.events) {
-          const status = applied
-            ? worker.integration?.eventStatuses.get(placement.eventCode) ?? "failed"
-            : "failed";
+          const status: EventIntegrationStatus = applied ? "syntax_verified" : "failed";
           eventStatuses.set(placement.eventCode, status);
-          if (status === "failed") {
-            const current = clusters.find((candidate) => candidate.id === worker.cluster.id);
-            eventFailureReasons.set(
-              placement.eventCode,
-              current?.note ?? worker.error ?? "cluster patch could not be merged",
-            );
-          }
+          if (!applied) eventFailureReasons.set(placement.eventCode, failure);
           await saveProgress();
           input.sink.emit({
             phase: "integrating",
@@ -433,75 +469,213 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
               : `${placement.eventCode} needs manual attention`,
           });
         }
-        if (worker.handle) {
-          await removeWorktree(worker.handle).catch(() => {});
-        }
       }
+      if (worker.handle) await removeWorktree(worker.handle).catch(() => {});
     }
     await saveProgress();
-    const unfinished = registered.filter((event) => {
-      const status = eventStatuses.get(event.code) ?? "planned";
-      return status === "planned" || status === "failed";
-    });
-    if (unfinished.length > 0) {
-      throw new Error(
-        `${unfinished.length} event${unfinished.length === 1 ? "" : "s"} still need integration`,
+
+    await patchPhase("reviewing");
+    const reviewableByFile = groupEventsByFile(registered.filter(
+      (event) => eventStatuses.get(event.code) === "syntax_verified",
+    ));
+    if (reviewableByFile.size > 0) {
+      const reviewWorktree = await createWorktree(
+        input.repoPath,
+        input.force ?? false,
+        [...changedFiles],
       );
+      const reviewDeps = integrationDeps(
+        input,
+        bootstrap,
+        registered,
+        survey,
+        reviewWorktree,
+        [...changedFiles],
+      );
+      const reviews = await mapLimit(
+        [...reviewableByFile.entries()],
+        2,
+        async ([file, events]) => ({
+          file,
+          events,
+          review: await reviewIntegratedFile(reviewDeps, file, events),
+        }),
+      );
+      await removeWorktree(reviewWorktree).catch(() => {});
+      for (const reviewed of reviews) {
+        if (reviewed.review.ok) {
+          for (const event of reviewed.events) eventStatuses.set(event.code, "reviewed");
+          await saveProgress();
+          continue;
+        }
+        const repairWorktree = await createWorktree(
+          input.repoPath,
+          input.force ?? false,
+          [...changedFiles],
+        );
+        const repairDeps = integrationDeps(
+          input,
+          bootstrap,
+          registered,
+          survey,
+          repairWorktree,
+          [...changedFiles],
+        );
+        const repaired = await repairIntegratedFile(
+          repairDeps,
+          reviewed.file,
+          reviewed.events,
+          reviewed.review,
+        );
+        const reviewCluster: Cluster = {
+          id: clusterIdFor([reviewed.file], reviewed.events.map((event) => event.eventId)),
+          files: [reviewed.file],
+          events: placementsFor(reviewed.events),
+          status: "verified",
+          attempts: 1,
+        };
+        const structural = repaired
+          ? await structuralClusterCheck(repairWorktree.path, reviewCluster)
+          : { ok: false, notes: "Sol repair did not complete" };
+        const recheck = structural.ok
+          ? await reviewIntegratedFile(repairDeps, reviewed.file, reviewed.events, ":recheck")
+          : { ok: false, issues: [], notes: structural.notes };
+        const repairPatch = await worktreePatch(repairWorktree);
+        const repairFiles = patchFiles(repairPatch);
+        if (
+          repaired && structural.ok && recheck.ok &&
+          repairFiles.every((file) => file === reviewed.file)
+        ) {
+          for (const file of repairFiles) changedFiles.add(file);
+          await saveProgress();
+          await applyPatchToRepo(repairWorktree, repairPatch);
+          ownedPatches.push({
+            patch: repairPatch,
+            files: repairFiles,
+            eventCodes: reviewed.events.map((event) => event.code),
+            kind: "semantic",
+          });
+          for (const event of reviewed.events) eventStatuses.set(event.code, "reviewed");
+        } else {
+          const reasons = reviewed.review.issues.map((issue) => issue.reason).join("; ") ||
+            recheck.notes || structural.notes;
+          await rollbackFileEventPatches(
+            input.repoPath,
+            reviewed.file,
+            ownedPatches,
+          );
+          for (const event of reviewed.events) {
+            eventStatuses.set(event.code, "failed");
+            eventFailureReasons.set(event.code, reasons.slice(0, 500));
+          }
+        }
+        await removeWorktree(repairWorktree).catch(() => {});
+        await saveProgress();
+      }
     }
 
     await patchPhase("verifying");
-    const verificationWorktree = await createWorktree(
-      input.repoPath,
-      input.force ?? false,
-      [...changedFiles],
+    let verificationWorktree = await createWorktree(
+      input.repoPath, input.force ?? false, [...changedFiles],
     );
-    const verificationDeps: IntegrationDeps = {
-      provider: input.provider,
-      models: input.models,
-      worktree: verificationWorktree,
-      target: input.target,
-      playbookSystemPrompt: input.playbookSystemPrompt,
-      registered,
-      ingestion: bootstrap.ingestion,
-      sink: input.sink,
-      saveClusters: () => {},
-      discardChanges: async () => discardWorktreeChanges(verificationWorktree),
-      onClusterIntegrated: async () => {},
-    };
-    let finalVerify = await finalizeIntegration(verificationDeps);
-    if (finalVerify.status === "failed") {
-      const repaired = await repairVerification(verificationDeps, finalVerify.results);
-      if (repaired) {
-        const repairPatch = await worktreePatch(verificationWorktree);
-        const repairFiles = patchFiles(repairPatch);
-        finalVerify = await finalizeIntegration(verificationDeps);
-        if (finalVerify.status !== "failed") {
-          for (const file of repairFiles) changedFiles.add(file);
-          await saveProgress();
-          await applyPatchToRepo(verificationWorktree, repairPatch);
-        }
+    let verificationDeps = integrationDeps(
+      input, bootstrap, registered, survey, verificationWorktree, [...changedFiles],
+    );
+    // Verification runs in the actual repository so its installed
+    // dependencies and workspace caches remain available. Sol repairs stay
+    // isolated and are merged serially before the next verification attempt.
+    let finalVerify = await finalizeIntegration(verificationDeps, input.repoPath);
+    for (let cycle = 0; finalVerify.status === "failed" && cycle < 2; cycle += 1) {
+      const repaired = await repairVerification(verificationDeps, finalVerify.results, cycle + 1);
+      if (!repaired) break;
+      const repairPatch = await worktreePatch(verificationWorktree);
+      const repairFiles = patchFiles(repairPatch);
+      const allowedRepairFiles = new Set(verificationDeps.allowedRepairFiles ?? []);
+      const structural = await structuralRepairCheck(
+        verificationWorktree.path,
+        registered,
+        repairFiles,
+      );
+      if (
+        repairPatch.trim() === "" ||
+        repairFiles.some((file) => !allowedRepairFiles.has(file)) ||
+        !structural.ok
+      ) {
+        break;
+      }
+      for (const file of repairFiles) changedFiles.add(file);
+      await saveProgress();
+      await applyPatchToRepo(verificationWorktree, repairPatch);
+      ownedPatches.push({
+        patch: repairPatch,
+        files: repairFiles,
+        eventCodes: registered.map((event) => event.code),
+        kind: "verification",
+      });
+      await removeWorktree(verificationWorktree).catch(() => {});
+      finalVerify = await finalizeIntegration(verificationDeps, input.repoPath);
+      if (finalVerify.status === "failed" && cycle + 1 < 2) {
+        verificationWorktree = await createWorktree(
+          input.repoPath, input.force ?? false, [...changedFiles],
+        );
+        verificationDeps = integrationDeps(
+          input, bootstrap, registered, survey, verificationWorktree, [...changedFiles],
+        );
       }
     }
-    await removeWorktree(verificationWorktree).catch(() => {});
-    if (finalVerify.status === "failed") {
+    verificationStatus = finalVerify.status;
+    if (finalVerify.status !== "passed") {
+      await removeWorktree(verificationWorktree).catch(() => {});
+      await rollbackOwnedPatches(input.repoPath, ownedPatches);
+      changedFiles.clear();
+      identifyWired = false;
       for (const event of registered) {
         eventStatuses.set(event.code, "failed");
         eventFailureReasons.set(
           event.code,
-          `final verification failed${finalVerify.command ? `: ${finalVerify.command}` : ""}`,
+          `final verification ${finalVerify.status}${finalVerify.command ? `: ${finalVerify.command}` : ""}`,
         );
       }
       await saveProgress();
-      throw new Error("final verification still fails after Opus repair");
+      throw new Error(`final verification ${finalVerify.status} after two Sol repair cycles`);
     }
-    identifyWired = await setupLooksPresent(input.repoPath, changedFiles);
+    await removeWorktree(verificationWorktree).catch(() => {});
+    identifyWired = await setupLooksPresent(input.repoPath, changedFiles, survey);
     if (!identifyWired) {
+      await rollbackOwnedPatches(input.repoPath, ownedPatches);
+      changedFiles.clear();
       for (const event of registered) {
         eventStatuses.set(event.code, "failed");
         eventFailureReasons.set(event.code, "SDK initialization or identify() is missing after final repair");
       }
       await saveProgress();
-      throw new Error("SDK initialization and identify() must be present before completion");
+      throw new Error("SDK initialization, identify(), and logout reset() must be present before completion");
+    }
+    for (const event of registered) {
+      if (eventStatuses.get(event.code) === "reviewed") {
+        eventStatuses.set(event.code, "build_verified");
+      }
+    }
+    await saveProgress();
+    const failures = registered.filter((event) => eventStatuses.get(event.code) !== "build_verified");
+    if (failures.length > 0) {
+      const reason = `${failures.length} event${failures.length === 1 ? "" : "s"} could not be verified`;
+      await failRun(reason);
+      finishTimings();
+      return {
+        kind: "partial",
+        runId,
+        registered,
+        eventStatuses,
+        reportEvents: buildReportEvents(registered, eventStatuses, eventFailureReasons),
+        changedFiles: [...changedFiles].sort(),
+        identifyWired,
+        applied: changedFiles.size > 0,
+        summary: summarize(registered, eventStatuses).join("\n"),
+        verificationStatus,
+        phaseTimings,
+        modelRoutes: modelRoutes(input.models),
+      };
     }
     await patchPhase("reporting");
     await runs.completeRun(runId, {
@@ -512,11 +686,11 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       events: buildEvidence(registered, eventStatuses),
     });
 
-    await removeWorktree(worktree).catch(() => {});
+    if (worktree) await removeWorktree(worktree).catch(() => {});
     const summaryLines = summarize(registered, eventStatuses);
-    const hasFailures = [...eventStatuses.values()].some((status) => status === "failed");
+    finishTimings();
     return {
-      kind: hasFailures ? "partial" : "completed",
+      kind: "completed",
       runId,
       registered,
       eventStatuses,
@@ -525,6 +699,9 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       identifyWired,
       applied: changedFiles.size > 0,
       summary: summaryLines.join("\n"),
+      verificationStatus,
+      phaseTimings,
+      modelRoutes: modelRoutes(input.models),
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -536,7 +713,8 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       }
     }
     await failRun(reason);
-    await removeWorktree(worktree).catch(() => {});
+    if (worktree) await removeWorktree(worktree).catch(() => {});
+    finishTimings();
     return {
       kind: "partial",
       runId,
@@ -547,8 +725,206 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       identifyWired,
       applied: changedFiles.size > 0,
       summary: `Integration stopped early: ${reason}. Saved event progress will be verified on rerun.`,
+      verificationStatus,
+      phaseTimings,
+      modelRoutes: modelRoutes(input.models),
     };
   }
+}
+
+function artifactContent<T>(
+  bootstrap: RunBootstrap,
+  kind: "survey" | "event_design",
+): T | undefined {
+  return bootstrap.artifacts.find((artifact) => artifact.kind === kind)?.content as T | undefined;
+}
+
+function modelConfigForTask(
+  models: EngineModelConfig,
+  task: keyof Pick<EngineModelConfig, "survey" | "design" | "sdk_setup" | "cluster_edit" | "review" | "repair">,
+  role: "survey" | "design" | "edit" | "review",
+) {
+  return models[task] ?? models[role];
+}
+
+function modelMetadata(config: ReturnType<typeof modelConfigForTask>) {
+  return {
+    model: config.model,
+    ...(config.effort ? { effort: config.effort } : {}),
+    ...(config.serviceTier ? { serviceTier: config.serviceTier } : {}),
+    fastMode: config.fastMode === true,
+  };
+}
+
+function eventRequest(event: ProposedEvent): Record<string, unknown> {
+  return {
+    code: event.code,
+    name: event.name,
+    reasoning: event.reasoning,
+    anchorFile: event.anchorFile,
+    ...(event.anchorSymbol ? { anchorSymbol: event.anchorSymbol } : {}),
+    ...(Object.keys(event.payloadSchema).length > 0
+      ? { payloadSchema: event.payloadSchema }
+      : {}),
+  };
+}
+
+async function runClusterWorker(
+  input: EngineRunInput,
+  bootstrap: RunBootstrap,
+  registered: RegisteredEvent[],
+  survey: SurveyArtifact | undefined,
+  changedFiles: Set<string>,
+  cluster: Cluster,
+): Promise<ClusterWorkerResult> {
+  let handle: WorktreeHandle | undefined;
+  try {
+    handle = await createWorktree(input.repoPath, input.force ?? false, [...changedFiles]);
+    const deps = integrationDeps(input, bootstrap, registered, survey, handle, [...changedFiles]);
+    const integration = await runClusterIntegration(
+      deps,
+      [cluster],
+      async () => worktreePatch(handle!),
+    );
+    return {
+      cluster,
+      handle,
+      integration,
+      patch: await worktreePatch(handle),
+    };
+  } catch (error) {
+    return {
+      cluster,
+      handle,
+      patch: "",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function integrationDeps(
+  input: EngineRunInput,
+  bootstrap: RunBootstrap,
+  registered: RegisteredEvent[],
+  survey: SurveyArtifact | undefined,
+  worktree: WorktreeHandle,
+  allowedRepairFiles: string[],
+): IntegrationDeps {
+  return {
+    provider: input.provider,
+    models: input.models,
+    worktree,
+    target: input.target,
+    playbookSystemPrompt: input.playbookSystemPrompt,
+    registered,
+    ingestion: bootstrap.ingestion,
+    survey,
+    allowedRepairFiles: allowedRepairFiles.filter(
+      (file) => file !== generateBindings(input.target, registered).relativePath,
+    ),
+    sink: input.sink,
+    saveClusters: () => {},
+    discardChanges: async () => discardWorktreeChanges(worktree),
+    onClusterIntegrated: async () => {},
+  };
+}
+
+function groupEventsByFile(events: RegisteredEvent[]): Map<string, RegisteredEvent[]> {
+  const grouped = new Map<string, RegisteredEvent[]>();
+  for (const event of events) {
+    const current = grouped.get(event.anchorFile) ?? [];
+    current.push(event);
+    grouped.set(event.anchorFile, current);
+  }
+  return grouped;
+}
+
+async function structuralRepairCheck(
+  repoPath: string,
+  events: RegisteredEvent[],
+  files: string[],
+): Promise<{ ok: boolean; notes: string }> {
+  const repairedFiles = new Set(files);
+  for (const [file, fileEvents] of groupEventsByFile(
+    events.filter((event) => repairedFiles.has(event.anchorFile)),
+  )) {
+    const result = await structuralClusterCheck(repoPath, {
+      id: clusterIdFor([file], fileEvents.map((event) => event.eventId)),
+      files: [file],
+      events: placementsFor(fileEvents),
+      status: "verified",
+      attempts: 1,
+    });
+    if (!result.ok) return result;
+  }
+  return { ok: true, notes: "" };
+}
+
+async function mapLimit<T, R>(
+  values: T[],
+  limit: number,
+  operation: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, values.length) }, async () => {
+    for (;;) {
+      const index = nextIndex++;
+      if (index >= values.length) return;
+      results[index] = await operation(values[index]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function rollbackFileEventPatches(
+  repoPath: string,
+  file: string,
+  patches: OwnedPatch[],
+): Promise<void> {
+  for (let index = patches.length - 1; index >= 0; index -= 1) {
+    const patch = patches[index]!;
+    if (
+      patch.rolledBack ||
+      (patch.kind !== "cluster" && patch.kind !== "semantic") ||
+      !patch.files.includes(file)
+    ) {
+      continue;
+    }
+    await reversePatchInRepo(repoPath, patch.patch);
+    patch.rolledBack = true;
+  }
+}
+
+async function rollbackOwnedPatches(repoPath: string, patches: OwnedPatch[]): Promise<void> {
+  for (let index = patches.length - 1; index >= 0; index -= 1) {
+    const patch = patches[index]!;
+    if (patch.rolledBack) continue;
+    await reversePatchInRepo(repoPath, patch.patch);
+    patch.rolledBack = true;
+  }
+}
+
+function modelRoutes(models: EngineModelConfig): Record<string, Record<string, unknown>> {
+  const result: Record<string, Record<string, unknown>> = {};
+  for (const task of ["survey", "design", "sdk_setup", "cluster_edit", "review", "repair"] as const) {
+    const role = task === "survey" || task === "design"
+      ? task
+      : task === "review"
+        ? "review"
+        : "edit";
+    const config = models[task] ?? models[role];
+    result[task] = {
+      model: config.model,
+      ...(config.effort ? { effort: config.effort } : {}),
+      serviceTier: config.fastMode ? "fast" : (config.serviceTier ?? "default"),
+      maxTurns: config.maxTurns,
+      maxMs: config.maxMs,
+      ...(config.maxOutputTokens ? { maxOutputTokens: config.maxOutputTokens } : {}),
+    };
+  }
+  return result;
 }
 
 function registeredFromSnapshot(events: RunBootstrap["snapshot"]["events"]): RegisteredEvent[] {
@@ -563,17 +939,6 @@ function registeredFromSnapshot(events: RunBootstrap["snapshot"]["events"]): Reg
       ...(event.anchorSymbol ? { anchorSymbol: event.anchorSymbol } : {}),
       payloadSchema: event.payloadSchema ?? {},
     }));
-}
-
-function mergeRegistered(
-  existing: RegisteredEvent[],
-  added: RegisteredEvent[],
-): RegisteredEvent[] {
-  const merged = new Map(existing.map((event) => [event.code, event]));
-  for (const event of added) {
-    merged.set(event.code, event);
-  }
-  return [...merged.values()].sort((a, b) => a.code.localeCompare(b.code));
 }
 
 async function reconcileProgress(
@@ -624,20 +989,25 @@ async function fileContainsWrapper(
 async function setupLooksPresent(
   repoPath: string,
   changedFiles: Set<string>,
+  survey?: SurveyArtifact,
 ): Promise<boolean> {
   let bindingsFound = false;
   let bindingCallFound = false;
   let identifyFound = false;
+  let resetFound = false;
   let sdkInitializationFound = false;
+  const contents = new Map<string, string>();
   for (const file of changedFiles) {
     try {
       const content = await readFile(safeRepoPath(repoPath, file), "utf8");
+      contents.set(file, content);
       const generated = content.includes("Generated by @whisperr/wizard");
       bindingsFound ||= generated;
       if (!generated) {
         bindingCallFound ||= content.includes("bindWhisperr(") ||
           content.includes("WhisperrEvents.bind(");
         identifyFound ||= /\bidentify\s*\(/.test(content);
+        resetFound ||= /\breset\s*\(/.test(content);
         sdkInitializationFound ||= /whisperr/i.test(content) &&
           /(initiali[sz]e|configure|client|setup)/i.test(content);
       }
@@ -645,7 +1015,14 @@ async function setupLooksPresent(
       // Missing progress files are handled as incomplete setup.
     }
   }
-  return bindingsFound && bindingCallFound && identifyFound && sdkInitializationFound;
+  const identifyAnchorsCovered = (survey?.identifyAnchors ?? []).every((anchor) =>
+    /\bidentify\s*\(/.test(contents.get(anchor.file) ?? "")
+  );
+  const logoutAnchorsCovered = (survey?.logoutAnchors ?? []).every((anchor) =>
+    /\breset\s*\(/.test(contents.get(anchor.file) ?? "")
+  );
+  return bindingsFound && bindingCallFound && identifyFound && resetFound &&
+    sdkInitializationFound && identifyAnchorsCovered && logoutAnchorsCovered;
 }
 
 function safeRepoPath(repoPath: string, file: string): string {
@@ -706,4 +1083,29 @@ function patchFiles(patch: string): string[] {
     }
   }
   return [...files];
+}
+
+function patchAddsProductEvents(
+  patch: string,
+  bindingsFile: string,
+  events: RegisteredEvent[],
+): boolean {
+  const wrappers = events.map((event) => eventWrapperName(event.code));
+  let file = "";
+  for (const line of patch.split("\n")) {
+    const header = /^\+\+\+ b\/(.+)$/.exec(line);
+    if (header?.[1]) {
+      file = header[1];
+      continue;
+    }
+    if (
+      file !== bindingsFile &&
+      line.startsWith("+") &&
+      !line.startsWith("+++") &&
+      wrappers.some((wrapper) => line.includes(wrapper))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }

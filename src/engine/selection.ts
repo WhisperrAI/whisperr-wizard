@@ -1,3 +1,6 @@
+import { readFile, stat } from "node:fs/promises";
+import { resolve, sep } from "node:path";
+
 import { z } from "zod";
 
 import {
@@ -27,13 +30,45 @@ export interface ProposedEvent {
   payloadSchema: Record<string, string>;
 }
 
+export interface SurveyFeatureArea {
+  name: string;
+  root: string;
+  files: string[];
+}
+
+export interface SurveyAnchor {
+  file: string;
+  symbol?: string;
+  description: string;
+}
+
+export interface SurveyCallSite extends SurveyAnchor {
+  outcome: string;
+  payloadFields: string[];
+  similarPaths: string[];
+}
+
+/** Structured, source-free repository map persisted with a wizard run. */
+export interface SurveyArtifact {
+  stack: {
+    frameworks: string[];
+    packageManager?: string;
+    entryPoints: string[];
+  };
+  featureAreas: SurveyFeatureArea[];
+  identifyAnchors: SurveyAnchor[];
+  logoutAnchors: SurveyAnchor[];
+  existingAnalytics: SurveyAnchor[];
+  integratableCallSites: SurveyCallSite[];
+}
+
 export interface SelectionResult {
   outcome: RoleOutcome["kind"];
-  /** True only when finish_selection ran successfully — not when the model stream ended. */
+  /** True only when finish_event_design ran successfully — not when the model stream ended. */
   finished: boolean;
   proposed: ProposedEvent[];
   summary: string;
-  surveyReport: string;
+  survey: SurveyArtifact;
   sessionId?: string;
 }
 
@@ -133,24 +168,90 @@ export async function runSurvey(
   bootstrap: RunBootstrap,
   sink: ProgressSink,
   resumeSessionId?: string,
-): Promise<{ report: string; outcome: RoleOutcome }> {
-  sink.emit({ phase: "surveying", action: "mapping the repository" });
-  const outcome = await provider.invoke(
-    {
-      role: "survey",
-      task: "survey",
-      sessionKey: "survey",
-      systemPrompt: SURVEY_SYSTEM_PROMPT,
-      userPrompt: surveyUserPrompt(repoPath, renderOnboardingContext(bootstrap.onboardingContext)),
-      tools: [],
-      allowRepoWrite: false,
-      cwd: repoPath,
-      resumeSessionId,
+): Promise<{ survey?: SurveyArtifact; finished: boolean; outcome: RoleOutcome }> {
+  let survey: SurveyArtifact | undefined;
+  let finished = false;
+  const finishSurvey: EngineTool = {
+    name: "finish_survey",
+    description: "Return the complete structured repository survey without raw source code.",
+    inputSchema: {
+      stack: z.object({
+        frameworks: z.array(z.string()).max(30),
+        packageManager: z.string().optional(),
+        entryPoints: z.array(z.string()).max(50),
+      }),
+      featureAreas: z.array(z.object({
+        name: z.string(),
+        root: z.string(),
+        files: z.array(z.string()).max(200),
+      })).max(200),
+      identifyAnchors: z.array(z.object({
+        file: z.string(),
+        symbol: z.string().optional(),
+        description: z.string(),
+      })).max(50),
+      logoutAnchors: z.array(z.object({
+        file: z.string(),
+        symbol: z.string().optional(),
+        description: z.string(),
+      })).max(50),
+      existingAnalytics: z.array(z.object({
+        file: z.string(),
+        symbol: z.string().optional(),
+        description: z.string(),
+      })).max(100),
+      integratableCallSites: z.array(z.object({
+        file: z.string(),
+        symbol: z.string().optional(),
+        description: z.string(),
+        outcome: z.string(),
+        payloadFields: z.array(z.string()).max(50),
+        similarPaths: z.array(z.string()).max(50),
+      })).max(500),
     },
+    jsonSchema: surveyJSONSchema(),
+    handler: async (input) => {
+      if (finished) {
+        return { ok: false, reason: "survey is already frozen" };
+      }
+      const normalized = normalizeSurveyArtifact(input);
+      if (!normalized) {
+        return { ok: false, reason: "survey fields or repository-relative paths are invalid" };
+      }
+      survey = normalized;
+      finished = true;
+      return { ok: true, callSites: normalized.integratableCallSites.length };
+    },
+  };
+  sink.emit({ phase: "surveying", action: "mapping the repository" });
+  const invocation = {
+    role: "survey" as const,
+    task: "survey" as const,
+    sessionKey: "survey",
+    systemPrompt: SURVEY_SYSTEM_PROMPT,
+    userPrompt: surveyUserPrompt(repoPath, renderOnboardingContext(bootstrap.onboardingContext)),
+    tools: [finishSurvey],
+    repositoryAccess: { mode: "survey" as const },
+    allowRepoWrite: false,
+    cwd: repoPath,
+    resumeSessionId,
+  };
+  let outcome = await provider.invoke(
+    invocation,
     modelConfigFor(models, "survey", "survey"),
     (action) => sink.emit({ phase: "surveying", action }),
   );
-  return { report: outcome.kind === "completed" ? outcome.text : "", outcome };
+  if (outcome.kind === "completed" && !finished && provider.invokeFallback) {
+    survey = undefined;
+    finished = false;
+    sink.emit({ phase: "surveying", action: "Opus survey was invalid; retrying once with Sol" });
+    outcome = await provider.invokeFallback(
+      { ...invocation, sessionKey: "survey:sol_retry" },
+      modelConfigFor(models, "repair", "survey"),
+      (action) => sink.emit({ phase: "surveying", action }),
+    );
+  }
+  return { survey, finished, outcome };
 }
 
 export async function runSelection(
@@ -158,14 +259,17 @@ export async function runSelection(
   models: EngineModelConfig,
   repoPath: string,
   bootstrap: RunBootstrap,
-  surveyReport: string,
+  survey: SurveyArtifact,
   rejectedCodes: string[],
   sink: ProgressSink,
   existingEventCodes = bootstrap.snapshot.events.map((event) => event.code),
+  recoveryCodes: string[] = [],
 ): Promise<SelectionResult> {
   const proposed: ProposedEvent[] = [];
   const seen = new Set<string>();
   const rejected = new Set(rejectedCodes);
+  const existing = new Set(existingEventCodes.map(normalizeEventCode));
+  const recovery = new Set(recoveryCodes.map(normalizeEventCode));
   let summary = "";
   let finished = false;
 
@@ -201,6 +305,9 @@ export async function runSelection(
       required: ["code", "name", "reasoning", "anchorFile"],
     },
     handler: async (input) => {
+      if (finished) {
+        return { ok: false, reason: "event design is already frozen" };
+      }
       const candidate: ProposedEvent = {
         code: String(input.code ?? ""),
         name: String(input.name ?? ""),
@@ -212,6 +319,16 @@ export async function runSelection(
       const validated = validateProposedEvent(candidate, seen, rejected);
       if (!validated.ok) {
         return { ok: false, reason: validated.reason };
+      }
+      if (recovery.size > 0 && !recovery.has(validated.event.code)) {
+        return { ok: false, reason: `placement recovery cannot create event ${validated.event.code}` };
+      }
+      if (existing.has(validated.event.code) && !recovery.has(validated.event.code)) {
+        return { ok: false, reason: `event ${validated.event.code} is already registered` };
+      }
+      const anchorError = await validateAnchor(repoPath, validated.event);
+      if (anchorError) {
+        return { ok: false, reason: anchorError };
       }
       seen.add(validated.event.code);
       proposed.push(validated.event);
@@ -258,8 +375,8 @@ export async function runSelection(
   };
 
   const finishTool: EngineTool = {
-    name: "finish_selection",
-    description: "Signal that every important event has been proposed.",
+    name: "finish_event_design",
+    description: "Freeze the complete batch after every important event has been proposed.",
     inputSchema: { summary: z.string().describe("one line on what was selected and why") },
     jsonSchema: {
       type: "object",
@@ -274,32 +391,219 @@ export async function runSelection(
   };
 
   sink.emit({ phase: "designing", action: "selecting important events" });
-  const outcome = await provider.invoke(
-    {
-      role: "design",
-      task: "design",
-      systemPrompt: SELECTION_SYSTEM_PROMPT,
-      userPrompt: selectionUserPrompt(
-        surveyReport,
-        renderOnboardingContext(bootstrap.onboardingContext),
-        existingEventCodes,
-        rejectedCodes,
-      ),
-      tools: [proposeBatchTool, proposeTool, finishTool],
-      allowRepoWrite: false,
-      cwd: repoPath,
-    },
+  const invocation = {
+    role: "design" as const,
+    task: "design" as const,
+    sessionKey: "design",
+    systemPrompt: SELECTION_SYSTEM_PROMPT,
+    userPrompt: selectionUserPrompt(
+      JSON.stringify(survey),
+      renderOnboardingContext(bootstrap.onboardingContext),
+      existingEventCodes,
+      rejectedCodes,
+    ),
+    tools: [proposeBatchTool, finishTool],
+    repositoryAccess: { mode: "none" as const },
+    allowRepoWrite: false,
+    cwd: repoPath,
+  };
+  let outcome = await provider.invoke(
+    invocation,
     modelConfigFor(models, "design", "design"),
     (action) => sink.emit({ phase: "designing", action }),
   );
+  if (
+    outcome.kind === "completed" &&
+    (!finished || proposed.length === 0) &&
+    provider.invokeFallback
+  ) {
+    proposed.length = 0;
+    seen.clear();
+    summary = "";
+    finished = false;
+    sink.emit({ phase: "designing", action: "Opus design was invalid; retrying once with Sol" });
+    outcome = await provider.invokeFallback(
+      { ...invocation, sessionKey: "design:sol_retry" },
+      modelConfigFor(models, "repair", "design"),
+      (action) => sink.emit({ phase: "designing", action }),
+    );
+  }
 
   return {
     outcome: outcome.kind,
     finished,
     proposed,
     summary,
-    surveyReport,
+    survey,
     sessionId: outcome.sessionId,
+  };
+}
+
+async function validateAnchor(repoPath: string, event: ProposedEvent): Promise<string | undefined> {
+  const root = resolve(repoPath);
+  const path = resolve(root, event.anchorFile);
+  if (path === root || !path.startsWith(root + sep)) {
+    return `${event.code}: anchor escapes the repository`;
+  }
+  try {
+    const info = await stat(path);
+    if (!info.isFile()) return `${event.code}: anchor is not a file`;
+    if (event.anchorSymbol) {
+      const content = await readFile(path, "utf8");
+      if (!content.includes(event.anchorSymbol)) {
+        return `${event.code}: anchor symbol ${event.anchorSymbol} is not present in ${event.anchorFile}`;
+      }
+    }
+  } catch {
+    return `${event.code}: anchor file ${event.anchorFile} does not exist`;
+  }
+  return undefined;
+}
+
+function surveyJSONSchema(): Record<string, unknown> {
+  const anchor = {
+    type: "object",
+    properties: {
+      file: { type: "string" },
+      symbol: { type: "string" },
+      description: { type: "string" },
+    },
+    required: ["file", "description"],
+  };
+  return {
+    type: "object",
+    properties: {
+      stack: {
+        type: "object",
+        properties: {
+          frameworks: { type: "array", items: { type: "string" }, maxItems: 30 },
+          packageManager: { type: "string" },
+          entryPoints: { type: "array", items: { type: "string" }, maxItems: 50 },
+        },
+        required: ["frameworks", "entryPoints"],
+      },
+      featureAreas: {
+        type: "array",
+        maxItems: 200,
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            root: { type: "string" },
+            files: { type: "array", items: { type: "string" }, maxItems: 200 },
+          },
+          required: ["name", "root", "files"],
+        },
+      },
+      identifyAnchors: { type: "array", items: anchor, maxItems: 50 },
+      logoutAnchors: { type: "array", items: anchor, maxItems: 50 },
+      existingAnalytics: { type: "array", items: anchor, maxItems: 100 },
+      integratableCallSites: {
+        type: "array",
+        maxItems: 500,
+        items: {
+          ...anchor,
+          properties: {
+            ...(anchor.properties as Record<string, unknown>),
+            outcome: { type: "string" },
+            payloadFields: { type: "array", items: { type: "string" }, maxItems: 50 },
+            similarPaths: { type: "array", items: { type: "string" }, maxItems: 50 },
+          },
+          required: ["file", "description", "outcome", "payloadFields", "similarPaths"],
+        },
+      },
+    },
+    required: [
+      "stack", "featureAreas", "identifyAnchors", "logoutAnchors",
+      "existingAnalytics", "integratableCallSites",
+    ],
+  };
+}
+
+function normalizeSurveyArtifact(input: Record<string, unknown>): SurveyArtifact | undefined {
+  const safePath = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    const normalized = value.trim().replaceAll("\\", "/");
+    if (!normalized || normalized.startsWith("/") || /^[a-z]:/i.test(normalized) ||
+      normalized.split("/").some((part) => !part || part === "." || part === "..")) {
+      return undefined;
+    }
+    return normalized;
+  };
+  const stringList = (value: unknown, max: number): string[] | undefined =>
+    Array.isArray(value) && value.length <= max &&
+      value.every((item) => typeof item === "string" && item.trim())
+      ? [...new Set(value.map((item) => String(item).trim()))]
+      : undefined;
+  const value = input as Record<string, any>;
+  const stack = value.stack as Record<string, unknown> | undefined;
+  const frameworks = stringList(stack?.frameworks, 30);
+  const entryPoints = stringList(stack?.entryPoints, 50);
+  if (!stack || !frameworks || !entryPoints || entryPoints.some((file) => !safePath(file))) {
+    return undefined;
+  }
+  const anchors = (raw: unknown, max: number): SurveyAnchor[] | undefined => {
+    if (!Array.isArray(raw) || raw.length > max) return undefined;
+    const result: SurveyAnchor[] = [];
+    for (const item of raw) {
+      const row = item as Record<string, unknown>;
+      const file = safePath(row?.file);
+      const description = typeof row?.description === "string" ? row.description.trim() : "";
+      if (!file || !description) return undefined;
+      result.push({
+        file,
+        ...(typeof row.symbol === "string" && row.symbol.trim()
+          ? { symbol: row.symbol.trim() }
+          : {}),
+        description,
+      });
+    }
+    return result;
+  };
+  if (!Array.isArray(value.featureAreas) || value.featureAreas.length > 200) return undefined;
+  const featureAreas: SurveyFeatureArea[] = [];
+  for (const item of value.featureAreas) {
+    const row = item as Record<string, unknown>;
+    const root = safePath(row?.root);
+    const files = stringList(row?.files, 200);
+    if (typeof row?.name !== "string" || !row.name.trim() || !root || !files ||
+      files.some((file) => !safePath(file))) return undefined;
+    featureAreas.push({ name: row.name.trim(), root, files: files.map((file) => safePath(file)!) });
+  }
+  const identifyAnchors = anchors(value.identifyAnchors, 50);
+  const logoutAnchors = anchors(value.logoutAnchors, 50);
+  const existingAnalytics = anchors(value.existingAnalytics, 100);
+  const baseCallSites = anchors(value.integratableCallSites, 500);
+  if (!identifyAnchors || !logoutAnchors || !existingAnalytics || !baseCallSites ||
+    !Array.isArray(value.integratableCallSites)) return undefined;
+  const integratableCallSites: SurveyCallSite[] = [];
+  for (let index = 0; index < baseCallSites.length; index += 1) {
+    const row = value.integratableCallSites[index] as Record<string, unknown>;
+    const outcome = typeof row.outcome === "string" ? row.outcome.trim() : "";
+    const payloadFields = stringList(row.payloadFields, 50);
+    const similarPaths = stringList(row.similarPaths, 50);
+    if (!outcome || !payloadFields || !similarPaths ||
+      similarPaths.some((file) => !safePath(file))) return undefined;
+    integratableCallSites.push({
+      ...baseCallSites[index]!,
+      outcome,
+      payloadFields,
+      similarPaths: similarPaths.map((file) => safePath(file)!),
+    });
+  }
+  return {
+    stack: {
+      frameworks,
+      ...(typeof stack.packageManager === "string" && stack.packageManager.trim()
+        ? { packageManager: stack.packageManager.trim() }
+        : {}),
+      entryPoints: entryPoints.map((file) => safePath(file)!),
+    },
+    featureAreas,
+    identifyAnchors,
+    logoutAnchors,
+    existingAnalytics,
+    integratableCallSites,
   };
 }
 

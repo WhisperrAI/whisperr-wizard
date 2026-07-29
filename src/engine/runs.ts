@@ -19,6 +19,20 @@ export interface RunRecord {
   integrationEvidence?: IntegrationProgress;
 }
 
+export type RunArtifactKind = "survey" | "event_design";
+
+export interface RunArtifact<T = unknown> {
+  kind: RunArtifactKind;
+  content: T;
+  contentHash: string;
+  model: string;
+  effort?: string;
+  serviceTier?: string;
+  fastMode: boolean;
+  frozenAt?: string;
+  createdAt: string;
+}
+
 export interface RunSnapshotEvent {
   id: string;
   code: string;
@@ -44,6 +58,7 @@ export interface RunBootstrap {
   app: Record<string, unknown>;
   snapshot: RunSnapshot;
   ingestion: { apiKey: string; baseUrl: string };
+  artifacts: RunArtifact[];
 }
 
 export type ItemKind = "event";
@@ -69,6 +84,19 @@ export interface IntegrationProgress {
   verificationStatus: string;
   verificationCommand?: string;
   events: IntegrationEventEvidence[];
+}
+
+export interface ArtifactModelMetadata {
+  model: string;
+  effort?: string;
+  serviceTier?: string;
+  fastMode?: boolean;
+}
+
+export interface DesignCommitResult {
+  artifact: RunArtifact;
+  events: RunSnapshotEvent[];
+  created: boolean;
 }
 
 export class RunsApiError extends Error {
@@ -176,6 +204,31 @@ export class RunsClient {
     }).then(normalizeItemWriteResult);
   }
 
+  persistSurveyArtifact<T>(
+    runId: string,
+    content: T,
+    metadata: ArtifactModelMetadata,
+  ): Promise<RunArtifact<T>> {
+    return this.request<RunArtifact<T>>(
+      "POST",
+      `/wizard/runs/${runId}/artifacts/survey`,
+      artifactRequest(content, metadata),
+    );
+  }
+
+  commitDesign<T>(
+    runId: string,
+    content: T,
+    events: Array<Record<string, unknown>>,
+    metadata: ArtifactModelMetadata,
+  ): Promise<DesignCommitResult> {
+    return this.request<DesignCommitResult>(
+      "POST",
+      `/wizard/runs/${runId}/design/commit`,
+      { ...artifactRequest(content, metadata), events },
+    );
+  }
+
   completeRun(
     runId: string,
     completion: {
@@ -264,7 +317,75 @@ export function normalizeRunBootstrap(payload: unknown): RunBootstrap {
       events,
     },
     ingestion: { apiKey: ingestion.apiKey, baseUrl: ingestion.baseUrl },
+    artifacts: normalizeArtifacts(value.artifacts ?? snapshotSource.artifacts),
   };
+}
+
+function normalizeArtifacts(payload: unknown): RunArtifact[] {
+  if (!Array.isArray(payload)) return [];
+  return payload.flatMap((candidate) => {
+    const value = record(candidate);
+    const kind = value?.kind;
+    if (
+      (kind !== "survey" && kind !== "event_design") ||
+      typeof value?.contentHash !== "string" ||
+      !/^[0-9a-f]{64}$/.test(value.contentHash) ||
+      typeof value.model !== "string" ||
+      typeof value.createdAt !== "string"
+    ) {
+      return [];
+    }
+    return [{
+      kind,
+      content: value.content,
+      contentHash: value.contentHash,
+      model: value.model,
+      ...(typeof value.effort === "string" ? { effort: value.effort } : {}),
+      ...(typeof value.serviceTier === "string" ? { serviceTier: value.serviceTier } : {}),
+      fastMode: value.fastMode === true,
+      ...(typeof value.frozenAt === "string" ? { frozenAt: value.frozenAt } : {}),
+      createdAt: value.createdAt,
+    }];
+  });
+}
+
+function artifactRequest<T>(
+  content: T,
+  metadata: ArtifactModelMetadata,
+): Record<string, unknown> {
+  return {
+    content,
+    contentHash: artifactContentHash(content),
+    model: metadata.model,
+    ...(metadata.effort ? { effort: metadata.effort } : {}),
+    ...(metadata.serviceTier ? { serviceTier: metadata.serviceTier } : {}),
+    fastMode: metadata.fastMode === true,
+  };
+}
+
+export function artifactContentHash(content: unknown): string {
+  return createHash("sha256").update(stableJSONStringify(content)).digest("hex");
+}
+
+function stableJSONStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJSONStringify).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right));
+    return `{${entries.map(([key, item]) =>
+      `${canonicalJSONString(key)}:${stableJSONStringify(item)}`
+    ).join(",")}}`;
+  }
+  return canonicalJSONString(value);
+}
+
+function canonicalJSONString(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 function normalizeIntegrationProgress(payload: unknown): IntegrationProgress | undefined {

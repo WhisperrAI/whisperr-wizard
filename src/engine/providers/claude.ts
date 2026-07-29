@@ -16,7 +16,8 @@ import type {
 } from "../types.js";
 
 const READ_ONLY_TOOLS = ["Read", "Glob", "Grep"] as const;
-const EDIT_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"] as const;
+const CONSTRAINED_EDIT_TOOLS = ["Read", "Edit", "Write"] as const;
+const SETUP_TOOLS = ["Read", "Edit", "Write", "Bash"] as const;
 const FAST_MODE_MODELS = new Set(["claude-opus-5", "claude-opus-4-8"]);
 
 export function supportsClaudeFastMode(model: string): boolean {
@@ -62,10 +63,19 @@ export function createClaudeProvider(
         }),
       );
       const trustedTools = trustedEngineMcpTools(invocation.tools);
-      const allowedTools = [
-        ...(invocation.allowRepoWrite ? EDIT_TOOLS : READ_ONLY_TOOLS),
-        ...trustedTools,
-      ];
+      const accessMode = invocation.repositoryAccess?.mode ??
+        (invocation.allowRepoWrite ? "repair" : "survey");
+      const repositoryTools = accessMode === "none" || accessMode === "review"
+        ? []
+        : accessMode === "survey"
+          ? READ_ONLY_TOOLS
+          : accessMode === "sdk_setup"
+            ? SETUP_TOOLS
+            : CONSTRAINED_EDIT_TOOLS;
+      const allowedTools = [...repositoryTools, ...trustedTools];
+      const allowedFiles = invocation.repositoryAccess?.allowedFiles
+        ? new Set(invocation.repositoryAccess.allowedFiles.map((file) => file.replaceAll("\\", "/")))
+        : undefined;
 
       let sessionId = invocation.resumeSessionId;
       let costUsd = 0;
@@ -94,6 +104,7 @@ export function createClaudeProvider(
           `X-Whisperr-Wizard-Model: ${headerValue(roleConfig.model)}`,
           `X-Whisperr-Wizard-Effort: ${headerValue(roleConfig.effort ?? "")}`,
           `X-Whisperr-Wizard-Service-Tier: ${roleConfig.fastMode ? "fast" : "default"}`,
+          `X-Whisperr-Wizard-Fallback: ${invocation.fallback ? "true" : "false"}`,
         ].filter(Boolean).join("\n");
         const response = query({
           prompt: invocation.userPrompt,
@@ -107,9 +118,12 @@ export function createClaudeProvider(
             ...(hostTools.length > 0
               ? { mcpServers: { engine: createSdkMcpServer({ name: "engine", tools: hostTools }) } }
               : {}),
-            hooks: buildToolPolicyHooks(invocation.cwd, trustedTools),
-            canUseTool: createToolPermissionCallback(invocation.cwd, trustedTools),
+            hooks: buildToolPolicyHooks(invocation.cwd, trustedTools, allowedFiles),
+            canUseTool: createToolPermissionCallback(invocation.cwd, trustedTools, allowedFiles),
             maxTurns: roleConfig.maxTurns,
+            ...(roleConfig.maxOutputTokens
+              ? { taskBudget: { total: roleConfig.maxOutputTokens } }
+              : {}),
             ...((roleConfig.fastMode ?? supportsClaudeFastMode(roleConfig.model))
               ? { settings: { fastMode: true } }
               : {}),

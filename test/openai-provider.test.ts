@@ -10,7 +10,14 @@ import { createRoutedProvider } from "../src/engine/providers/router.js";
 import type { EngineProvider, RoleModelConfig } from "../src/engine/types.js";
 import type { WizardConfig, WizardSession } from "../src/types.js";
 
-const roleConfig: RoleModelConfig = { model: "gpt-5.6-sol", effort: "high", maxTurns: 6, maxMs: 30_000 };
+const roleConfig: RoleModelConfig = {
+  model: "gpt-5.6-sol",
+  effort: "medium",
+  serviceTier: "priority",
+  maxTurns: 6,
+  maxMs: 30_000,
+  maxOutputTokens: 4_000,
+};
 
 test("OpenAI file tools hide and deny secret material", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "openai-secrets-"));
@@ -38,6 +45,7 @@ test("OpenAI file tools hide and deny secret material", async () => {
 
 test("openai provider binds a conversation and loops function calls", async () => {
   const seen: Array<{ path: string; body: Record<string, unknown> }> = [];
+  let conversationSequence = 0;
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => (body += String(chunk)));
@@ -46,7 +54,8 @@ test("openai provider binds a conversation and loops function calls", async () =
       seen.push({ path: request.url ?? "", body: parsed });
       response.setHeader("Content-Type", "application/json");
       if ((request.url ?? "").endsWith("/v1/conversations")) {
-        response.end(JSON.stringify({ id: "conv_1" }));
+        conversationSequence += 1;
+        response.end(JSON.stringify({ id: `conv_${conversationSequence}` }));
         return;
       }
       const input = parsed.input as Array<Record<string, unknown>>;
@@ -78,6 +87,8 @@ test("openai provider binds a conversation and loops function calls", async () =
   const outcome = await provider.invoke(
     {
       role: "design",
+      task: "design",
+      sessionKey: "design",
       systemPrompt: "sys",
       userPrompt: "go",
       tools: [{
@@ -90,6 +101,28 @@ test("openai provider binds a conversation and loops function calls", async () =
           return { ok: true };
         },
       }],
+      repositoryAccess: { mode: "none" },
+      allowRepoWrite: false,
+      cwd: mkdtempSync(join(tmpdir(), "openai-cwd-")),
+    },
+    roleConfig,
+    () => {},
+  );
+  const surveyOutcome = await provider.invoke(
+    {
+      role: "survey",
+      task: "survey",
+      sessionKey: "survey",
+      systemPrompt: "sys",
+      userPrompt: "go",
+      tools: [{
+        name: "probe",
+        description: "test tool",
+        inputSchema: {},
+        jsonSchema: { type: "object", properties: { ping: { type: "string" } } },
+        handler: async () => ({ ok: true }),
+      }],
+      repositoryAccess: { mode: "survey" },
       allowRepoWrite: false,
       cwd: mkdtempSync(join(tmpdir(), "openai-cwd-")),
     },
@@ -103,13 +136,22 @@ test("openai provider binds a conversation and loops function calls", async () =
     assert.equal(outcome.text, "final answer");
     assert.equal(outcome.sessionId, "conv_1");
   }
+  assert.equal(surveyOutcome.kind, "completed");
+  if (surveyOutcome.kind === "completed") {
+    assert.equal(surveyOutcome.sessionId, "conv_2");
+  }
   assert.deepEqual(toolCalls, [{ ping: "pong" }]);
   assert.ok(seen[0].path.includes("/wizard/openai/runs/wrun_9/v1/conversations"));
   assert.equal(seen[1].body.conversation, "conv_1");
   const tools = seen[1].body.tools as Array<{ name: string }>;
   assert.ok(tools.some((tool) => tool.name === "probe"));
-  assert.ok(tools.some((tool) => tool.name === "read_file"));
+  assert.ok(!tools.some((tool) => tool.name === "read_file"));
   assert.ok(!tools.some((tool) => tool.name === "write_file"));
+  assert.deepEqual(seen[1].body.reasoning, { effort: "medium" });
+  assert.equal(seen[1].body.service_tier, "priority");
+  assert.equal(seen[1].body.max_output_tokens, 4_000);
+  const conversationCreates = seen.filter((request) => request.path.endsWith("/v1/conversations"));
+  assert.equal(conversationCreates.length, 2, "design and survey use isolated conversations");
 });
 
 test("file tools are jailed to the repository", async () => {
@@ -149,7 +191,17 @@ test("file tools are jailed to the repository", async () => {
   );
   provider.onRunReady?.("wrun_10");
   const outcome = await provider.invoke(
-    { role: "survey", systemPrompt: "s", userPrompt: "u", tools: [], allowRepoWrite: false, cwd },
+    {
+      role: "survey",
+      task: "survey",
+      sessionKey: "survey",
+      systemPrompt: "s",
+      userPrompt: "u",
+      tools: [],
+      repositoryAccess: { mode: "survey" },
+      allowRepoWrite: false,
+      cwd,
+    },
     roleConfig,
     () => {},
   );
@@ -186,29 +238,33 @@ test("routed provider dispatches by role and fans out run binding", async () => 
   assert.deepEqual(calls.filter((entry) => entry.startsWith("invoke:")), ["invoke:openai", "invoke:claude"]);
 });
 
-test("task router opens the Terra circuit after quota and continues with Opus", async () => {
+test("a Terra circuit failure does not disable the Sol review route", async () => {
   const calls: string[] = [];
-  const terra: EngineProvider = {
-    name: "terra",
-    invoke: async () => {
-      calls.push("terra");
-      return { kind: "failed", error: "wizard model quota is exhausted", costUsd: 0, turns: 1 };
-    },
-  };
-  const opus: EngineProvider = {
-    name: "opus",
+  const openai: EngineProvider = {
+    name: "openai",
     invoke: async (_invocation, config) => {
-      calls.push(`opus:${config.model}`);
+      calls.push(config.model);
+      if (config.model === "gpt-5.6-terra") {
+        return { kind: "failed", error: "wizard model quota is exhausted", costUsd: 0, turns: 1 };
+      }
       return { kind: "completed", text: "done", costUsd: 0, turns: 1 };
     },
   };
+  const solConfig: RoleModelConfig = {
+    model: "gpt-5.6-sol",
+    effort: "medium",
+    serviceTier: "priority",
+    maxTurns: 30,
+    maxMs: 1000,
+  };
   const routed = createRoutedProvider({
     cluster_edit: {
-      provider: terra,
+      provider: openai,
       concurrency: 4,
-      fallbackConfig: { model: "claude-opus-5", effort: "medium", maxTurns: 60, maxMs: 1000 },
+      fallbackConfig: solConfig,
     },
-  }, opus, 2);
+    review: { provider: openai, concurrency: 2 },
+  }, openai, 2);
   const invocation = {
     role: "edit" as const,
     task: "cluster_edit" as const,
@@ -218,15 +274,28 @@ test("task router opens the Terra circuit after quota and continues with Opus", 
     allowRepoWrite: true,
     cwd: "/tmp",
   };
-  const first = await routed.invoke(invocation, roleConfig, () => {});
+  const terraConfig: RoleModelConfig = {
+    model: "gpt-5.6-terra",
+    effort: "medium",
+    serviceTier: "priority",
+    maxTurns: 20,
+    maxMs: 1000,
+  };
+  const first = await routed.invoke(invocation, terraConfig, () => {});
   assert.equal(first.kind, "failed", "the current dirty attempt must be rolled back by the caller");
-  const escalated = await routed.invokeFallback?.(
-    { ...invocation, task: "repair" },
-    { model: "claude-opus-5", effort: "medium", maxTurns: 60, maxMs: 1000 },
+  const review = await routed.invoke(
+    {
+      ...invocation,
+      role: "review",
+      task: "review",
+      allowRepoWrite: false,
+      repositoryAccess: { mode: "review" },
+    },
+    solConfig,
     () => {},
   );
-  assert.equal(escalated?.kind, "completed");
-  const next = await routed.invoke(invocation, roleConfig, () => {});
+  assert.equal(review.kind, "completed");
+  const next = await routed.invoke(invocation, terraConfig, () => {});
   assert.equal(next.kind, "completed");
-  assert.deepEqual(calls, ["terra", "opus:claude-opus-5", "opus:claude-opus-5"]);
+  assert.deepEqual(calls, ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-sol"]);
 });

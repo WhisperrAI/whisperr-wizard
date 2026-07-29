@@ -149,9 +149,7 @@ export async function runIntegrationAgent(opts: {
   }
   repoMap = planning.repoMap;
 
-  // Surface the plan while it's the freshest thing that happened and nothing
-  // has been edited yet — this is the last look before the agent touches their
-  // code, and under --review-plan it's where they can veto placements.
+  // Surface the plan while it is fresh and before repository edits begin.
   let scopedPlan: EventPlanEntry[] | null = null;
   if (planning.plan) {
     scopedPlan = planForManifest(planning.plan, manifest);
@@ -1097,6 +1095,7 @@ async function runPass(opts: RunPassOptions): Promise<PassResult> {
 export function buildToolPolicyHooks(
   repoPath: string,
   trustedTools?: ReadonlySet<string>,
+  allowedFiles?: ReadonlySet<string>,
 ): { PreToolUse: HookCallbackMatcher[] } {
   return {
     PreToolUse: [
@@ -1107,6 +1106,7 @@ export function buildToolPolicyHooks(
             const decision = evaluateToolUse(input.tool_name, toolInputRecord(input.tool_input), {
               repoPath,
               trustedTools,
+              allowedFiles,
             });
             if (decision.behavior === "allow") {
               // Keep this as a bare continue so canUseTool still runs on SDK ask-path calls.
@@ -1129,9 +1129,10 @@ export function buildToolPolicyHooks(
 export function createToolPermissionCallback(
   repoPath: string,
   trustedTools?: ReadonlySet<string>,
+  allowedFiles?: ReadonlySet<string>,
 ): CanUseTool {
   return async (toolName, input, options) => {
-    const decision = evaluateToolUse(toolName, input, { repoPath, trustedTools });
+    const decision = evaluateToolUse(toolName, input, { repoPath, trustedTools, allowedFiles });
     return decision.behavior === "allow"
       ? { behavior: "allow", toolUseID: options.toolUseID }
       : {

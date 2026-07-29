@@ -31,6 +31,7 @@ export interface RunReport {
    * (tool missing / timed out) — i.e. "unknown", distinct from a real failure.
    */
   verified?: boolean | null;
+  verification_status?: "pending" | "passed" | "failed" | "unavailable";
   cost_usd: number;
   duration_ms: number;
   summary: string;
@@ -47,6 +48,7 @@ export interface RunReport {
   effort?: string;
   exit_class?: ReportExitClass;
   phase_timings?: ReportPhaseTiming[];
+  model_routes?: Record<string, Record<string, unknown>>;
   opportunities_proposed?: number;
   opportunities_applied?: number;
 }

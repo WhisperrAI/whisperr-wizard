@@ -122,12 +122,20 @@ export async function worktreePatch(handle: WorktreeHandle): Promise<string> {
 }
 
 export async function applyPatchToRepo(handle: WorktreeHandle, patch: string): Promise<void> {
+  return applyPatch(handle.repoPath, patch, false);
+}
+
+export async function reversePatchInRepo(repoPath: string, patch: string): Promise<void> {
+  return applyPatch(repoPath, patch, true);
+}
+
+async function applyPatch(repoPath: string, patch: string, reverse: boolean): Promise<void> {
   if (patch.trim() === "") {
     return;
   }
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("git", ["apply", "--whitespace=nowarn"], {
-      cwd: handle.repoPath,
+    const child = spawn("git", ["apply", ...(reverse ? ["--reverse"] : []), "--whitespace=nowarn"], {
+      cwd: repoPath,
       stdio: ["pipe", "ignore", "pipe"],
     });
     let stderr = "";

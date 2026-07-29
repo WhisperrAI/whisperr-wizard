@@ -62,14 +62,15 @@ test("deriveClusters groups by directory and bounds cluster size", () => {
   assert.ok(diaryClusters.length >= 2, "11 diary events must split across clusters");
 });
 
-test("small directories merge instead of becoming one-event clusters", () => {
+test("clusters never mix repository files", () => {
   const clusters = deriveClusters([
     placement("alpha_started", "src/alpha/a.ts"),
     placement("beta_started", "src/beta/b.ts"),
     placement("gamma_started", "src/gamma/c.ts"),
     placement("delta_started", "src/delta/d.ts"),
   ]);
-  assert.ok(clusters.length < 4, `expected merged clusters, got ${clusters.length}`);
+  assert.equal(clusters.length, 4);
+  assert.ok(clusters.every((cluster) => cluster.files.length === 1));
 });
 
 test("cluster IDs stay unique across slices and concurrent waves lock files", () => {
@@ -90,7 +91,11 @@ test("cluster IDs stay unique across slices and concurrent waves lock files", ()
   assert.ok(wave.length <= 4);
   const files = wave.flatMap((cluster) => cluster.files);
   assert.equal(new Set(files).size, files.length, "a file may be owned by only one concurrent worker");
-  assert.equal(wave.filter((cluster) => cluster.files.includes("src/shared.ts")).length, 1);
+  assert.ok(wave.every((cluster) => cluster.files.length === 1));
+  assert.ok(
+    clusters.filter((cluster) => cluster.files.includes("src/shared.ts")).length >= 3,
+    "ten same-file events must be split into serial single-file clusters",
+  );
 });
 
 for (const eventCount of [20, 100, 200]) {
@@ -122,13 +127,17 @@ test("cluster queue transitions and completion", () => {
     placement("two_started", "src/a/b.ts"),
     placement("three_started", "src/a/c.ts"),
   ]);
-  assert.equal(clusters.length, 1);
+  assert.equal(clusters.length, 3);
   const first = nextPendingCluster(clusters);
   assert.ok(first);
   clusters = transitionCluster(clusters, first.id, "editing");
   assert.equal(clusters[0].attempts, 1);
   clusters = transitionCluster(clusters, first.id, "verified");
   clusters = transitionCluster(clusters, first.id, "reviewed");
+  assert.ok(nextPendingCluster(clusters));
+  for (const cluster of clusters.filter((candidate) => candidate.id !== first.id)) {
+    clusters = transitionCluster(clusters, cluster.id, "verified");
+  }
   assert.equal(nextPendingCluster(clusters), undefined);
   assert.ok(clustersComplete(clusters));
   clusters = transitionCluster(clusters, first.id, "failed_resumable", "context overflow");

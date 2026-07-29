@@ -41,6 +41,7 @@ function guardedPath(
   cwd: string,
   toolName: "Read" | "Glob" | "Write" | "Edit",
   candidate: string,
+  allowedFiles?: ReadonlySet<string>,
 ): string {
   const path = jailedPath(cwd, candidate);
   const decision = evaluateToolUse(
@@ -48,7 +49,7 @@ function guardedPath(
     toolName === "Glob"
       ? { path: candidate, pattern: "*" }
       : { file_path: candidate },
-    { repoPath: cwd },
+    { repoPath: cwd, allowedFiles },
   );
   if (decision.behavior === "deny") {
     throw new Error(decision.message);
@@ -56,7 +57,17 @@ function guardedPath(
   return path;
 }
 
-export function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
+export function fileTools(
+  cwd: string,
+  allowWrite: boolean,
+  access: RoleInvocation["repositoryAccess"] = { mode: allowWrite ? "repair" : "survey" },
+): EngineTool[] {
+  if (access.mode === "none" || access.mode === "review") {
+    return [];
+  }
+  const allowedFiles = access.allowedFiles
+    ? new Set(access.allowedFiles.map((file) => file.replaceAll("\\", "/")))
+    : undefined;
   const tools: EngineTool[] = [
     {
       name: "read_file",
@@ -68,7 +79,7 @@ export function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
         required: ["path"],
       },
       handler: async (input) => {
-        const path = guardedPath(cwd, "Read", String(input.path ?? ""));
+        const path = guardedPath(cwd, "Read", String(input.path ?? ""), allowedFiles);
         const content = readFileSync(path, "utf8");
         return { content: content.slice(0, 40_000) };
       },
@@ -83,7 +94,7 @@ export function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
         required: ["path"],
       },
       handler: async (input) => {
-        const target = guardedPath(cwd, "Glob", String(input.path ?? "."));
+        const target = guardedPath(cwd, "Glob", String(input.path ?? "."), allowedFiles);
         const entries = readdirSync(target)
           .filter((entry) => !isSecretPathLike(entry))
           .map((entry) => {
@@ -106,7 +117,7 @@ export function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
           required: ["path", "content"],
         },
         handler: async (input) => {
-          const path = guardedPath(cwd, "Write", String(input.path ?? ""));
+          const path = guardedPath(cwd, "Write", String(input.path ?? ""), allowedFiles);
           writeFileSync(path, String(input.content ?? ""));
           return { ok: true };
         },
@@ -125,7 +136,7 @@ export function fileTools(cwd: string, allowWrite: boolean): EngineTool[] {
           required: ["path", "oldText", "newText"],
         },
         handler: async (input) => {
-          const path = guardedPath(cwd, "Edit", String(input.path ?? ""));
+          const path = guardedPath(cwd, "Edit", String(input.path ?? ""), allowedFiles);
           const content = readFileSync(path, "utf8");
           const oldText = String(input.oldText ?? "");
           if (!content.includes(oldText)) {
@@ -169,6 +180,7 @@ export function createOpenAIProvider(
             : {
                 "X-Whisperr-Wizard-Session-Key": sessionKey,
                 "X-Whisperr-Wizard-Task": task,
+                "X-Whisperr-Wizard-Fallback": sessionKey.startsWith("fallback:") ? "true" : "false",
               }),
         },
         body: JSON.stringify(body),
@@ -267,7 +279,10 @@ export function createOpenAIProvider(
             ? { kind, error, sessionId: activeConversationId, costUsd, turns }
             : { kind, sessionId: activeConversationId, costUsd, turns };
 
-      const allTools = [...invocation.tools, ...fileTools(invocation.cwd, invocation.allowRepoWrite)];
+      const allTools = [
+        ...invocation.tools,
+        ...fileTools(invocation.cwd, invocation.allowRepoWrite, invocation.repositoryAccess),
+      ];
       const toolsByName = new Map(allTools.map((tool) => [tool.name, tool]));
       const toolDefs = allTools.map((tool) => ({
         type: "function",
@@ -301,6 +316,9 @@ export function createOpenAIProvider(
             tools: toolDefs,
             ...(roleConfig.effort ? { reasoning: { effort: roleConfig.effort } } : {}),
             ...(roleConfig.serviceTier ? { service_tier: roleConfig.serviceTier } : {}),
+            ...(roleConfig.maxOutputTokens
+              ? { max_output_tokens: roleConfig.maxOutputTokens }
+              : {}),
           }, sessionKey, task);
           const items = response.output ?? [];
           const calls = items.filter(

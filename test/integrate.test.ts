@@ -61,7 +61,7 @@ test("verify steps resolve from the repository honestly", () => {
   assert.equal(runVerificationStatus([]), "unavailable");
 });
 
-test("cluster integration marks overflow clusters resumable and reviews the rest", async () => {
+test("cluster integration marks overflow clusters resumable and structurally verifies the rest", async () => {
   const worktreePath = mkdtempSync(join(tmpdir(), "integrate-"));
   const worktree: WorktreeHandle = { path: worktreePath, baseRef: "abc", repoPath: worktreePath };
   const models: EngineModelConfig = {
@@ -82,7 +82,8 @@ test("cluster integration marks overflow clusters resumable and reviews the rest
         mkdirSync(join(invocation.cwd, "src/reports"), { recursive: true });
         writeFileSync(
           join(invocation.cwd, "src/reports/share.ts"),
-          "func share() { WhisperrEvents.reportShared() }\n",
+          'import { WhisperrEvents } from "../../whisperr-events";\n' +
+            "export function share() { WhisperrEvents.reportShared() }\n",
         );
         return { kind: "completed", text: "edited", costUsd: 0.01, turns: 2 };
       }
@@ -114,7 +115,7 @@ test("cluster integration marks overflow clusters resumable and reviews the rest
   const outcome = await runClusterIntegration(deps, clusters, async () => "diff");
   assert.ok(editCalls >= 2);
   assert.equal(outcome.eventStatuses.get("trial_started"), "failed");
-  assert.equal(outcome.eventStatuses.get("report_shared"), "reviewed");
+  assert.equal(outcome.eventStatuses.get("report_shared"), "syntax_verified");
   const failed = outcome.clusters.find((cluster) =>
     cluster.events.some((event) => event.eventCode === "trial_started"),
   );
@@ -122,7 +123,7 @@ test("cluster integration marks overflow clusters resumable and reviews the rest
   assert.ok(saved.length >= 4);
 });
 
-test("invalid Terra cluster is rolled back before an Opus escalation", async () => {
+test("invalid Terra cluster is rolled back before a Sol escalation", async () => {
   const worktreePath = mkdtempSync(join(tmpdir(), "integrate-fallback-"));
   mkdirSync(join(worktreePath, "src/auth"), { recursive: true });
   writeFileSync(join(worktreePath, "src/auth/signup.ts"), "export function signup() {}\n");
@@ -134,6 +135,7 @@ test("invalid Terra cluster is rolled back before an Opus escalation", async () 
     review: { model: "opus", maxTurns: 5, maxMs: 1000 },
     cluster_edit: { model: "terra", maxTurns: 5, maxMs: 1000 },
     sdk_setup: { model: "opus", maxTurns: 5, maxMs: 1000 },
+    repair: { model: "sol", maxTurns: 5, maxMs: 1000 },
   };
   let discarded = 0;
   const provider: EngineProvider = {
@@ -146,10 +148,12 @@ test("invalid Terra cluster is rolled back before an Opus escalation", async () 
       return { kind: "completed", text: "VERDICT: pass", costUsd: 0, turns: 1 };
     },
     async invokeFallback(invocation) {
-      assert.equal(discarded, 1, "rollback must happen before Opus starts");
+      assert.equal(discarded, 1, "rollback must happen before Sol starts");
+      assert.equal(invocation.task, "repair");
       writeFileSync(
         join(invocation.cwd, "src/auth/signup.ts"),
-        "export function signup() { WhisperrEvents.trialStarted({ plan, seatCount }); }\n",
+        'import { WhisperrEvents } from "../../whisperr-events";\n' +
+          "export function signup() { WhisperrEvents.trialStarted({ plan, seatCount }); }\n",
       );
       return { kind: "completed", text: "fixed", costUsd: 0, turns: 1 };
     },
@@ -178,5 +182,5 @@ test("invalid Terra cluster is rolled back before an Opus escalation", async () 
     onClusterIntegrated: async () => {},
   }, [cluster], async () => "diff");
   assert.equal(discarded, 1);
-  assert.equal(outcome.eventStatuses.get("trial_started"), "reviewed");
+  assert.equal(outcome.eventStatuses.get("trial_started"), "syntax_verified");
 });

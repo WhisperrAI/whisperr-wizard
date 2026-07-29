@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createProgressSink } from "../src/engine/output.js";
@@ -11,6 +14,7 @@ import {
   runSelection,
   validateProposedEvent,
   type ProposedEvent,
+  type SurveyArtifact,
 } from "../src/engine/selection.js";
 import type { EngineModelConfig, EngineProvider, RoleInvocation } from "../src/engine/types.js";
 
@@ -34,7 +38,32 @@ function bootstrap(existing: string[] = []): RunBootstrap {
       id: `aev_${index}`, code, name: code, reasoning: "r", projectId: "wproj_1", payloadSchema: {},
     })) },
     ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
+    artifacts: [],
   };
+}
+
+const survey: SurveyArtifact = {
+  stack: { frameworks: ["Next.js"], packageManager: "npm", entryPoints: ["src/app.ts"] },
+  featureAreas: [{ name: "Auth", root: "src/auth", files: ["src/auth/signup.ts"] }],
+  identifyAnchors: [],
+  logoutAnchors: [],
+  existingAnalytics: [],
+  integratableCallSites: [{
+    file: "src/auth/signup.ts",
+    symbol: "completeSignup",
+    description: "Signup",
+    outcome: "Confirmed signup",
+    payloadFields: ["plan"],
+    similarPaths: [],
+  }],
+};
+
+function designRepo(): string {
+  const repo = mkdtempSync(join(tmpdir(), "selection-"));
+  mkdirSync(join(repo, "src/auth"), { recursive: true });
+  writeFileSync(join(repo, "src/auth/signup.ts"), "export function completeSignup() {}\n");
+  writeFileSync(join(repo, "src/app.ts"), "export const app = true;\n");
+  return repo;
 }
 
 function scriptedProvider(script: (invocation: RoleInvocation) => Promise<void>): EngineProvider {
@@ -88,30 +117,38 @@ test("validateProposedEvent normalizes and rejects PII payload fields", () => {
 
 test("runSelection collects valid proposals and blocks rejected codes", async () => {
   const provider = scriptedProvider(async (invocation) => {
-    const propose = invocation.tools.find((tool) => tool.name === "propose_event")!;
-    const finish = invocation.tools.find((tool) => tool.name === "finish_selection")!;
-    const first = await propose.handler({
-      code: "Trial Started",
-      name: "Trial started",
-      reasoning: "Activation moment.",
-      anchorFile: "src/auth/signup.ts",
-      anchorSymbol: "completeSignup",
-      payloadSchema: { plan: "Trial plan code" },
-    });
+    assert.equal(invocation.repositoryAccess?.mode, "none");
+    assert.equal(invocation.sessionKey, "design");
+    assert.deepEqual(invocation.tools.map((tool) => tool.name), [
+      "propose_event_batch",
+      "finish_event_design",
+    ]);
+    const propose = invocation.tools.find((tool) => tool.name === "propose_event_batch")!;
+    const finish = invocation.tools.find((tool) => tool.name === "finish_event_design")!;
+    const first = await propose.handler({ events: [{
+        code: "Trial Started",
+        name: "Trial started",
+        reasoning: "Activation moment.",
+        anchorFile: "src/auth/signup.ts",
+        anchorSymbol: "completeSignup",
+        payloadSchema: { plan: "Trial plan code" },
+      }] });
     assert.equal(first.ok, true);
-    const dupe = await propose.handler({
-      code: "trial_started", name: "x", reasoning: "x", anchorFile: "src/x.ts", payloadSchema: {},
-    });
+    const dupe = await propose.handler({ events: [{
+      code: "trial_started", name: "x", reasoning: "x",
+      anchorFile: "src/auth/signup.ts", anchorSymbol: "completeSignup", payloadSchema: {},
+    }] });
     assert.equal(dupe.ok, false);
-    const rejected = await propose.handler({
-      code: "noisy_event", name: "x", reasoning: "x", anchorFile: "src/x.ts", payloadSchema: {},
-    });
+    const rejected = await propose.handler({ events: [{
+      code: "noisy_event", name: "x", reasoning: "x",
+      anchorFile: "src/auth/signup.ts", anchorSymbol: "completeSignup", payloadSchema: {},
+    }] });
     assert.equal(rejected.ok, false);
     await finish.handler({ summary: "one activation event" });
   });
 
   const result = await runSelection(
-    provider, models, "/repo", bootstrap(["existing_event"]), "survey report", ["noisy_event"], sink,
+    provider, models, designRepo(), bootstrap(["existing_event"]), survey, ["noisy_event"], sink,
   );
   assert.equal(result.outcome, "completed");
   assert.equal(result.finished, true);
@@ -120,20 +157,21 @@ test("runSelection collects valid proposals and blocks rejected codes", async ()
   assert.equal(result.summary, "one activation event");
 });
 
-test("runSelection stays unfinished when finish_selection is never called", async () => {
+test("runSelection stays unfinished when finish_event_design is never called", async () => {
   const provider = scriptedProvider(async (invocation) => {
-    const propose = invocation.tools.find((tool) => tool.name === "propose_event")!;
-    await propose.handler({
+    const propose = invocation.tools.find((tool) => tool.name === "propose_event_batch")!;
+    await propose.handler({ events: [{
       code: "trial_started",
       name: "Trial started",
       reasoning: "Activation moment.",
       anchorFile: "src/auth/signup.ts",
+      anchorSymbol: "completeSignup",
       payloadSchema: {},
-    });
+    }] });
   });
 
   const result = await runSelection(
-    provider, models, "/repo", bootstrap(), "survey report", [], sink,
+    provider, models, designRepo(), bootstrap(), survey, [], sink,
   );
   assert.equal(result.outcome, "completed");
   assert.equal(result.finished, false);
@@ -143,12 +181,12 @@ test("runSelection stays unfinished when finish_selection is never called", asyn
 
 test("runSelection can finish with zero proposals", async () => {
   const provider = scriptedProvider(async (invocation) => {
-    const finish = invocation.tools.find((tool) => tool.name === "finish_selection")!;
+    const finish = invocation.tools.find((tool) => tool.name === "finish_event_design")!;
     await finish.handler({ summary: "nothing important enough" });
   });
 
   const result = await runSelection(
-    provider, models, "/repo", bootstrap(), "survey report", [], sink,
+    provider, models, designRepo(), bootstrap(), survey, [], sink,
   );
   assert.equal(result.outcome, "completed");
   assert.equal(result.finished, true);

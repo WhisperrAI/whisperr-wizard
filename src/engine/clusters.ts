@@ -43,35 +43,20 @@ export function deriveClusters(placements: EventPlacement[]): Cluster[] {
     }
   }
 
-  // Small slices from different files can share a cluster. Never combine two
-  // slices of the same file, and never exceed four events.
-  const clusters: Cluster[] = [];
-  const positions = new Map<string, number[]>();
-  for (const slice of fileSlices) {
-    let target = clusters.find((cluster) =>
-      !cluster.files.includes(slice.file) &&
-      cluster.events.length + slice.events.length <= MAX_CLUSTER_EVENTS
-    );
-    if (!target) {
-      target = { id: "", files: [], events: [], status: "pending", attempts: 0 };
-      clusters.push(target);
-    }
-    target.files.push(slice.file);
-    target.events.push(...slice.events);
-    const existing = positions.get(String(clusters.indexOf(target))) ?? [];
-    existing.push(slice.position);
-    positions.set(String(clusters.indexOf(target)), existing);
-  }
-  for (const [index, cluster] of clusters.entries()) {
-    cluster.files.sort();
-    cluster.events.sort((a, b) => a.eventCode.localeCompare(b.eventCode));
-    cluster.id = clusterIdFor(
-      cluster.files,
-      cluster.events.map((event) => event.eventId || event.eventCode),
-      Number((positions.get(String(index)) ?? [0]).join("")),
-    );
-  }
-  return clusters;
+  return fileSlices.map((slice) => {
+    const events = [...slice.events].sort((a, b) => a.eventCode.localeCompare(b.eventCode));
+    return {
+      id: clusterIdFor(
+        [slice.file],
+        events.map((event) => event.eventId || event.eventCode),
+        slice.position,
+      ),
+      files: [slice.file],
+      events,
+      status: "pending",
+      attempts: 0,
+    };
+  });
 }
 
 export function nextConcurrentClusters(
@@ -90,7 +75,7 @@ export function nextConcurrentClusters(
   return selected;
 }
 
-const TERMINAL_STATUSES: ClusterStatus[] = ["reviewed", "failed_resumable", "blocked"];
+const TERMINAL_STATUSES: ClusterStatus[] = ["verified", "reviewed", "failed_resumable", "blocked"];
 
 export function nextPendingCluster(clusters: Cluster[]): Cluster | undefined {
   return clusters.find((cluster) => cluster.status === "pending" || cluster.status === "editing");

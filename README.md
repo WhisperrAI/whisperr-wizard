@@ -15,24 +15,23 @@ hands you a clean diff to review and commit.
 
 The wizard is an agentic integrator with task-aware hybrid routing:
 
-1. **Plan** — one read-only pass charts your repo (entry points, end-user vs
-   admin auth flows, billing surfaces, existing analytics wrappers) and
-   decides, per event, exactly where it belongs (`file @ anchor`) with the
-   properties available in scope — or says honestly that it doesn't exist on
-   this surface. It also notes churn-relevant moments your plan is missing.
-2. **See the plan** — every placement is printed before a single line
-   changes. The run then proceeds on its own; pass `--review-plan` if you'd
-   rather confirm placements first, or `--propose-only` to keep new
-   events/interventions behind dashboard approval instead of adding them.
-3. **Wire** — Terra surveys and runs up to four file-isolated, four-event edit
-   clusters concurrently. Opus 5 handles SDK setup and automatically retries a
-   clean cluster when Terra is unavailable, quota-limited, incomplete, or
-   invalid. No two workers edit the same file concurrently.
-4. **Review** — up to two fast Opus 5 tasks re-read diffs and fix wrong subjects,
-   wrong lifecycle moments, and missing discriminators.
-5. **Verify** — placements receive structural checks before their patches merge,
-   then one full build/lint runs after all serial merges. Failures get an Opus
-   repair pass. Every event ends
+1. **Survey** — Opus 5 low/fast maps the stack, feature areas, auth lifecycle,
+   existing analytics, and integratable call sites into a source-free run
+   artifact.
+2. **Design** — a separate Opus 5 low/fast session designs and validates the
+   complete event batch from that saved survey. The batch is frozen and
+   registered atomically; there is no terminal event-approval prompt.
+3. **Set up** — another isolated Opus 5 low/fast session installs and initializes
+   the SDK, binds generated wrappers, wires `identify()` for login/restoration,
+   and wires `reset()` for logout.
+4. **Wire** — Terra 5.6 medium/priority runs a rolling queue of up to four
+   file-isolated edit clusters, with no more than four events per cluster and
+   no concurrent edits to the same file.
+5. **Review** — Sol 5.6 medium/priority reviews file-isolated event placements
+   for outcome timing, deduplication, payload correctness, PII safety, and
+   wrapper usage, repairing only failed files.
+6. **Verify** — the wizard runs the repository's available typecheck, lint, and
+   build scripts. Sol gets at most two targeted repair cycles. Every event ends
    the run as `✓ wired @ file` or `○ skipped — reason`.
 
 Multi-surface aware: run it in your web app, then your mobile app, then your

@@ -2,13 +2,13 @@ import * as p from "@clack/prompts";
 
 import { postRunReport } from "../core/report.js";
 import { pollFirstEvent } from "../core/verify.js";
+import { packageVersion } from "../core/version.js";
 import type { Playbook, WizardConfig, WizardSession } from "../types.js";
 import { createProgressSink } from "./output.js";
 import { runEngine } from "./orchestrator.js";
 import { createClaudeProvider } from "./providers/claude.js";
 import { createOpenAIProvider } from "./providers/openai.js";
 import { createRoutedProvider } from "./providers/router.js";
-import type { ProposedEvent } from "./selection.js";
 import type { EngineModelConfig } from "./types.js";
 
 const MINUTE = 60_000;
@@ -17,19 +17,58 @@ export function engineModelConfig(config: WizardConfig): EngineModelConfig {
   const model = (task: string, fallback: string) =>
     process.env[`WHISPERR_WIZARD_ENGINE_${task.toUpperCase()}_MODEL`]?.trim() || fallback;
   const terra = "gpt-5.6-terra";
+  const sol = "gpt-5.6-sol";
   const opus = "claude-opus-5";
   const opusOnly = process.env.WHISPERR_WIZARD_PRESET?.trim() === "claude-default" ||
     config.offline === true;
-  const survey = opusOnly
-    ? { model: model("survey", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 5 * MINUTE }
-    : { model: model("survey", terra), effort: "medium", serviceTier: "priority" as const, maxTurns: 30, maxMs: 5 * MINUTE };
-  const design = { model: model("design", opus), effort: "medium", fastMode: true, maxTurns: 80, maxMs: 20 * MINUTE };
-  const sdkSetup = { model: model("sdk_setup", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE };
+  if (opusOnly) {
+    // Emergency rollback preset intentionally preserves the previous Opus-only
+    // behavior and budgets.
+    const survey = { model: model("survey", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 5 * MINUTE };
+    const design = { model: model("design", opus), effort: "medium", fastMode: true, maxTurns: 80, maxMs: 20 * MINUTE };
+    const sdkSetup = { model: model("sdk_setup", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE };
+    const clusterEdit = { model: model("cluster_edit", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE };
+    const repair = { model: model("repair", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
+    const review = { model: model("review", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
+    return {
+      survey,
+      design,
+      edit: sdkSetup,
+      review,
+      sdk_setup: sdkSetup,
+      cluster_edit: clusterEdit,
+      repair,
+    };
+  }
+  const survey = { model: model("survey", opus), effort: "low", fastMode: true, maxTurns: 30, maxMs: 5 * MINUTE };
+  const design = { model: model("design", opus), effort: "low", fastMode: true, maxTurns: 20, maxMs: 5 * MINUTE };
+  const sdkSetup = { model: model("sdk_setup", opus), effort: "low", fastMode: true, maxTurns: 30, maxMs: 6 * MINUTE };
   const clusterEdit = opusOnly
     ? { model: model("cluster_edit", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE }
-    : { model: model("cluster_edit", terra), effort: "medium", serviceTier: "priority" as const, maxTurns: 30, maxMs: 5 * MINUTE };
-  const repair = { model: model("repair", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
-  const review = { model: model("review", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
+    : {
+        model: model("cluster_edit", terra),
+        effort: "medium",
+        serviceTier: "priority" as const,
+        maxTurns: 20,
+        maxMs: 4 * MINUTE,
+        maxOutputTokens: 8_000,
+      };
+  const repair = {
+    model: model("repair", sol),
+    effort: "medium",
+    serviceTier: "priority" as const,
+    maxTurns: 30,
+    maxMs: 8 * MINUTE,
+    maxOutputTokens: 12_000,
+  };
+  const review = {
+    model: model("review", sol),
+    effort: "medium",
+    serviceTier: "priority" as const,
+    maxTurns: 8,
+    maxMs: 3 * MINUTE,
+    maxOutputTokens: 4_000,
+  };
   return {
     survey,
     design,
@@ -49,17 +88,14 @@ export function engineProvider(config: WizardConfig, session: WizardSession) {
     return createRoutedProvider({}, claude, 2);
   }
   const openai = createOpenAIProvider(config, session);
-  if (preset === "sol-design") {
-    return createRoutedProvider({
-      survey: { provider: openai, fallbackConfig: models.sdk_setup },
-      design: { provider: openai, fallbackConfig: models.design },
-      review: { provider: openai, fallbackConfig: models.review },
-    }, claude);
-  }
   return createRoutedProvider({
-    survey: { provider: openai, concurrency: 4, fallbackConfig: models.sdk_setup },
-    cluster_edit: { provider: openai, concurrency: 4, fallbackConfig: models.sdk_setup },
-  }, claude, 2);
+    survey: { provider: claude, concurrency: 3, fallbackConfig: models.repair },
+    design: { provider: claude, concurrency: 3, fallbackConfig: models.repair },
+    sdk_setup: { provider: claude, concurrency: 2, fallbackConfig: models.repair },
+    cluster_edit: { provider: openai, concurrency: 4, fallbackConfig: models.repair },
+    review: { provider: openai, concurrency: 2, fallbackConfig: models.review },
+    repair: { provider: openai, concurrency: 2, fallbackConfig: models.repair },
+  }, openai, 2);
 }
 
 export interface EngineFlowResult {
@@ -77,6 +113,7 @@ export async function tryEngineFlow(options: {
 }): Promise<EngineFlowResult> {
   const { repoPath, fingerprint, config, session, playbook, theme } = options;
   const startedAt = Date.now();
+  const models = engineModelConfig(config);
   const sink = createProgressSink({
     json: false,
     isTTY: Boolean(process.stdout.isTTY),
@@ -89,7 +126,7 @@ export async function tryEngineFlow(options: {
     config,
     session,
     provider: engineProvider(config, session),
-    models: engineModelConfig(config),
+    models,
     target: playbook.target.id,
     projectKind: ["node", "python", "php", "go", "express", "django", "fastapi", "laravel", "spring-boot"].includes(
       playbook.target.id,
@@ -98,9 +135,6 @@ export async function tryEngineFlow(options: {
       : "frontend",
     playbookSystemPrompt: playbook.systemPrompt,
     sink,
-    callbacks: {
-      reviewEvents: async (proposed) => reviewEventsInTerminal(proposed, theme),
-    },
   });
 
   if (result.kind === "wrong_mode") {
@@ -120,11 +154,22 @@ export async function tryEngineFlow(options: {
     target: playbook.target.id,
     repo_fingerprint: fingerprint,
     identify_wired: result.identifyWired,
-    verified: null,
+    verified: result.verificationStatus === "passed"
+      ? true
+      : result.verificationStatus === "failed"
+        ? false
+        : null,
+    verification_status: result.verificationStatus,
     cost_usd: 0,
     duration_ms: Date.now() - startedAt,
     summary: result.summary.slice(0, 2000),
     events: result.reportEvents,
+    wizard_version: packageVersion(),
+    planner_model: models.survey.model,
+    editor_model: models.cluster_edit?.model ?? models.edit.model,
+    effort: models.cluster_edit?.effort ?? models.edit.effort,
+    phase_timings: result.phaseTimings,
+    model_routes: result.modelRoutes,
     exit_class: result.kind === "completed" ? "engine_completed" : "engine_partial",
   });
 
@@ -139,34 +184,4 @@ export async function tryEngineFlow(options: {
     );
   }
   return { handled: true, exitCode: result.kind === "completed" ? 0 : 1 };
-}
-
-async function reviewEventsInTerminal(
-  proposed: ProposedEvent[],
-  theme: { bright: (text: string) => string; muted: (text: string) => string },
-): Promise<ProposedEvent[] | null> {
-  if (proposed.length === 0) {
-    return [];
-  }
-  const lines = proposed.map((event) => {
-    const fields = Object.keys(event.payloadSchema);
-    return [
-      `${theme.bright(event.code)} — ${event.name}`,
-      `  ${event.reasoning}`,
-      `  anchor: ${event.anchorFile}${event.anchorSymbol ? ` (${event.anchorSymbol})` : ""}`,
-      fields.length > 0 ? `  payload: ${fields.join(", ")}` : "  payload: none",
-    ].join("\n");
-  });
-  p.note(lines.join("\n\n"), `Proposed events (${proposed.length})`);
-  const selection = await p.multiselect({
-    message: "Register and integrate these events? Deselect any you don't want.",
-    options: proposed.map((event) => ({ value: event.code, label: event.code, hint: event.name })),
-    initialValues: proposed.map((event) => event.code),
-    required: false,
-  });
-  if (p.isCancel(selection)) {
-    return null;
-  }
-  const chosen = new Set(selection as string[]);
-  return proposed.filter((event) => chosen.has(event.code));
 }

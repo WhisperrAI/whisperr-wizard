@@ -3,8 +3,8 @@ export const SURVEY_SYSTEM_PROMPT = [
   "Map the repository so a later pass can pick the product's important lifecycle events.",
   "You cannot edit files. Be fast and decisive; read entry points and feature roots, not every file.",
   "",
-  "Report, in plain markdown:",
-  "1. Stack: frameworks, package manager, app entry point file.",
+  "Finish by calling finish_survey exactly once. Its structured fields must contain:",
+  "1. Stack: frameworks, package manager, and app entry point files.",
   "2. Feature areas: name, root directory, and every relevant file containing",
   "   committed end-user actions or meaningful lifecycle transitions.",
   "3. The end-user identify() anchor: the login/signup success and session-restore call sites for the",
@@ -13,7 +13,8 @@ export const SURVEY_SYSTEM_PROMPT = [
   "5. Exhaustive inventory of integratable call sites: file, function/symbol,",
   "   confirmed outcome or state transition, available non-PII payload fields,",
   "   and whether similar paths exist elsewhere.",
-  "Cite concrete file paths for every claim. Do not propose event names yet.",
+  "Cite concrete repository-relative paths for every claim. Do not propose event names yet.",
+  "Never copy raw source code into the result.",
 ].join("\n");
 
 export function surveyUserPrompt(repoPath: string, onboardingContext: string): string {
@@ -22,14 +23,14 @@ export function surveyUserPrompt(repoPath: string, onboardingContext: string): s
     "",
     onboardingContext ? "Business context from onboarding:\n" + onboardingContext : "",
     "",
-    "Produce the survey report now.",
+    "Complete the structured survey now.",
   ].join("\n");
 }
 
 export const SELECTION_SYSTEM_PROMPT = [
   "You are the event-selection pass of the Whisperr integration wizard.",
   "From the survey report and business context, choose the IMPORTANT product events this codebase",
-  "can actually emit, and propose each one with the propose_event tool.",
+  "can actually emit, and propose them with propose_event_batch calls.",
   "",
   "Rules — these are hard constraints:",
   "- Only propose an event with a concrete call site: a real file and function where the committed",
@@ -57,7 +58,7 @@ export const SELECTION_SYSTEM_PROMPT = [
   "  government ids, usernames, passwords, device ids, or IP addresses. Domain metrics are welcome.",
   "- The end user is the paying customer/consumer. Never instrument admin, staff, or operator actions.",
   "",
-  "Call propose_event once per event. When done, call finish_selection with a one-line summary.",
+  "Use only propose_event_batch for proposals. When done, call finish_event_design with a one-line summary.",
 ].join("\n");
 
 export function selectionUserPrompt(
@@ -67,7 +68,7 @@ export function selectionUserPrompt(
   rejectedCodes: string[],
 ): string {
   return [
-    "Survey report:",
+    "Saved structured survey artifact:",
     surveyReport,
     "",
     onboardingContext ? "Business context from onboarding:\n" + onboardingContext : "",
