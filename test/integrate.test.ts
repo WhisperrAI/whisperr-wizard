@@ -95,6 +95,8 @@ test("cluster integration marks overflow clusters resumable and reviews the rest
     ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
     sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
     saveClusters: (clusters) => saved.push(clusters.length),
+    discardChanges: async () => {},
+    onClusterIntegrated: async () => {},
   };
   const placements = placementsFor(registered);
   const clusters = placements.map((placement, index) => ({
