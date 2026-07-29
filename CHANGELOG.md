@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.0
+
+- Make the hybrid router the default: Terra medium with priority processing
+  surveys and file-isolated event clusters, while Opus 5 medium with fast mode
+  designs events, initializes the SDK, reviews changes, and repairs failures.
+- Run four independent Terra clusters concurrently with same-file
+  serialization, serial patch merging, per-event server checkpoints, and
+  automatic clean rollback plus Opus escalation for incomplete or invalid
+  Terra work.
+- Batch event design for large universes, replace per-cluster full builds with
+  structural checks, and run one final verification followed by targeted Opus
+  repair.
+- Preserve exact resumable progress across task limits and interruptions,
+  improve nested gateway error reporting, and retain `claude-default` as the
+  emergency Opus-only preset.
+
 ## 0.7.3
 
 - Run every default Wizard engine role on Claude Opus 5 with Anthropic fast

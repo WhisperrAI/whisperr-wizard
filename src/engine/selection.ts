@@ -16,6 +16,7 @@ import type {
   EventPlacement,
   RoleOutcome,
 } from "./types.js";
+import { modelConfigFor } from "./types.js";
 
 export interface ProposedEvent {
   code: string;
@@ -137,6 +138,8 @@ export async function runSurvey(
   const outcome = await provider.invoke(
     {
       role: "survey",
+      task: "survey",
+      sessionKey: "survey",
       systemPrompt: SURVEY_SYSTEM_PROMPT,
       userPrompt: surveyUserPrompt(repoPath, renderOnboardingContext(bootstrap.onboardingContext)),
       tools: [],
@@ -144,7 +147,7 @@ export async function runSurvey(
       cwd: repoPath,
       resumeSessionId,
     },
-    models.survey,
+    modelConfigFor(models, "survey", "survey"),
     (action) => sink.emit({ phase: "surveying", action }),
   );
   return { report: outcome.kind === "completed" ? outcome.text : "", outcome };
@@ -221,6 +224,39 @@ export async function runSelection(
     },
   };
 
+  const proposeBatchTool: EngineTool = {
+    name: "propose_event_batch",
+    description:
+      "Propose a batch of important, concretely-anchored product events in one tool call.",
+    inputSchema: {
+      events: z.array(z.object(proposeTool.inputSchema)).min(1).max(200),
+    },
+    jsonSchema: {
+      type: "object",
+      properties: {
+        events: {
+          type: "array",
+          minItems: 1,
+          maxItems: 200,
+          items: proposeTool.jsonSchema,
+        },
+      },
+      required: ["events"],
+    },
+    handler: async (input) => {
+      const events = Array.isArray(input.events) ? input.events : [];
+      const results: Record<string, unknown>[] = [];
+      for (const event of events) {
+        results.push(await proposeTool.handler((event ?? {}) as Record<string, unknown>));
+      }
+      return {
+        ok: results.every((result) => result.ok === true),
+        accepted: results.filter((result) => result.ok === true).length,
+        results,
+      };
+    },
+  };
+
   const finishTool: EngineTool = {
     name: "finish_selection",
     description: "Signal that every important event has been proposed.",
@@ -241,6 +277,7 @@ export async function runSelection(
   const outcome = await provider.invoke(
     {
       role: "design",
+      task: "design",
       systemPrompt: SELECTION_SYSTEM_PROMPT,
       userPrompt: selectionUserPrompt(
         surveyReport,
@@ -248,11 +285,11 @@ export async function runSelection(
         existingEventCodes,
         rejectedCodes,
       ),
-      tools: [proposeTool, finishTool],
+      tools: [proposeBatchTool, proposeTool, finishTool],
       allowRepoWrite: false,
       cwd: repoPath,
     },
-    models.design,
+    modelConfigFor(models, "design", "design"),
     (action) => sink.emit({ phase: "designing", action }),
   );
 

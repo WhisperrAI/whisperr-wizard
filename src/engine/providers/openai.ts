@@ -26,7 +26,7 @@ interface ResponsePayload {
   id?: string;
   output?: Array<Record<string, unknown>>;
   output_text?: string;
-  error?: { message?: string };
+  error?: { message?: string; code?: string; error?: { message?: string; code?: string } };
 }
 
 function jailedPath(cwd: string, candidate: string): string {
@@ -145,9 +145,15 @@ export function createOpenAIProvider(
   session: WizardSession,
 ): EngineProvider {
   let runId: string | undefined;
-  let conversationId: string | undefined;
+  const conversationIds = new Map<string, string>();
+  let legacyConversationId: string | undefined;
 
-  const gatewayFetch = async (path: string, body: Record<string, unknown>): Promise<ResponsePayload> => {
+  const gatewayFetch = async (
+    path: string,
+    body: Record<string, unknown>,
+    sessionKey: string,
+    task: string,
+  ): Promise<ResponsePayload> => {
     if (!runId) {
       throw new Error("OpenAI provider used before the run was created");
     }
@@ -158,6 +164,12 @@ export function createOpenAIProvider(
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${session.token}`,
+          ...(sessionKey === "legacy"
+            ? {}
+            : {
+                "X-Whisperr-Wizard-Session-Key": sessionKey,
+                "X-Whisperr-Wizard-Task": task,
+              }),
         },
         body: JSON.stringify(body),
       },
@@ -170,41 +182,67 @@ export function createOpenAIProvider(
       payload = {};
     }
     if (!response.ok) {
-      const detail = (payload as { message?: string; code?: string }).message ?? text;
+      const top = payload as {
+        message?: string;
+        code?: string;
+        error?: { message?: string; code?: string; error?: { message?: string; code?: string } };
+      };
+      const nested = top.error?.error ?? top.error;
+      const detail = top.message ?? nested?.message ?? text;
       const error = new Error(detail || `gateway request failed (${response.status})`);
-      (error as { code?: string }).code = (payload as { code?: string }).code;
+      (error as { code?: string }).code = top.code ?? nested?.code;
       throw error;
     }
     return payload;
   };
 
-  const ensureConversation = async (resumeId?: string): Promise<string> => {
-    if (conversationId) {
-      return conversationId;
+  const ensureConversation = async (
+    sessionKey: string,
+    task: string,
+    resumeId?: string,
+  ): Promise<string> => {
+    const existing = sessionKey === "legacy"
+      ? legacyConversationId
+      : conversationIds.get(sessionKey);
+    if (existing) {
+      return existing;
     }
     if (resumeId) {
-      conversationId = resumeId;
+      if (sessionKey === "legacy") {
+        legacyConversationId = resumeId;
+      } else {
+        conversationIds.set(sessionKey, resumeId);
+      }
       return resumeId;
     }
     try {
-      const created = await gatewayFetch("/v1/conversations", {});
-      conversationId = created.id;
+      const created = await gatewayFetch("/v1/conversations", {}, sessionKey, task);
+      if (created.id) {
+        if (sessionKey === "legacy") {
+          legacyConversationId = created.id;
+        } else {
+          conversationIds.set(sessionKey, created.id);
+        }
+      }
     } catch (error) {
       if ((error as { code?: string }).code !== "conversation_already_bound") {
         throw error;
       }
     }
-    if (!conversationId) {
+    const createdId = sessionKey === "legacy"
+      ? legacyConversationId
+      : conversationIds.get(sessionKey);
+    if (!createdId) {
       throw new Error("wizard run already has a bound conversation; rerun with its resume state");
     }
-    return conversationId;
+    return createdId;
   };
 
   return {
     name: "openai-gateway",
     onRunReady(readyRunId: string, resumeSessionId?: string): void {
       runId = readyRunId;
-      conversationId = resumeSessionId;
+      legacyConversationId = resumeSessionId;
     },
     async invoke(
       invocation: RoleInvocation,
@@ -213,16 +251,21 @@ export function createOpenAIProvider(
     ): Promise<RoleOutcome> {
       let costUsd = 0;
       let turns = 0;
+      const task = invocation.task ?? invocation.role;
+      const sessionKey = invocation.sessionKey?.trim() || "legacy";
+      let activeConversationId = sessionKey === "legacy"
+        ? legacyConversationId
+        : conversationIds.get(sessionKey);
       const outcome = (
         kind: "completed" | "context_overflow" | "budget_exhausted" | "failed",
         text = "",
         error = "",
       ): RoleOutcome =>
         kind === "completed"
-          ? { kind, text, sessionId: conversationId, costUsd, turns }
+          ? { kind, text, sessionId: activeConversationId, costUsd, turns }
           : kind === "failed"
-            ? { kind, error, sessionId: conversationId, costUsd, turns }
-            : { kind, sessionId: conversationId, costUsd, turns };
+            ? { kind, error, sessionId: activeConversationId, costUsd, turns }
+            : { kind, sessionId: activeConversationId, costUsd, turns };
 
       const allTools = [...invocation.tools, ...fileTools(invocation.cwd, invocation.allowRepoWrite)];
       const toolsByName = new Map(allTools.map((tool) => [tool.name, tool]));
@@ -234,7 +277,12 @@ export function createOpenAIProvider(
       }));
 
       try {
-        const conversation = await ensureConversation(invocation.resumeSessionId);
+        const conversation = await ensureConversation(
+          sessionKey,
+          task,
+          invocation.resumeSessionId,
+        );
+        activeConversationId = conversation;
         const deadline = Date.now() + roleConfig.maxMs;
         let input: Array<Record<string, unknown>> = [
           { role: "user", content: invocation.userPrompt },
@@ -252,7 +300,8 @@ export function createOpenAIProvider(
             input,
             tools: toolDefs,
             ...(roleConfig.effort ? { reasoning: { effort: roleConfig.effort } } : {}),
-          });
+            ...(roleConfig.serviceTier ? { service_tier: roleConfig.serviceTier } : {}),
+          }, sessionKey, task);
           const items = response.output ?? [];
           const calls = items.filter(
             (item) => item.type === "function_call",

@@ -185,3 +185,48 @@ test("routed provider dispatches by role and fans out run binding", async () => 
   assert.ok(calls.includes("ready:openai") && calls.includes("ready:claude"));
   assert.deepEqual(calls.filter((entry) => entry.startsWith("invoke:")), ["invoke:openai", "invoke:claude"]);
 });
+
+test("task router opens the Terra circuit after quota and continues with Opus", async () => {
+  const calls: string[] = [];
+  const terra: EngineProvider = {
+    name: "terra",
+    invoke: async () => {
+      calls.push("terra");
+      return { kind: "failed", error: "wizard model quota is exhausted", costUsd: 0, turns: 1 };
+    },
+  };
+  const opus: EngineProvider = {
+    name: "opus",
+    invoke: async (_invocation, config) => {
+      calls.push(`opus:${config.model}`);
+      return { kind: "completed", text: "done", costUsd: 0, turns: 1 };
+    },
+  };
+  const routed = createRoutedProvider({
+    cluster_edit: {
+      provider: terra,
+      concurrency: 4,
+      fallbackConfig: { model: "claude-opus-5", effort: "medium", maxTurns: 60, maxMs: 1000 },
+    },
+  }, opus, 2);
+  const invocation = {
+    role: "edit" as const,
+    task: "cluster_edit" as const,
+    systemPrompt: "",
+    userPrompt: "",
+    tools: [],
+    allowRepoWrite: true,
+    cwd: "/tmp",
+  };
+  const first = await routed.invoke(invocation, roleConfig, () => {});
+  assert.equal(first.kind, "failed", "the current dirty attempt must be rolled back by the caller");
+  const escalated = await routed.invokeFallback?.(
+    { ...invocation, task: "repair" },
+    { model: "claude-opus-5", effort: "medium", maxTurns: 60, maxMs: 1000 },
+    () => {},
+  );
+  assert.equal(escalated?.kind, "completed");
+  const next = await routed.invoke(invocation, roleConfig, () => {});
+  assert.equal(next.kind, "completed");
+  assert.deepEqual(calls, ["terra", "opus:claude-opus-5", "opus:claude-opus-5"]);
+});

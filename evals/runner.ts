@@ -111,11 +111,35 @@ function scriptedProvider(expectations: Expectations): EngineProvider {
         return { kind: "completed" as const, text: "selected", costUsd: 0, turns: 1 };
       }
       if (invocation.role === "edit") {
-        for (const event of expectations.expectedEvents) {
+        if (invocation.task === "sdk_setup") {
+          writeFileSync(
+            join(invocation.cwd, "src", "whisperr-setup.ts"),
+            [
+              "export function setupWhisperr(userId: string): void {",
+              "  Whisperr.initialize();",
+              "  bindWhisperr(Whisperr);",
+              "  Whisperr.identify(userId);",
+              "}",
+              "",
+            ].join("\n"),
+          );
+          return { kind: "completed" as const, text: "setup", costUsd: 0, turns: 1 };
+        }
+        const assigned = expectations.expectedEvents.filter((event) =>
+          invocation.userPrompt.includes(event.code)
+        );
+        for (const event of assigned) {
           const anchor = join(invocation.cwd, event.anchorFile);
           const original = readFileSync(anchor, "utf8");
           if (!original.includes(event.code)) {
-            writeFileSync(anchor, original + `\n// wired:${event.code}\n`);
+            const wrapper = event.code
+              .split("_")
+              .map((part, index) => index === 0 ? part : part[0]!.toUpperCase() + part.slice(1))
+              .join("");
+            writeFileSync(
+              anchor,
+              original + `\nWhisperrEvents.${wrapper}({ plan: "eval" }); // wired:${event.code}\n`,
+            );
           }
         }
         return { kind: "completed" as const, text: "edited", costUsd: 0, turns: 1 };

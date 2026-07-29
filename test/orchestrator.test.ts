@@ -139,8 +139,15 @@ test("orchestrator runs select -> register -> integrate -> apply end to end", as
         return { kind: "completed", text: "done", costUsd: 0, turns: 2 };
       }
       if (invocation.role === "edit") {
-        writeFileSync(join(invocation.cwd, "signup.swift"),
-          "func completeSignup() { WhisperrEvents.signupCompleted(plan: plan) }\n");
+        if (invocation.task === "sdk_setup") {
+          writeFileSync(
+            join(invocation.cwd, "startup.swift"),
+            "func configure() { Whisperr.initialize(); WhisperrEvents.bind(track: Whisperr.track); Whisperr.identify(userId) }\n",
+          );
+        } else {
+          writeFileSync(join(invocation.cwd, "signup.swift"),
+            "func completeSignup() { WhisperrEvents.signupCompleted(plan: plan) }\n");
+        }
         return { kind: "completed", text: "edited", costUsd: 0, turns: 2 };
       }
       return { kind: "completed", text: "VERDICT: pass", costUsd: 0, turns: 1 };
@@ -175,13 +182,13 @@ test("orchestrator runs select -> register -> integrate -> apply end to end", as
   assert.equal(state.completions.length, 1);
   const completion = state.completions[0] as { events: Array<{ status: string }>; identifyWired: boolean };
   assert.equal(completion.events.length, 1);
-  assert.equal(completion.events[0].status, "applied");
+  assert.equal(completion.events[0].status, "reviewed");
   assert.ok(state.patches.some((patch) => {
     const evidence = patch.integrationEvidence as {
       events?: Array<{ eventCode?: string; status?: string }>;
     } | undefined;
     return evidence?.events?.some(
-      (event) => event.eventCode === "signup_completed" && event.status === "applied",
+      (event) => event.eventCode === "signup_completed" && event.status === "reviewed",
     );
   }), "integrated event progress should be checkpointed before completion");
   assert.equal(result.applied, true);
@@ -235,6 +242,7 @@ test("orchestrator verifies server progress and resumes without survey or design
     join(repo, "signup.swift"),
     [
       "func configure() { WhisperrEvents.bind(track: track) }",
+      "func sdkSetup() { Whisperr.initialize(); Whisperr.identify(userId) }",
       "func completeSignup() { WhisperrEvents.signupCompleted() }",
       "",
     ].join("\n"),
@@ -321,8 +329,15 @@ test("orchestrator marks the run failed when completion is rejected", async () =
           return { kind: "completed", text: "done", costUsd: 0, turns: 2 };
         }
         if (invocation.role === "edit") {
-          writeFileSync(join(invocation.cwd, "signup.swift"),
-            "func completeSignup() { WhisperrEvents.signupCompleted() }\n");
+          if (invocation.task === "sdk_setup") {
+            writeFileSync(
+              join(invocation.cwd, "startup.swift"),
+              "func configure() { Whisperr.initialize(); WhisperrEvents.bind(track: Whisperr.track); Whisperr.identify(userId) }\n",
+            );
+          } else {
+            writeFileSync(join(invocation.cwd, "signup.swift"),
+              "func completeSignup() { WhisperrEvents.signupCompleted() }\n");
+          }
           return { kind: "completed", text: "edited", costUsd: 0, turns: 1 };
         }
         return { kind: "completed", text: "VERDICT: pass", costUsd: 0, turns: 1 };

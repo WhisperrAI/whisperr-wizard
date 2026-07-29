@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -79,6 +79,11 @@ test("cluster integration marks overflow clusters resumable and reviews the rest
         if (invocation.userPrompt.includes("trial_started")) {
           return { kind: "context_overflow", costUsd: 0, turns: 1 };
         }
+        mkdirSync(join(invocation.cwd, "src/reports"), { recursive: true });
+        writeFileSync(
+          join(invocation.cwd, "src/reports/share.ts"),
+          "func share() { WhisperrEvents.reportShared() }\n",
+        );
         return { kind: "completed", text: "edited", costUsd: 0.01, turns: 2 };
       }
       return { kind: "completed", text: "VERDICT: pass", costUsd: 0.001, turns: 1 };
@@ -109,10 +114,69 @@ test("cluster integration marks overflow clusters resumable and reviews the rest
   const outcome = await runClusterIntegration(deps, clusters, async () => "diff");
   assert.ok(editCalls >= 2);
   assert.equal(outcome.eventStatuses.get("trial_started"), "failed");
-  assert.equal(outcome.eventStatuses.get("report_shared"), "applied");
+  assert.equal(outcome.eventStatuses.get("report_shared"), "reviewed");
   const failed = outcome.clusters.find((cluster) =>
     cluster.events.some((event) => event.eventCode === "trial_started"),
   );
   assert.equal(failed?.status, "failed_resumable");
   assert.ok(saved.length >= 4);
+});
+
+test("invalid Terra cluster is rolled back before an Opus escalation", async () => {
+  const worktreePath = mkdtempSync(join(tmpdir(), "integrate-fallback-"));
+  mkdirSync(join(worktreePath, "src/auth"), { recursive: true });
+  writeFileSync(join(worktreePath, "src/auth/signup.ts"), "export function signup() {}\n");
+  const worktree: WorktreeHandle = { path: worktreePath, baseRef: "abc", repoPath: worktreePath };
+  const models: EngineModelConfig = {
+    survey: { model: "terra", maxTurns: 5, maxMs: 1000 },
+    design: { model: "opus", maxTurns: 5, maxMs: 1000 },
+    edit: { model: "opus", maxTurns: 5, maxMs: 1000 },
+    review: { model: "opus", maxTurns: 5, maxMs: 1000 },
+    cluster_edit: { model: "terra", maxTurns: 5, maxMs: 1000 },
+    sdk_setup: { model: "opus", maxTurns: 5, maxMs: 1000 },
+  };
+  let discarded = 0;
+  const provider: EngineProvider = {
+    name: "hybrid",
+    async invoke(invocation) {
+      if (invocation.task === "cluster_edit") {
+        writeFileSync(join(invocation.cwd, "src/auth/signup.ts"), "export function signup() { /* incomplete */ }\n");
+        return { kind: "completed", text: "incomplete", costUsd: 0, turns: 1 };
+      }
+      return { kind: "completed", text: "VERDICT: pass", costUsd: 0, turns: 1 };
+    },
+    async invokeFallback(invocation) {
+      assert.equal(discarded, 1, "rollback must happen before Opus starts");
+      writeFileSync(
+        join(invocation.cwd, "src/auth/signup.ts"),
+        "export function signup() { WhisperrEvents.trialStarted({ plan, seatCount }); }\n",
+      );
+      return { kind: "completed", text: "fixed", costUsd: 0, turns: 1 };
+    },
+  };
+  const cluster = {
+    id: "cluster_fallback",
+    files: ["src/auth/signup.ts"],
+    events: [placementsFor(registered)[0]!],
+    status: "pending" as const,
+    attempts: 0,
+  };
+  const outcome = await runClusterIntegration({
+    provider,
+    models,
+    worktree,
+    target: "nextjs",
+    playbookSystemPrompt: "system",
+    registered,
+    ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
+    sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
+    saveClusters: () => {},
+    discardChanges: async () => {
+      discarded += 1;
+      writeFileSync(join(worktreePath, "src/auth/signup.ts"), "export function signup() {}\n");
+    },
+    onClusterIntegrated: async () => {},
+  }, [cluster], async () => "diff");
+  assert.equal(discarded, 1);
+  assert.equal(outcome.eventStatuses.get("trial_started"), "reviewed");
 });

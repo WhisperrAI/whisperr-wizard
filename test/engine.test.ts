@@ -10,6 +10,7 @@ import {
   clustersComplete,
   deriveClusters,
   MAX_CLUSTER_EVENTS,
+  nextConcurrentClusters,
   nextPendingCluster,
   transitionCluster,
 } from "../src/engine/clusters.js";
@@ -70,6 +71,50 @@ test("small directories merge instead of becoming one-event clusters", () => {
   ]);
   assert.ok(clusters.length < 4, `expected merged clusters, got ${clusters.length}`);
 });
+
+test("cluster IDs stay unique across slices and concurrent waves lock files", () => {
+  const placements = Array.from({ length: 10 }, (_, index) =>
+    placement(`same_file_${index}`, "src/shared.ts")
+  );
+  placements.push(
+    placement("other_a", "src/a.ts"),
+    placement("other_b", "src/b.ts"),
+    placement("other_c", "src/c.ts"),
+    placement("other_d", "src/d.ts"),
+  );
+  const clusters = deriveClusters(placements);
+  assert.equal(new Set(clusters.map((cluster) => cluster.id)).size, clusters.length);
+  assert.ok(clusters.every((cluster) => cluster.events.length <= 4));
+
+  const wave = nextConcurrentClusters(clusters, 4);
+  assert.ok(wave.length <= 4);
+  const files = wave.flatMap((cluster) => cluster.files);
+  assert.equal(new Set(files).size, files.length, "a file may be owned by only one concurrent worker");
+  assert.equal(wave.filter((cluster) => cluster.files.includes("src/shared.ts")).length, 1);
+});
+
+for (const eventCount of [20, 100, 200]) {
+  test(`${eventCount}-event fixture schedules without loss, duplication, or same-file overlap`, () => {
+    const placements = Array.from({ length: eventCount }, (_, index) =>
+      placement(`fixture_event_${index}`, `src/feature_${index % 37}.ts`)
+    );
+    let clusters = deriveClusters(placements);
+    const scheduled: string[] = [];
+    while (!clustersComplete(clusters)) {
+      const wave = nextConcurrentClusters(clusters, 4);
+      assert.ok(wave.length > 0 && wave.length <= 4);
+      const files = wave.flatMap((cluster) => cluster.files);
+      assert.equal(new Set(files).size, files.length);
+      for (const cluster of wave) {
+        scheduled.push(...cluster.events.map((event) => event.eventId));
+        clusters = transitionCluster(clusters, cluster.id, "reviewed");
+      }
+    }
+    assert.equal(scheduled.length, eventCount);
+    assert.equal(new Set(scheduled).size, eventCount);
+    assert.deepEqual(new Set(scheduled), new Set(placements.map((event) => event.eventId)));
+  });
+}
 
 test("cluster queue transitions and completion", () => {
   let clusters = deriveClusters([

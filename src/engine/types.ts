@@ -1,6 +1,13 @@
 import type { ZodRawShape } from "zod";
 
 export type EngineRole = "survey" | "design" | "edit" | "review";
+export type EngineTask =
+  | "survey"
+  | "design"
+  | "sdk_setup"
+  | "cluster_edit"
+  | "repair"
+  | "review";
 
 export const ENGINE_PHASES = [
   "authorizing",
@@ -20,11 +27,19 @@ export type EnginePhase = (typeof ENGINE_PHASES)[number];
 export interface RoleModelConfig {
   model: string;
   effort?: string;
+  serviceTier?: "default" | "priority";
+  fastMode?: boolean;
   maxTurns: number;
   maxMs: number;
 }
 
-export type EngineModelConfig = Record<EngineRole, RoleModelConfig>;
+/**
+ * The role keys remain required for source compatibility with older embedders.
+ * New engine code always asks for a task key first and only falls back to its
+ * legacy role while old presets are being phased out.
+ */
+export type EngineModelConfig = Record<EngineRole, RoleModelConfig> &
+  Partial<Record<EngineTask, RoleModelConfig>>;
 
 export interface EngineTool {
   name: string;
@@ -36,6 +51,9 @@ export interface EngineTool {
 
 export interface RoleInvocation {
   role: EngineRole;
+  task?: EngineTask;
+  /** Stable within a run; isolates concurrent OpenAI conversations. */
+  sessionKey?: string;
   systemPrompt: string;
   userPrompt: string;
   tools: EngineTool[];
@@ -58,6 +76,23 @@ export interface EngineProvider {
     config: RoleModelConfig,
     onProgress: (action: string) => void,
   ): Promise<RoleOutcome>;
+  /**
+   * Invoke the fallback route for a task. Write tasks call this only after
+   * rolling their isolated worktree back to a clean checkpoint.
+   */
+  invokeFallback?(
+    invocation: RoleInvocation,
+    config: RoleModelConfig,
+    onProgress: (action: string) => void,
+  ): Promise<RoleOutcome>;
+}
+
+export function modelConfigFor(
+  models: EngineModelConfig,
+  task: EngineTask,
+  role: EngineRole,
+): RoleModelConfig {
+  return models[task] ?? models[role];
 }
 
 export type ClusterStatus =

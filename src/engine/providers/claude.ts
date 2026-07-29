@@ -42,8 +42,12 @@ export function createClaudeProvider(
   config: WizardConfig,
   session: WizardSession,
 ): EngineProvider {
+  let runId = "";
   return {
     name: "claude",
+    onRunReady(readyRunId: string): void {
+      runId = readyRunId;
+    },
     async invoke(
       invocation: RoleInvocation,
       roleConfig: RoleModelConfig,
@@ -80,6 +84,17 @@ export function createClaudeProvider(
             : { kind, sessionId, costUsd, turns };
 
       try {
+        const task = invocation.task ?? invocation.role;
+        const sessionKey = invocation.sessionKey ?? task;
+        const customHeaders = [
+          process.env.ANTHROPIC_CUSTOM_HEADERS,
+          runId ? `X-Whisperr-Wizard-Run-ID: ${headerValue(runId)}` : "",
+          `X-Whisperr-Wizard-Task: ${headerValue(task)}`,
+          `X-Whisperr-Wizard-Session-Key: ${headerValue(sessionKey)}`,
+          `X-Whisperr-Wizard-Model: ${headerValue(roleConfig.model)}`,
+          `X-Whisperr-Wizard-Effort: ${headerValue(roleConfig.effort ?? "")}`,
+          `X-Whisperr-Wizard-Service-Tier: ${roleConfig.fastMode ? "fast" : "default"}`,
+        ].filter(Boolean).join("\n");
         const response = query({
           prompt: invocation.userPrompt,
           options: {
@@ -95,11 +110,15 @@ export function createClaudeProvider(
             hooks: buildToolPolicyHooks(invocation.cwd, trustedTools),
             canUseTool: createToolPermissionCallback(invocation.cwd, trustedTools),
             maxTurns: roleConfig.maxTurns,
-            ...(supportsClaudeFastMode(roleConfig.model)
+            ...((roleConfig.fastMode ?? supportsClaudeFastMode(roleConfig.model))
               ? { settings: { fastMode: true } }
               : {}),
             ...(invocation.resumeSessionId ? { resume: invocation.resumeSessionId } : {}),
             settingSources: [],
+            env: {
+              ...process.env,
+              ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+            },
           },
         });
         for await (const raw of response as AsyncIterable<StreamMessage>) {
@@ -146,4 +165,8 @@ export function createClaudeProvider(
       }
     },
   };
+}
+
+function headerValue(value: string): string {
+  return value.replace(/[\r\n]/g, "").slice(0, 200);
 }

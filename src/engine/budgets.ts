@@ -10,6 +10,8 @@ const OVERFLOW_PATTERNS = [
 
 const TRANSIENT_PATTERNS = [
   /rate.?limit/i,
+  /quota/i,
+  /\b429\b/,
   /overloaded/i,
   /timeout/i,
   /timed out/i,

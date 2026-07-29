@@ -4,9 +4,15 @@ import { basename, resolve, sep } from "node:path";
 import type { ReportEvent } from "../core/report.js";
 import type { WizardConfig, WizardSession } from "../types.js";
 import { eventWrapperName } from "./bindings.js";
-import { deriveClusters } from "./clusters.js";
+import {
+  clustersComplete,
+  deriveClusters,
+  nextConcurrentClusters,
+  transitionCluster,
+} from "./clusters.js";
 import {
   finalizeIntegration,
+  repairVerification,
   runClusterIntegration,
   runSdkSetupPass,
   writeBindingsModule,
@@ -42,6 +48,7 @@ import {
   discardWorktreeChanges,
   removeWorktree,
   worktreePatch,
+  WorktreeError,
   type WorktreeHandle,
 } from "./worktree.js";
 
@@ -209,6 +216,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   const prior = bootstrap.run.integrationEvidence;
   const changedFiles = new Set(prior?.changedFiles ?? []);
   const eventStatuses = await reconcileProgress(input.repoPath, registered, prior, input.sink);
+  const eventFailureReasons = new Map<string, string>();
   for (const event of registered) {
     const status = eventStatuses.get(event.code) ?? "planned";
     if (status !== "planned" && status !== "failed" && status !== "unsupported") {
@@ -286,7 +294,10 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         throw new Error("SDK setup did not complete");
       }
       await checkpoint();
-      identifyWired = true;
+      identifyWired = await setupLooksPresent(input.repoPath, changedFiles);
+      if (!identifyWired) {
+        throw new Error("SDK initialization, bindings, or identify() could not be verified");
+      }
       await saveProgress();
     } else {
       // The generated bindings may gain events after placement recovery.
@@ -297,55 +308,134 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       const status = eventStatuses.get(event.code) ?? "planned";
       return status === "planned" || status === "failed";
     });
-    const clusters = deriveClusters(placementsFor(pending));
-    const deps: IntegrationDeps = {
-      provider: input.provider,
-      models: input.models,
-      worktree,
-      target: input.target,
-      playbookSystemPrompt: input.playbookSystemPrompt,
-      registered,
-      ingestion: bootstrap.ingestion,
-      sink: input.sink,
-      saveClusters: () => {},
-      discardChanges: async () => discardWorktreeChanges(worktree),
-      onClusterIntegrated: async (cluster: Cluster, status: EventIntegrationStatus) => {
-        const verified = new Map<string, EventIntegrationStatus>();
-        for (const placement of cluster.events) {
-          const present = await fileContainsWrapper(
-            worktree.path,
-            placement.file,
-            placement.eventCode,
-          );
-          verified.set(placement.eventCode, present ? status : "failed");
+    let clusters = deriveClusters(placementsFor(pending));
+    await patchPhase("integrating");
+    // The setup worktree has served its purpose. Every cluster gets a fresh,
+    // isolated worktree seeded from the customer checkout and the saved
+    // allowlist. Four model tasks run at once; their disjoint patches are then
+    // applied serially so the checkout and server ledger advance together.
+    await removeWorktree(worktree).catch(() => {});
+    while (!clustersComplete(clusters)) {
+      const wave = nextConcurrentClusters(clusters);
+      if (wave.length === 0) {
+        break;
+      }
+      const prepared: Array<{ cluster: Cluster; handle?: WorktreeHandle; error?: string }> = [];
+      for (const cluster of wave) {
+        try {
+          prepared.push({
+            cluster,
+            handle: await createWorktree(input.repoPath, input.force ?? false, [...changedFiles]),
+          });
+        } catch (error) {
+          prepared.push({
+            cluster,
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
-        await checkpoint();
-        // One server checkpoint per event. Applying happens first, so the server
-        // never claims an integration that is absent from the customer's checkout.
-        for (const placement of cluster.events) {
-          eventStatuses.set(
-            placement.eventCode,
-            verified.get(placement.eventCode) ?? "failed",
+      }
+      const completed = await Promise.all(prepared.map(async (worker) => {
+        if (!worker.handle) {
+          return { ...worker, integration: undefined, patch: "" };
+        }
+        const workerDeps: IntegrationDeps = {
+          provider: input.provider,
+          models: input.models,
+          worktree: worker.handle,
+          target: input.target,
+          playbookSystemPrompt: input.playbookSystemPrompt,
+          registered,
+          ingestion: bootstrap.ingestion,
+          sink: input.sink,
+          saveClusters: () => {},
+          discardChanges: async () => discardWorktreeChanges(worker.handle!),
+          onClusterIntegrated: async () => {},
+        };
+        try {
+          const integration = await runClusterIntegration(
+            workerDeps,
+            [worker.cluster],
+            async () => worktreePatch(worker.handle!),
           );
+          return {
+            ...worker,
+            integration,
+            patch: await worktreePatch(worker.handle),
+          };
+        } catch (error) {
+          return {
+            ...worker,
+            integration: undefined,
+            patch: "",
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      }));
+
+      for (const worker of completed) {
+        const returned = worker.integration?.clusters[0];
+        if (returned) {
+          clusters = clusters.map((cluster) => cluster.id === returned.id ? returned : cluster);
+        } else {
+          clusters = transitionCluster(
+            clusters,
+            worker.cluster.id,
+            "blocked",
+            worker.error ?? "cluster worker failed",
+          );
+        }
+        let applied = false;
+        if (returned?.status === "reviewed") {
+          const files = patchFiles(worker.patch);
+          const unexpected = files.filter((file) => !worker.cluster.files.includes(file));
+          if (unexpected.length > 0) {
+            clusters = transitionCluster(
+              clusters,
+              worker.cluster.id,
+              "blocked",
+              `cluster edited files outside its isolation boundary: ${unexpected.join(", ")}`,
+            );
+          } else {
+            try {
+              for (const file of files) changedFiles.add(file);
+              // Persist the dirty-file allowlist before the checkout mutation.
+              await saveProgress();
+              await applyPatchToRepo(worker.handle!, worker.patch);
+              applied = true;
+            } catch (error) {
+              clusters = transitionCluster(
+                clusters,
+                worker.cluster.id,
+                "blocked",
+                `serial patch merge failed: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+          }
+        }
+        for (const placement of worker.cluster.events) {
+          const status = applied
+            ? worker.integration?.eventStatuses.get(placement.eventCode) ?? "failed"
+            : "failed";
+          eventStatuses.set(placement.eventCode, status);
+          if (status === "failed") {
+            const current = clusters.find((candidate) => candidate.id === worker.cluster.id);
+            eventFailureReasons.set(
+              placement.eventCode,
+              current?.note ?? worker.error ?? "cluster patch could not be merged",
+            );
+          }
           await saveProgress();
           input.sink.emit({
             phase: "integrating",
             file: placement.file,
-            action: `saved ${placement.eventCode} progress`,
+            action: applied
+              ? `merged and saved ${placement.eventCode}`
+              : `${placement.eventCode} needs manual attention`,
           });
         }
-      },
-    };
-
-    await patchPhase("integrating");
-    const integration = await runClusterIntegration(
-      deps,
-      clusters,
-      async () => worktreePatch(worktree),
-    );
-    for (const [code, status] of integration.eventStatuses) {
-      if ((eventStatuses.get(code) ?? "planned") === "planned") {
-        eventStatuses.set(code, status);
+        if (worker.handle) {
+          await removeWorktree(worker.handle).catch(() => {});
+        }
       }
     }
     await saveProgress();
@@ -360,7 +450,59 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     }
 
     await patchPhase("verifying");
-    const finalVerify = await finalizeIntegration(deps);
+    const verificationWorktree = await createWorktree(
+      input.repoPath,
+      input.force ?? false,
+      [...changedFiles],
+    );
+    const verificationDeps: IntegrationDeps = {
+      provider: input.provider,
+      models: input.models,
+      worktree: verificationWorktree,
+      target: input.target,
+      playbookSystemPrompt: input.playbookSystemPrompt,
+      registered,
+      ingestion: bootstrap.ingestion,
+      sink: input.sink,
+      saveClusters: () => {},
+      discardChanges: async () => discardWorktreeChanges(verificationWorktree),
+      onClusterIntegrated: async () => {},
+    };
+    let finalVerify = await finalizeIntegration(verificationDeps);
+    if (finalVerify.status === "failed") {
+      const repaired = await repairVerification(verificationDeps, finalVerify.results);
+      if (repaired) {
+        const repairPatch = await worktreePatch(verificationWorktree);
+        const repairFiles = patchFiles(repairPatch);
+        finalVerify = await finalizeIntegration(verificationDeps);
+        if (finalVerify.status !== "failed") {
+          for (const file of repairFiles) changedFiles.add(file);
+          await saveProgress();
+          await applyPatchToRepo(verificationWorktree, repairPatch);
+        }
+      }
+    }
+    await removeWorktree(verificationWorktree).catch(() => {});
+    if (finalVerify.status === "failed") {
+      for (const event of registered) {
+        eventStatuses.set(event.code, "failed");
+        eventFailureReasons.set(
+          event.code,
+          `final verification failed${finalVerify.command ? `: ${finalVerify.command}` : ""}`,
+        );
+      }
+      await saveProgress();
+      throw new Error("final verification still fails after Opus repair");
+    }
+    identifyWired = await setupLooksPresent(input.repoPath, changedFiles);
+    if (!identifyWired) {
+      for (const event of registered) {
+        eventStatuses.set(event.code, "failed");
+        eventFailureReasons.set(event.code, "SDK initialization or identify() is missing after final repair");
+      }
+      await saveProgress();
+      throw new Error("SDK initialization and identify() must be present before completion");
+    }
     await patchPhase("reporting");
     await runs.completeRun(runId, {
       changedFiles: [...changedFiles].sort(),
@@ -378,7 +520,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       runId,
       registered,
       eventStatuses,
-      reportEvents: buildReportEvents(registered, eventStatuses),
+      reportEvents: buildReportEvents(registered, eventStatuses, eventFailureReasons),
       changedFiles: [...changedFiles].sort(),
       identifyWired,
       applied: changedFiles.size > 0,
@@ -386,6 +528,13 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    for (const event of registered) {
+      const status = eventStatuses.get(event.code) ?? "planned";
+      if (status === "planned") {
+        eventStatuses.set(event.code, "failed");
+        eventFailureReasons.set(event.code, reason);
+      }
+    }
     await failRun(reason);
     await removeWorktree(worktree).catch(() => {});
     return {
@@ -393,7 +542,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       runId,
       registered,
       eventStatuses,
-      reportEvents: buildReportEvents(registered, eventStatuses),
+      reportEvents: buildReportEvents(registered, eventStatuses, eventFailureReasons),
       changedFiles: [...changedFiles].sort(),
       identifyWired,
       applied: changedFiles.size > 0,
@@ -478,6 +627,8 @@ async function setupLooksPresent(
 ): Promise<boolean> {
   let bindingsFound = false;
   let bindingCallFound = false;
+  let identifyFound = false;
+  let sdkInitializationFound = false;
   for (const file of changedFiles) {
     try {
       const content = await readFile(safeRepoPath(repoPath, file), "utf8");
@@ -486,12 +637,15 @@ async function setupLooksPresent(
       if (!generated) {
         bindingCallFound ||= content.includes("bindWhisperr(") ||
           content.includes("WhisperrEvents.bind(");
+        identifyFound ||= /\bidentify\s*\(/.test(content);
+        sdkInitializationFound ||= /whisperr/i.test(content) &&
+          /(initiali[sz]e|configure|client|setup)/i.test(content);
       }
     } catch {
       // Missing progress files are handled as incomplete setup.
     }
   }
-  return bindingsFound && bindingCallFound;
+  return bindingsFound && bindingCallFound && identifyFound && sdkInitializationFound;
 }
 
 function safeRepoPath(repoPath: string, file: string): string {
@@ -518,6 +672,7 @@ function buildEvidence(
 function buildReportEvents(
   registered: RegisteredEvent[],
   statuses: Map<string, EventIntegrationStatus>,
+  failureReasons: Map<string, string> = new Map(),
 ): ReportEvent[] {
   return registered.map((event) => {
     const status = statuses.get(event.code);
@@ -527,7 +682,7 @@ function buildReportEvents(
       event_type: event.code,
       status: wired ? "wired" : "skipped",
       ...(wired ? { file: event.anchorFile } : {}),
-      ...(wired ? {} : { reason: status ?? "not integrated" }),
+      ...(wired ? {} : { reason: failureReasons.get(event.code) ?? status ?? "not integrated" }),
     };
   });
 }

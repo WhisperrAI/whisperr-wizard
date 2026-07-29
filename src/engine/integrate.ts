@@ -1,7 +1,7 @@
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, writeFile } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 
-import { generateBindings, type GeneratedBindings } from "./bindings.js";
+import { eventWrapperName, generateBindings, type GeneratedBindings } from "./bindings.js";
 import { MAX_CLUSTER_ATTEMPTS, classifyFailure, nextClusterStatusAfterFailure } from "./budgets.js";
 import { clustersComplete, nextPendingCluster, transitionCluster } from "./clusters.js";
 import type { ProgressSink } from "./output.js";
@@ -11,7 +11,9 @@ import type {
   EngineModelConfig,
   EngineProvider,
   EventIntegrationStatus,
+  RoleInvocation,
 } from "./types.js";
+import { modelConfigFor } from "./types.js";
 import {
   resolveVerifySteps,
   runVerificationStatus,
@@ -73,6 +75,8 @@ export async function runSdkSetupPass(deps: IntegrationDeps, bindings: Generated
   const outcome = await deps.provider.invoke(
     {
       role: "edit",
+      task: "sdk_setup",
+      sessionKey: "sdk_setup",
       systemPrompt: deps.playbookSystemPrompt,
       userPrompt: [
         "CORE SETUP for the Whisperr SDK in this repository. Do exactly this, then stop:",
@@ -89,7 +93,7 @@ export async function runSdkSetupPass(deps: IntegrationDeps, bindings: Generated
       allowRepoWrite: true,
       cwd: deps.worktree.path,
     },
-    deps.models.edit,
+    modelConfigFor(deps.models, "sdk_setup", "edit"),
     (action) => deps.sink.emit({ phase: "binding", action }),
   );
   return outcome.kind === "completed";
@@ -133,6 +137,8 @@ async function reviewCluster(
   const outcome = await deps.provider.invoke(
     {
       role: "review",
+      task: "review",
+      sessionKey: `review:${cluster.id}`,
       systemPrompt: [
         "You review an instrumentation diff against a strict checklist. Answer with a verdict line",
         "`VERDICT: pass` or `VERDICT: fail`, then bullet notes for anything wrong.",
@@ -150,7 +156,7 @@ async function reviewCluster(
       allowRepoWrite: false,
       cwd: deps.worktree.path,
     },
-    deps.models.review,
+    modelConfigFor(deps.models, "review", "review"),
     (action) => deps.sink.emit({ phase: "reviewing", action }),
   );
   if (outcome.kind !== "completed") {
@@ -168,7 +174,6 @@ export async function runClusterIntegration(
   let clusters = initialClusters;
   const eventStatuses = new Map<string, EventIntegrationStatus>();
   const bindings = generateBindings(deps.target, deps.registered);
-  const steps = resolveVerifySteps(deps.worktree.path, deps.target);
   const total = clusters.length;
 
   for (;;) {
@@ -186,21 +191,47 @@ export async function runClusterIntegration(
       action: "placing events",
     });
 
-    const edit = await deps.provider.invoke(
-      {
+    const invocation: RoleInvocation = {
         role: "edit",
+        task: "cluster_edit",
+        sessionKey: cluster.id,
         systemPrompt: deps.playbookSystemPrompt,
         userPrompt: clusterPrompt(cluster, deps.registered, bindings),
         tools: [],
         allowRepoWrite: true,
         cwd: deps.worktree.path,
-      },
-      deps.models.edit,
+      };
+    let edit = await deps.provider.invoke(
+      invocation,
+      modelConfigFor(deps.models, "cluster_edit", "edit"),
       (action) =>
         deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
     );
 
-    if (edit.kind !== "completed") {
+    let escalated = false;
+    let structural = edit.kind === "completed"
+      ? await structuralClusterCheck(deps.worktree.path, cluster)
+      : { ok: false, notes: `edit ${edit.kind}` };
+    if ((!structural.ok || edit.kind !== "completed") && deps.provider.invokeFallback) {
+      await deps.discardChanges();
+      escalated = true;
+      deps.sink.emit({
+        phase: "integrating",
+        cluster: { index, total },
+        action: "Terra attempt rolled back; retrying with Opus",
+      });
+      edit = await deps.provider.invokeFallback(
+        { ...invocation, task: "repair", sessionKey: `escalation:${cluster.id}` },
+        modelConfigFor(deps.models, "sdk_setup", "edit"),
+        (action) =>
+          deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
+      );
+      structural = edit.kind === "completed"
+        ? await structuralClusterCheck(deps.worktree.path, cluster)
+        : { ok: false, notes: `Opus escalation ${edit.kind}` };
+    }
+
+    if (edit.kind !== "completed" || !structural.ok) {
       const failure =
         edit.kind === "context_overflow"
           ? "context_overflow"
@@ -208,7 +239,12 @@ export async function runClusterIntegration(
             ? "context_overflow"
             : classifyFailure(edit.kind === "failed" ? edit.error : "");
       const nextStatus = nextClusterStatusAfterFailure(failure, cluster.attempts);
-      clusters = transitionCluster(clusters, cluster.id, nextStatus, `edit ${edit.kind}`);
+      clusters = transitionCluster(
+        clusters,
+        cluster.id,
+        nextStatus,
+        structural.notes || `edit ${edit.kind}`,
+      );
       deps.saveClusters(clusters);
       for (const placement of cluster.events) {
         eventStatuses.set(placement.eventCode, "failed");
@@ -217,42 +253,46 @@ export async function runClusterIntegration(
       continue;
     }
 
-    let statuses: EventIntegrationStatus = "applied";
-    if (steps.length > 0) {
-      deps.sink.emit({ phase: "verifying", cluster: { index, total }, action: "running verifier" });
-      const results = await runVerifySteps(deps.worktree.path, steps);
-      statuses = verifiedStatus(results);
-      if (results.some((result) => !result.ok) && cluster.attempts < MAX_CLUSTER_ATTEMPTS) {
-        deps.sink.emit({ phase: "verifying", cluster: { index, total }, action: "repairing verification failure" });
-        await deps.provider.invoke(
-          {
-            role: "edit",
-            systemPrompt: deps.playbookSystemPrompt,
-            userPrompt: [
-              "The verification command failed after your edits. Fix ONLY the failure below, then stop.",
-              "",
-              results.map((result) => result.output).join("\n").slice(0, 20_000),
-            ].join("\n"),
-            tools: [],
-            allowRepoWrite: true,
-            cwd: deps.worktree.path,
-          },
-          deps.models.edit,
-          (action) => deps.sink.emit({ phase: "verifying", cluster: { index, total }, action }),
-        );
-        const retried = await runVerifySteps(deps.worktree.path, steps);
-        statuses = verifiedStatus(retried);
-      }
-    }
     clusters = transitionCluster(clusters, cluster.id, "verified");
     deps.saveClusters(clusters);
 
     const diff = await clusterDiff(cluster.files);
-    const review = await reviewCluster(deps, cluster, diff);
+    let review = await reviewCluster(deps, cluster, diff);
+    if (!review.ok && !escalated && deps.provider.invokeFallback) {
+      await deps.discardChanges();
+      deps.sink.emit({
+        phase: "reviewing",
+        cluster: { index, total },
+        action: "Terra diff rejected; retrying the clean cluster with Opus",
+      });
+      edit = await deps.provider.invokeFallback(
+        { ...invocation, task: "repair", sessionKey: `review-retry:${cluster.id}` },
+        modelConfigFor(deps.models, "sdk_setup", "edit"),
+        (action) => deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
+      );
+      structural = edit.kind === "completed"
+        ? await structuralClusterCheck(deps.worktree.path, cluster)
+        : { ok: false, notes: `Opus review retry ${edit.kind}` };
+      if (edit.kind === "completed" && structural.ok) {
+        review = await reviewCluster(deps, cluster, await clusterDiff(cluster.files));
+      }
+    }
+    if (!structural.ok || !review.ok) {
+      clusters = transitionCluster(
+        clusters,
+        cluster.id,
+        "blocked",
+        (!structural.ok ? structural.notes : review.notes).slice(0, 500),
+      );
+      for (const placement of cluster.events) {
+        eventStatuses.set(placement.eventCode, "failed");
+      }
+      await deps.discardChanges();
+      continue;
+    }
+    const statuses: EventIntegrationStatus = "reviewed";
     const finalStatus: EventIntegrationStatus = review.ok
-      ? statuses === "applied"
-        ? "applied"
-        : "reviewed"
+      ? statuses
       : statuses;
     clusters = transitionCluster(clusters, cluster.id, "reviewed", review.ok ? undefined : review.notes.slice(0, 500));
     deps.saveClusters(clusters);
@@ -268,6 +308,38 @@ export async function runClusterIntegration(
   return { clusters, eventStatuses };
 }
 
+export async function structuralClusterCheck(
+  repoPath: string,
+  cluster: Cluster,
+): Promise<{ ok: boolean; notes: string }> {
+  const allowed = new Set(cluster.files);
+  const missing: string[] = [];
+  for (const placement of cluster.events) {
+    if (!allowed.has(placement.file)) {
+      missing.push(`${placement.eventCode}: placement escaped cluster`);
+      continue;
+    }
+    try {
+      const root = resolve(repoPath);
+      const path = resolve(root, placement.file);
+      if (!path.startsWith(root + sep)) {
+        missing.push(`${placement.eventCode}: unsafe file`);
+        continue;
+      }
+      const content = await readFile(path, "utf8");
+      if (!content.includes(eventWrapperName(placement.eventCode))) {
+        missing.push(`${placement.eventCode}: wrapper call missing from ${placement.file}`);
+      }
+    } catch {
+      missing.push(`${placement.eventCode}: cannot read ${placement.file}`);
+    }
+  }
+  return {
+    ok: missing.length === 0,
+    notes: missing.join("; "),
+  };
+}
+
 export async function finalizeIntegration(
   deps: IntegrationDeps,
 ): Promise<{ results: VerifyStepResult[]; status: "pending" | "passed" | "failed" | "unavailable"; command?: string }> {
@@ -279,4 +351,34 @@ export async function finalizeIntegration(
     status: runVerificationStatus(results),
     command: verificationCommand(results),
   };
+}
+
+export async function repairVerification(
+  deps: IntegrationDeps,
+  results: VerifyStepResult[],
+): Promise<boolean> {
+  const failed = results.filter((result) => !result.ok);
+  if (failed.length === 0) return true;
+  deps.sink.emit({ phase: "verifying", action: "Opus is repairing final verification failures" });
+  const outcome = await deps.provider.invoke(
+    {
+      role: "edit",
+      task: "repair",
+      sessionKey: "final_repair",
+      systemPrompt: deps.playbookSystemPrompt,
+      userPrompt: [
+        "The one final repository verification failed after all instrumentation patches were merged.",
+        "Repair only the affected integration files and their imports/configuration. Preserve every generated event wrapper call.",
+        "Do not redesign events. Stop after the repair; the wizard will rerun verification.",
+        "",
+        failed.map((result) => `$ ${result.command} ${result.args.join(" ")}\n${result.output}`).join("\n\n").slice(0, 30_000),
+      ].join("\n"),
+      tools: [],
+      allowRepoWrite: true,
+      cwd: deps.worktree.path,
+    },
+    modelConfigFor(deps.models, "repair", "edit"),
+    (action) => deps.sink.emit({ phase: "verifying", action }),
+  );
+  return outcome.kind === "completed";
 }

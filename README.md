@@ -13,7 +13,7 @@ hands you a clean diff to review and commit.
 
 ## How it works
 
-The wizard is an agentic integrator with a planner/editor split:
+The wizard is an agentic integrator with task-aware hybrid routing:
 
 1. **Plan** — one read-only pass charts your repo (entry points, end-user vs
    admin auth flows, billing surfaces, existing analytics wrappers) and
@@ -24,11 +24,15 @@ The wizard is an agentic integrator with a planner/editor split:
    changes. The run then proceeds on its own; pass `--review-plan` if you'd
    rather confirm placements first, or `--propose-only` to keep new
    events/interventions behind dashboard approval instead of adding them.
-3. **Wire** — a fast editor model executes the plan mechanically.
-4. **Review** — the agent re-reads its own diff and fixes wrong subjects,
+3. **Wire** — Terra surveys and runs up to four file-isolated, four-event edit
+   clusters concurrently. Opus 5 handles SDK setup and automatically retries a
+   clean cluster when Terra is unavailable, quota-limited, incomplete, or
+   invalid. No two workers edit the same file concurrently.
+4. **Review** — up to two fast Opus 5 tasks re-read diffs and fix wrong subjects,
    wrong lifecycle moments, and missing discriminators.
-5. **Verify** — placements are scanned back out of the diff, your build/lint
-   command runs, and failures get one automatic repair pass. Every event ends
+5. **Verify** — placements receive structural checks before their patches merge,
+   then one full build/lint runs after all serial merges. Failures get an Opus
+   repair pass. Every event ends
    the run as `✓ wired @ file` or `○ skipped — reason`.
 
 Multi-surface aware: run it in your web app, then your mobile app, then your
@@ -65,8 +69,10 @@ Options:
 -v, --version   Show version
 ```
 
-Environment knobs: `WHISPERR_WIZARD_PLANNER_MODEL`,
-`WHISPERR_WIZARD_BUDGET_USD` (default 25), `WHISPERR_WIZARD_EFFORT`.
+Environment knobs: `WHISPERR_WIZARD_ENGINE_<TASK>_MODEL` (for example
+`WHISPERR_WIZARD_ENGINE_DESIGN_MODEL`), `WHISPERR_WIZARD_BUDGET_USD`
+(default 25), `WHISPERR_WIZARD_EFFORT`.
+Set `WHISPERR_WIZARD_PRESET=claude-default` for the Opus-only rollback preset.
 
 ## Safety
 

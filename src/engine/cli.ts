@@ -14,24 +14,52 @@ import type { EngineModelConfig } from "./types.js";
 const MINUTE = 60_000;
 
 export function engineModelConfig(config: WizardConfig): EngineModelConfig {
-  const model = (role: string, fallback: string) =>
-    process.env[`WHISPERR_WIZARD_ENGINE_${role.toUpperCase()}_MODEL`]?.trim() || fallback;
+  const model = (task: string, fallback: string) =>
+    process.env[`WHISPERR_WIZARD_ENGINE_${task.toUpperCase()}_MODEL`]?.trim() || fallback;
+  const terra = "gpt-5.6-terra";
+  const opus = "claude-opus-5";
+  const opusOnly = process.env.WHISPERR_WIZARD_PRESET?.trim() === "claude-default" ||
+    config.offline === true;
+  const survey = opusOnly
+    ? { model: model("survey", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 5 * MINUTE }
+    : { model: model("survey", terra), effort: "medium", serviceTier: "priority" as const, maxTurns: 30, maxMs: 5 * MINUTE };
+  const design = { model: model("design", opus), effort: "medium", fastMode: true, maxTurns: 80, maxMs: 20 * MINUTE };
+  const sdkSetup = { model: model("sdk_setup", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE };
+  const clusterEdit = opusOnly
+    ? { model: model("cluster_edit", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE }
+    : { model: model("cluster_edit", terra), effort: "medium", serviceTier: "priority" as const, maxTurns: 30, maxMs: 5 * MINUTE };
+  const repair = { model: model("repair", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
+  const review = { model: model("review", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
   return {
-    survey: { model: model("survey", config.model), effort: "medium", maxTurns: 40, maxMs: 12 * MINUTE },
-    design: { model: model("design", config.plannerModel), effort: "high", maxTurns: 40, maxMs: 15 * MINUTE },
-    edit: { model: model("edit", config.model), effort: config.effort, maxTurns: 50, maxMs: 15 * MINUTE },
-    review: { model: model("review", config.model), effort: "medium", maxTurns: 15, maxMs: 8 * MINUTE },
+    survey,
+    design,
+    edit: sdkSetup,
+    review,
+    sdk_setup: sdkSetup,
+    cluster_edit: clusterEdit,
+    repair,
   };
 }
 
 export function engineProvider(config: WizardConfig, session: WizardSession) {
   const claude = createClaudeProvider(config, session);
-  const preset = process.env.WHISPERR_WIZARD_PRESET?.trim() ?? "claude-default";
-  if (preset === "sol-design") {
-    const openai = createOpenAIProvider(config, session);
-    return createRoutedProvider({ survey: openai, design: openai, review: openai }, claude);
+  const models = engineModelConfig(config);
+  const preset = process.env.WHISPERR_WIZARD_PRESET?.trim() ?? "hybrid";
+  if (preset === "claude-default" || config.offline) {
+    return createRoutedProvider({}, claude, 2);
   }
-  return claude;
+  const openai = createOpenAIProvider(config, session);
+  if (preset === "sol-design") {
+    return createRoutedProvider({
+      survey: { provider: openai, fallbackConfig: models.sdk_setup },
+      design: { provider: openai, fallbackConfig: models.design },
+      review: { provider: openai, fallbackConfig: models.review },
+    }, claude);
+  }
+  return createRoutedProvider({
+    survey: { provider: openai, concurrency: 4, fallbackConfig: models.sdk_setup },
+    cluster_edit: { provider: openai, concurrency: 4, fallbackConfig: models.sdk_setup },
+  }, claude, 2);
 }
 
 export interface EngineFlowResult {
