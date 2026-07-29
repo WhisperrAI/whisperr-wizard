@@ -151,7 +151,6 @@ async function runFixture(name: string, fixtureDir: string): Promise<FixtureResu
   const failures: string[] = [];
 
   const repo = materializeFixture(fixtureDir);
-  process.env.WHISPERR_WIZARD_STATE_DIR = mkdtempSync(join(tmpdir(), "eval-state-"));
   const state: MockRuntimeState = { items: [], completions: [], snapshotEvents: [], failItems: false };
   const { server, port } = await startMockRuntime(state);
 
@@ -166,7 +165,7 @@ async function runFixture(name: string, fixtureDir: string): Promise<FixtureResu
     projectKind: "frontend",
     playbookSystemPrompt: "eval",
     sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
-    callbacks: { reviewEvents: async (proposed) => proposed, confirmApply: async () => true },
+    callbacks: { reviewEvents: async (proposed) => proposed },
   });
   server.close();
 
@@ -225,7 +224,6 @@ async function runFailureInjection(): Promise<FixtureResult> {
   const failures: string[] = [];
   const fixtureDir = join(process.cwd(), "evals", "fixtures", "webapp");
   const repo = materializeFixture(fixtureDir);
-  process.env.WHISPERR_WIZARD_STATE_DIR = mkdtempSync(join(tmpdir(), "eval-state-"));
   const state: MockRuntimeState = { items: [], completions: [], snapshotEvents: [], failItems: true };
   const { server, port } = await startMockRuntime(state);
   const expectations = JSON.parse(readFileSync(join(fixtureDir, "expectations.json"), "utf8")) as Expectations;
@@ -241,7 +239,7 @@ async function runFailureInjection(): Promise<FixtureResult> {
     projectKind: "frontend",
     playbookSystemPrompt: "eval",
     sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
-    callbacks: { reviewEvents: async (proposed) => proposed, confirmApply: async () => true },
+    callbacks: { reviewEvents: async (proposed) => proposed },
   });
   server.close();
 

@@ -32,6 +32,11 @@ export interface IntegrationDeps {
   ingestion: { apiKey: string; baseUrl: string };
   sink: ProgressSink;
   saveClusters: (clusters: Cluster[]) => void;
+  discardChanges: () => Promise<void>;
+  onClusterIntegrated: (
+    cluster: Cluster,
+    status: EventIntegrationStatus,
+  ) => Promise<void>;
 }
 
 export interface IntegrationResult {
@@ -208,6 +213,7 @@ export async function runClusterIntegration(
       for (const placement of cluster.events) {
         eventStatuses.set(placement.eventCode, "failed");
       }
+      await deps.discardChanges();
       continue;
     }
 
@@ -253,6 +259,7 @@ export async function runClusterIntegration(
     for (const placement of cluster.events) {
       eventStatuses.set(placement.eventCode, finalStatus);
     }
+    await deps.onClusterIntegrated(cluster, finalStatus);
   }
 
   if (!clustersComplete(clusters)) {

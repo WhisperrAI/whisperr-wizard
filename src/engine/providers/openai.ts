@@ -202,8 +202,9 @@ export function createOpenAIProvider(
 
   return {
     name: "openai-gateway",
-    onRunReady(readyRunId: string): void {
+    onRunReady(readyRunId: string, resumeSessionId?: string): void {
       runId = readyRunId;
+      conversationId = resumeSessionId;
     },
     async invoke(
       invocation: RoleInvocation,

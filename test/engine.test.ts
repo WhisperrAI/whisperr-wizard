@@ -1,7 +1,4 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -18,8 +15,7 @@ import {
 } from "../src/engine/clusters.js";
 import { createProgressSink, formatProgressLine } from "../src/engine/output.js";
 import { itemIdempotencyKey, normalizeRunBootstrap, RunsApiError } from "../src/engine/runs.js";
-import { loadRunState, saveRunState, stateDirectory, statePath } from "../src/engine/state.js";
-import type { EngineRunState, EventPlacement } from "../src/engine/types.js";
+import type { EventPlacement } from "../src/engine/types.js";
 
 function placement(code: string, file: string): EventPlacement {
   return { eventId: `aev_${code}`, eventCode: code, file, status: "planned" };
@@ -95,76 +91,6 @@ test("cluster queue transitions and completion", () => {
   assert.equal(clusters[0].note, "context overflow");
 });
 
-function sampleState(directory: string): EngineRunState {
-  process.env.WHISPERR_WIZARD_STATE_DIR = directory;
-  return {
-    version: 1,
-    apiBaseUrl: "https://api.example.test",
-    appId: "app_state_1",
-    repoFingerprint: "repo_fp_1",
-    runId: "wrun_1",
-    phase: "integrating",
-    providerSessions: { design: "sess_design" },
-    designComplete: true,
-    tombstonedCodes: ["removed_event"],
-    clusters: deriveClusters([
-      placement("one_started", "src/a/a.ts"),
-      placement("two_started", "src/a/b.ts"),
-      placement("three_started", "src/a/c.ts"),
-    ]),
-    updatedAt: "2026-01-01T00:00:00.000Z",
-  };
-}
-
-test("run state round-trips atomically with restrictive permissions", () => {
-  const directory = mkdtempSync(join(tmpdir(), "wizard-state-"));
-  const state = sampleState(directory);
-  saveRunState(state);
-  const path = statePath(state.apiBaseUrl, state.appId, state.repoFingerprint);
-  assert.equal(statSync(path).mode & 0o077, 0);
-  const loaded = loadRunState(state.apiBaseUrl, state.appId, state.repoFingerprint);
-  assert.ok(loaded);
-  assert.equal(loaded.runId, "wrun_1");
-  assert.equal(loaded.clusters.length, 1);
-  assert.equal(loaded.providerSessions.design, "sess_design");
-  assert.notEqual(loaded.updatedAt, "2026-01-01T00:00:00.000Z");
-});
-
-test("run state falls back when the configured home state path cannot be created", () => {
-  const directory = mkdtempSync(join(tmpdir(), "wizard-state-blocked-"));
-  const blockedPath = join(directory, "not-a-directory");
-  writeFileSync(blockedPath, "blocked");
-  const originalOverride = process.env.WHISPERR_WIZARD_STATE_DIR;
-  process.env.WHISPERR_WIZARD_STATE_DIR = join(blockedPath, "wizard-runs");
-  try {
-    const state = sampleState(process.env.WHISPERR_WIZARD_STATE_DIR);
-    saveRunState(state);
-    assert.notEqual(stateDirectory(), process.env.WHISPERR_WIZARD_STATE_DIR);
-    assert.ok(loadRunState(state.apiBaseUrl, state.appId, state.repoFingerprint));
-  } finally {
-    if (originalOverride === undefined) {
-      delete process.env.WHISPERR_WIZARD_STATE_DIR;
-    } else {
-      process.env.WHISPERR_WIZARD_STATE_DIR = originalOverride;
-    }
-  }
-});
-
-test("corrupted or mismatched state is ignored", () => {
-  const directory = mkdtempSync(join(tmpdir(), "wizard-state-"));
-  const state = sampleState(directory);
-  saveRunState(state);
-  const path = statePath(state.apiBaseUrl, state.appId, state.repoFingerprint);
-  writeFileSync(path, "{not json");
-  assert.equal(
-    loadRunState(state.apiBaseUrl, state.appId, state.repoFingerprint),
-    undefined,
-  );
-  saveRunState(state);
-  assert.equal(loadRunState("https://other.example.test", state.appId, state.repoFingerprint), undefined);
-  assert.ok(readFileSync(path, "utf8").includes("wrun_1"));
-});
-
 test("progress lines follow the phase · cluster · file · action protocol", () => {
   assert.equal(
     formatProgressLine({
@@ -224,18 +150,38 @@ test("item idempotency keys are stable and kind-scoped", () => {
 test("run bootstrap accepts nested and legacy snapshots, and rejects malformed responses", () => {
   const base = {
     project: { id: "project", repoFingerprint: "fp", displayName: "App", target: "swift", kind: "frontend" },
-    run: { id: "run", status: "running", phase: "surveying" },
+    run: {
+      id: "run",
+      status: "running",
+      phase: "surveying",
+      integrationEvidence: {
+        changedFiles: ["src/a.ts"],
+        identifyWired: true,
+        verificationStatus: "pending",
+        events: [{ eventId: "event", eventCode: "saved", file: "src/a.ts", status: "reviewed" }],
+      },
+    },
     ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
   };
-  const event = { id: "event", code: "saved", name: "Saved", reasoning: "r", projectId: "project", payloadSchema: {} };
-  assert.equal(normalizeRunBootstrap({ ...base, snapshot: { setupStatus: "running", events: [event] } }).snapshot.events[0].code, "saved");
+  const event = {
+    id: "event", code: "saved", name: "Saved", reasoning: "r", projectId: "project",
+    anchorFile: "src/a.ts", anchorSymbol: "save", payloadSchema: {},
+  };
+  const normalized = normalizeRunBootstrap({
+    ...base,
+    snapshot: { setupStatus: "running", events: [event] },
+  });
+  assert.equal(normalized.snapshot.events[0].anchorFile, "src/a.ts");
+  assert.equal(normalized.run.integrationEvidence?.events[0].status, "reviewed");
   assert.equal(normalizeRunBootstrap({ ...base, setupStatus: "running", events: [event] }).snapshot.events[0].code, "saved");
   assert.throws(() => normalizeRunBootstrap({ ...base, events: "not-an-array" }), RunsApiError);
 });
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   applyPatchToRepo,
@@ -288,6 +234,14 @@ test("dirty repositories are refused without force", async () => {
   const forced = await createWorktree(repo, true);
   assert.ok(existsSync(forced.path));
   await removeWorktree(forced);
+});
+
+test("server-recorded dirty files seed a resumable worktree", async () => {
+  const repo = initRepo();
+  writeFileSync(join(repo, "app.ts"), "export const a = 99;\n");
+  const handle = await createWorktree(repo, false, ["app.ts"]);
+  assert.equal(await readFile(join(handle.path, "app.ts"), "utf8"), "export const a = 99;\n");
+  await removeWorktree(handle);
 });
 
 test("partial patches persist for failed runs", async () => {

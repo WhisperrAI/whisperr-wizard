@@ -15,6 +15,8 @@ export interface RunRecord {
   id: string;
   status: string;
   phase: string;
+  modelConversationId?: string;
+  integrationEvidence?: IntegrationProgress;
 }
 
 export interface RunSnapshotEvent {
@@ -23,6 +25,8 @@ export interface RunSnapshotEvent {
   name: string;
   reasoning: string;
   projectId: string;
+  anchorFile?: string;
+  anchorSymbol?: string;
   payloadSchema: Record<string, string>;
 }
 
@@ -57,6 +61,14 @@ export interface IntegrationEventEvidence {
   eventCode: string;
   file?: string;
   status: EventIntegrationStatus;
+}
+
+export interface IntegrationProgress {
+  changedFiles: string[];
+  identifyWired: boolean;
+  verificationStatus: string;
+  verificationCommand?: string;
+  events: IntegrationEventEvidence[];
 }
 
 export class RunsApiError extends Error {
@@ -140,9 +152,14 @@ export class RunsClient {
       modelConversationId?: string | null;
       error?: string;
       message?: string;
+      integrationEvidence?: IntegrationProgress;
     },
   ): Promise<RunRecord> {
     return this.request<RunRecord>("PATCH", `/wizard/runs/${runId}`, { ...patch });
+  }
+
+  saveProgress(runId: string, progress: IntegrationProgress): Promise<RunRecord> {
+    return this.patchRun(runId, { integrationEvidence: progress });
   }
 
   writeItem(
@@ -227,7 +244,17 @@ export function normalizeRunBootstrap(payload: unknown): RunBootstrap {
       target: stringValue(project.target),
       kind: stringValue(project.kind),
     },
-    run: { id: run.id, status: stringValue(run.status), phase: stringValue(run.phase) },
+    run: {
+      id: run.id,
+      status: stringValue(run.status),
+      phase: stringValue(run.phase),
+      ...(stringValue(run.modelConversationId)
+        ? { modelConversationId: stringValue(run.modelConversationId) }
+        : {}),
+      ...(normalizeIntegrationProgress(run.integrationEvidence)
+        ? { integrationEvidence: normalizeIntegrationProgress(run.integrationEvidence)! }
+        : {}),
+    },
     resumed: value.resumed === true,
     universeMode: stringValue(value.universeMode),
     ...(record(value.onboardingContext) ? { onboardingContext: record(value.onboardingContext)! } : {}),
@@ -237,6 +264,36 @@ export function normalizeRunBootstrap(payload: unknown): RunBootstrap {
       events,
     },
     ingestion: { apiKey: ingestion.apiKey, baseUrl: ingestion.baseUrl },
+  };
+}
+
+function normalizeIntegrationProgress(payload: unknown): IntegrationProgress | undefined {
+  const value = record(payload);
+  if (!value || !Array.isArray(value.changedFiles) || !Array.isArray(value.events)) {
+    return undefined;
+  }
+  const events = value.events
+    .map((candidate) => {
+      const event = record(candidate);
+      if (!event || !stringValue(event.eventId) || !stringValue(event.eventCode)) {
+        return undefined;
+      }
+      return {
+        eventId: stringValue(event.eventId),
+        eventCode: stringValue(event.eventCode),
+        ...(stringValue(event.file) ? { file: stringValue(event.file) } : {}),
+        status: stringValue(event.status) as EventIntegrationStatus,
+      };
+    })
+    .filter((event): event is IntegrationEventEvidence => event !== undefined);
+  return {
+    changedFiles: value.changedFiles.filter((file): file is string => typeof file === "string"),
+    identifyWired: value.identifyWired === true,
+    verificationStatus: stringValue(value.verificationStatus) || "pending",
+    ...(stringValue(value.verificationCommand)
+      ? { verificationCommand: stringValue(value.verificationCommand) }
+      : {}),
+    events,
   };
 }
 
@@ -254,5 +311,8 @@ function isSnapshotEvent(value: unknown): value is RunSnapshotEvent {
   const event = record(value);
   return !!event && typeof event.id === "string" && typeof event.code === "string" &&
     typeof event.name === "string" && typeof event.reasoning === "string" &&
-    typeof event.projectId === "string" && !!record(event.payloadSchema);
+    typeof event.projectId === "string" &&
+    (event.anchorFile === undefined || typeof event.anchorFile === "string") &&
+    (event.anchorSymbol === undefined || typeof event.anchorSymbol === "string") &&
+    !!record(event.payloadSchema);
 }
