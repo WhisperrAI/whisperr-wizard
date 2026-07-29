@@ -72,15 +72,6 @@ export async function tryEngineFlow(options: {
     sink,
     callbacks: {
       reviewEvents: async (proposed) => reviewEventsInTerminal(proposed, theme),
-      confirmApply: async (patch, summaryLines) => {
-        p.note(summaryLines.join("\n"), "Integration result");
-        const lineCount = patch.split("\n").length;
-        const answer = await p.confirm({
-          message: `Apply these changes to your working tree? (${lineCount} patch lines)`,
-          initialValue: true,
-        });
-        return answer === true;
-      },
     },
   });
 
@@ -140,7 +131,7 @@ async function reviewEventsInTerminal(
   });
   p.note(lines.join("\n\n"), `Proposed events (${proposed.length})`);
   const selection = await p.multiselect({
-    message: "Register these events? Deselect any you don't want.",
+    message: "Register and integrate these events? Deselect any you don't want.",
     options: proposed.map((event) => ({ value: event.code, label: event.code, hint: event.name })),
     initialValues: proposed.map((event) => event.code),
     required: false,

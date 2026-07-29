@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 export class WorktreeError extends Error {
   constructor(
@@ -49,21 +49,70 @@ async function must(cwd: string, args: string[]): Promise<string> {
   return result.stdout;
 }
 
-export async function createWorktree(repoPath: string, force = false): Promise<WorktreeHandle> {
+function safeRepoFile(repoPath: string, file: string): string {
+  const path = resolve(repoPath, file);
+  if (path === repoPath || !path.startsWith(repoPath + sep) || relative(repoPath, path).startsWith("..")) {
+    throw new WorktreeError("git_failed", `unsafe progress file path: ${file}`);
+  }
+  return path;
+}
+
+async function dirtyFiles(repoPath: string): Promise<string[]> {
+  const tracked = await must(repoPath, ["diff", "--name-only", "-z", "HEAD"]);
+  const untracked = await must(repoPath, ["ls-files", "--others", "--exclude-standard", "-z"]);
+  return [...new Set((tracked + untracked).split("\0").filter(Boolean))];
+}
+
+async function seedWorktree(
+  repoPath: string,
+  worktreePath: string,
+  files: string[],
+): Promise<void> {
+  for (const file of files) {
+    const source = safeRepoFile(repoPath, file);
+    const destination = safeRepoFile(worktreePath, file);
+    try {
+      await lstat(source);
+      await mkdir(dirname(destination), { recursive: true });
+      await cp(source, destination, { recursive: true, force: true });
+    } catch {
+      await rm(destination, { recursive: true, force: true });
+    }
+  }
+}
+
+export async function createWorktree(
+  repoPath: string,
+  force = false,
+  allowedDirtyFiles: string[] = [],
+): Promise<WorktreeHandle> {
   const inside = await git(repoPath, ["rev-parse", "--is-inside-work-tree"]);
   if (!inside.ok) {
     throw new WorktreeError("not_a_repo", "the target directory is not a git repository");
   }
-  const status = await must(repoPath, ["status", "--porcelain"]);
-  if (status.trim() !== "" && !force) {
+  const dirty = await dirtyFiles(repoPath);
+  const allowed = new Set(allowedDirtyFiles);
+  const unexpected = dirty.filter((file) => !allowed.has(file));
+  if (unexpected.length > 0 && !force) {
     throw new WorktreeError(
       "dirty_repo",
-      "the repository has uncommitted changes — commit or stash them, or rerun with --force",
+      `the repository has unrelated uncommitted changes (${unexpected.slice(0, 3).join(", ")}) — commit or stash them, or rerun with --force`,
     );
   }
-  const baseRef = (await must(repoPath, ["rev-parse", "HEAD"])).trim();
+  let baseRef = (await must(repoPath, ["rev-parse", "HEAD"])).trim();
   const path = await mkdtemp(join(tmpdir(), "whisperr-worktree-"));
   await must(repoPath, ["worktree", "add", "--detach", "--force", path, "HEAD"]);
+  const seedFiles = force ? dirty : dirty.filter((file) => allowed.has(file));
+  if (seedFiles.length > 0) {
+    await seedWorktree(repoPath, path, seedFiles);
+    await must(path, ["add", "-A"]);
+    await must(path, [
+      "-c", "user.name=Whisperr Wizard",
+      "-c", "user.email=wizard@whisperr.net",
+      "commit", "--no-gpg-sign", "-m", "Whisperr resume checkpoint",
+    ]);
+    baseRef = (await must(path, ["rev-parse", "HEAD"])).trim();
+  }
   return { path, baseRef, repoPath };
 }
 
@@ -95,6 +144,25 @@ export async function applyPatchToRepo(handle: WorktreeHandle, patch: string): P
     });
     child.stdin.end(patch);
   });
+}
+
+export async function commitWorktreeCheckpoint(handle: WorktreeHandle): Promise<void> {
+  await must(handle.path, ["add", "-A"]);
+  const patch = await must(handle.path, ["diff", "--cached", "--binary", handle.baseRef]);
+  if (patch.trim() === "") {
+    return;
+  }
+  await must(handle.path, [
+    "-c", "user.name=Whisperr Wizard",
+    "-c", "user.email=wizard@whisperr.net",
+    "commit", "--no-gpg-sign", "-m", "Whisperr integration checkpoint",
+  ]);
+  handle.baseRef = (await must(handle.path, ["rev-parse", "HEAD"])).trim();
+}
+
+export async function discardWorktreeChanges(handle: WorktreeHandle): Promise<void> {
+  await must(handle.path, ["reset", "--hard", handle.baseRef]);
+  await must(handle.path, ["clean", "-fd"]);
 }
 
 export async function savePartialPatch(handle: WorktreeHandle, destination: string): Promise<string | undefined> {

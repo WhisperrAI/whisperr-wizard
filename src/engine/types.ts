@@ -52,7 +52,7 @@ export type RoleOutcome =
 
 export interface EngineProvider {
   name: string;
-  onRunReady?(runId: string): void;
+  onRunReady?(runId: string, resumeSessionId?: string): void;
   invoke(
     invocation: RoleInvocation,
     config: RoleModelConfig,
@@ -94,19 +94,4 @@ export interface Cluster {
   status: ClusterStatus;
   attempts: number;
   note?: string;
-}
-
-export interface EngineRunState {
-  version: 1;
-  apiBaseUrl: string;
-  appId: string;
-  repoFingerprint: string;
-  runId: string;
-  phase: EnginePhase;
-  providerSessions: Partial<Record<EngineRole, string>>;
-  designComplete: boolean;
-  tombstonedCodes: string[];
-  clusters: Cluster[];
-  worktreePath?: string;
-  updatedAt: string;
 }

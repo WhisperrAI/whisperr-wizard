@@ -7,9 +7,9 @@ export function createRoutedProvider(
   const providers = new Set<EngineProvider>([fallback, ...Object.values(routes)]);
   return {
     name: "routed",
-    onRunReady(runId: string): void {
+    onRunReady(runId: string, resumeSessionId?: string): void {
       for (const provider of providers) {
-        provider.onRunReady?.(runId);
+        provider.onRunReady?.(runId, resumeSessionId);
       }
     },
     invoke(

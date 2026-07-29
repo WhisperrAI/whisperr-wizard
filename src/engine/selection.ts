@@ -86,8 +86,17 @@ export function validateProposedEvent(
   if (rejected.has(code)) {
     return { ok: false, reason: `event ${code} was rejected by the user — do not re-propose it` };
   }
-  if (!input.name.trim() || !input.reasoning.trim() || !input.anchorFile.trim()) {
+  const anchorFile = input.anchorFile.trim().replaceAll("\\", "/");
+  const anchorParts = anchorFile.split("/");
+  if (!input.name.trim() || !input.reasoning.trim() || !anchorFile) {
     return { ok: false, reason: "name, reasoning, and anchorFile are required" };
+  }
+  if (
+    anchorFile.startsWith("/") ||
+    /^[a-z]:/i.test(anchorFile) ||
+    anchorParts.some((part) => part === "" || part === "." || part === "..")
+  ) {
+    return { ok: false, reason: "anchorFile must be a safe repository-relative path" };
   }
   const schema: Record<string, string> = {};
   for (const [field, description] of Object.entries(input.payloadSchema ?? {})) {
@@ -109,7 +118,7 @@ export function validateProposedEvent(
       code,
       name: input.name.trim(),
       reasoning: input.reasoning.trim(),
-      anchorFile: input.anchorFile.trim(),
+      anchorFile,
       anchorSymbol: input.anchorSymbol?.trim() || undefined,
       payloadSchema: schema,
     },
@@ -149,6 +158,7 @@ export async function runSelection(
   surveyReport: string,
   rejectedCodes: string[],
   sink: ProgressSink,
+  existingEventCodes = bootstrap.snapshot.events.map((event) => event.code),
 ): Promise<SelectionResult> {
   const proposed: ProposedEvent[] = [];
   const seen = new Set<string>();
@@ -235,7 +245,7 @@ export async function runSelection(
       userPrompt: selectionUserPrompt(
         surveyReport,
         renderOnboardingContext(bootstrap.onboardingContext),
-        bootstrap.snapshot.events.map((event) => event.code),
+        existingEventCodes,
         rejectedCodes,
       ),
       tools: [proposeTool, finishTool],
@@ -274,10 +284,12 @@ export async function registerApprovedEvents(
         code: event.code,
         name: event.name,
         reasoning: event.reasoning,
+        anchorFile: event.anchorFile,
+        ...(event.anchorSymbol ? { anchorSymbol: event.anchorSymbol } : {}),
         ...(Object.keys(event.payloadSchema).length > 0
           ? { payloadSchema: event.payloadSchema }
           : {}),
-      });
+      }, "placement-v2");
     } catch (error) {
       // Another project in this app already owns the code (multi-repo apps:
       // the backend registered it first). Selection saw the app-wide snapshot
