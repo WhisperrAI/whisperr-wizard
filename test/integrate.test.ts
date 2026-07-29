@@ -5,7 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { generateBindings } from "../src/engine/bindings.js";
-import { runClusterIntegration, type IntegrationDeps } from "../src/engine/integrate.js";
+import {
+  runClusterIntegration,
+  runSdkSetupPass,
+  type IntegrationDeps,
+} from "../src/engine/integrate.js";
 import { createProgressSink } from "../src/engine/output.js";
 import { placementsFor, type RegisteredEvent } from "../src/engine/selection.js";
 import type { EngineModelConfig, EngineProvider, RoleInvocation } from "../src/engine/types.js";
@@ -59,6 +63,47 @@ test("verify steps resolve from the repository honestly", () => {
   assert.equal(verifiedStatus([{ kind: "typecheck", command: "npm", args: [], ok: true, output: "" }]), "type_verified");
   assert.equal(verifiedStatus([{ kind: "typecheck", command: "npm", args: [], ok: false, output: "boom" }]), "applied");
   assert.equal(runVerificationStatus([]), "unavailable");
+});
+
+test("SDK setup accepts deterministically valid changes at the model turn limit", async () => {
+  const worktreePath = mkdtempSync(join(tmpdir(), "setup-turn-limit-"));
+  writeFileSync(join(worktreePath, "package.json"), "{}");
+  const worktree: WorktreeHandle = { path: worktreePath, baseRef: "abc", repoPath: worktreePath };
+  const models: EngineModelConfig = {
+    survey: { model: "m", maxTurns: 5, maxMs: 1000 },
+    design: { model: "m", maxTurns: 5, maxMs: 1000 },
+    edit: { model: "m", maxTurns: 5, maxMs: 1000 },
+    review: { model: "m", maxTurns: 5, maxMs: 1000 },
+    sdk_setup: { model: "opus", maxTurns: 5, maxMs: 1000 },
+    repair: { model: "sol", maxTurns: 5, maxMs: 1000 },
+  };
+  let fallbackCalls = 0;
+  const provider: EngineProvider = {
+    name: "hybrid",
+    async invoke() {
+      return { kind: "budget_exhausted", costUsd: 0, turns: 5 };
+    },
+    async invokeFallback() {
+      fallbackCalls += 1;
+      return { kind: "completed", text: "unused", costUsd: 0, turns: 1 };
+    },
+  };
+  const deps: IntegrationDeps = {
+    provider,
+    models,
+    worktree,
+    target: "nextjs",
+    playbookSystemPrompt: "system",
+    registered,
+    ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
+    sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
+    saveClusters: () => {},
+    discardChanges: async () => {},
+    onClusterIntegrated: async () => {},
+  };
+
+  assert.equal(await runSdkSetupPass(deps, generateBindings("nextjs", registered), async () => true), true);
+  assert.equal(fallbackCalls, 0);
 });
 
 test("cluster integration marks overflow clusters resumable and structurally verifies the rest", async () => {

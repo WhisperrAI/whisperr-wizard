@@ -117,14 +117,20 @@ export async function runSdkSetupPass(
     (action) => deps.sink.emit({ phase: "binding", action }),
   );
   const passesValidation = async () => {
-    if (!validate) return true;
+    if (!validate) return outcome.kind === "completed";
     try {
       return await validate();
     } catch {
       return false;
     }
   };
-  let valid = outcome.kind === "completed" && await passesValidation();
+  let valid = await passesValidation();
+  if (valid && outcome.kind !== "completed") {
+    deps.sink.emit({
+      phase: "binding",
+      action: `setup changes passed deterministic validation after ${outcome.kind.replaceAll("_", " ")}`,
+    });
+  }
   if (!valid && deps.provider.invokeFallback) {
     await deps.discardChanges();
     await writeFile(join(deps.worktree.path, bindings.relativePath), bindings.content);
@@ -134,7 +140,13 @@ export async function runSdkSetupPass(
       modelConfigFor(deps.models, "repair", "edit"),
       (action) => deps.sink.emit({ phase: "binding", action }),
     );
-    valid = outcome.kind === "completed" && await passesValidation();
+    valid = await passesValidation();
+    if (valid && outcome.kind !== "completed") {
+      deps.sink.emit({
+        phase: "binding",
+        action: `Sol setup passed deterministic validation after ${outcome.kind.replaceAll("_", " ")}`,
+      });
+    }
   }
   return valid;
 }
@@ -250,10 +262,8 @@ export async function runClusterIntegration(
         deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
     );
 
-    let structural = edit.kind === "completed"
-      ? await structuralClusterCheck(deps.worktree.path, cluster)
-      : { ok: false, notes: `edit ${edit.kind}` };
-    if ((!structural.ok || edit.kind !== "completed") && deps.provider.invokeFallback) {
+    let structural = await structuralClusterCheck(deps.worktree.path, cluster);
+    if (!structural.ok && deps.provider.invokeFallback) {
       await deps.discardChanges();
       deps.sink.emit({
         phase: "integrating",
@@ -266,12 +276,10 @@ export async function runClusterIntegration(
         (action) =>
           deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
       );
-      structural = edit.kind === "completed"
-        ? await structuralClusterCheck(deps.worktree.path, cluster)
-        : { ok: false, notes: `Sol escalation ${edit.kind}` };
+      structural = await structuralClusterCheck(deps.worktree.path, cluster);
     }
 
-    if (edit.kind !== "completed" || !structural.ok) {
+    if (!structural.ok) {
       const failure =
         edit.kind === "context_overflow"
           ? "context_overflow"
