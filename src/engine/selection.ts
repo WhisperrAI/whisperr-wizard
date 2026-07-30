@@ -298,7 +298,7 @@ export async function runSelection(
     },
     handler: async (input) => {
       if (finished) {
-        return { ok: false, reason: "event design is already frozen" };
+        return { ok: false, reason: "event design draft is already complete" };
       }
       const candidate: ProposedEvent = {
         code: String(input.code ?? ""),
@@ -368,7 +368,8 @@ export async function runSelection(
 
   const finishTool: EngineTool = {
     name: "finish_event_design",
-    description: "Freeze the complete batch after every important event has been proposed.",
+    description:
+      "Complete the proposed batch for deterministic server validation and atomic commit.",
     inputSchema: { summary: z.string().describe("one line on what was selected and why") },
     jsonSchema: {
       type: "object",

@@ -27,6 +27,7 @@ import {
   type IntegrationEventEvidence,
   type IntegrationProgress,
   type RunBootstrap,
+  type WizardCapabilities,
 } from "./runs.js";
 import {
   placementsFor,
@@ -162,6 +163,27 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     }
   };
 
+  try {
+    const capabilities = await runs.getCapabilities();
+    const required = requiredModelGateways(input.models);
+    const unavailable = required.filter(
+      (gateway) => capabilities.modelGateways[gateway] !== true,
+    );
+    if (unavailable.length > 0) {
+      const names = unavailable.map((gateway) =>
+        gateway === "openai" ? "OpenAI" : "Anthropic"
+      );
+      throw new Error(
+        `required ${names.join(" and ")} model gateway${names.length === 1 ? " is" : "s are"} unavailable`,
+      );
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const reason = `model gateway preflight failed: ${detail}`;
+    await failRun(reason);
+    return { kind: "aborted", reason };
+  }
+
   let survey = artifactContent<SurveyArtifact>(bootstrap, "survey");
   let registered: RegisteredEvent[];
   let preparedSetup:
@@ -215,74 +237,97 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       const existingCodes = bootstrap.snapshot.events
         .filter((event) => !recoverableCodes.has(event.code))
         .map((event) => event.code);
-      const designPromise = runSelection(
-        input.provider,
-        input.models,
-        input.repoPath,
-        bootstrap,
-        survey,
-        [],
-        input.sink,
-        existingCodes,
-        [...recoverableCodes],
-        surveySessionId,
-      );
+      const designPromise = (async () => {
+        const selection = await runSelection(
+          input.provider,
+          input.models,
+          input.repoPath,
+          bootstrap,
+          survey,
+          [],
+          input.sink,
+          existingCodes,
+          [...recoverableCodes],
+          surveySessionId,
+        );
+        if (!selection.finished) {
+          throw new Error(
+            selection.outcome === "completed"
+              ? "design did not call finish_event_design"
+              : `design ${selection.outcomeDetail}`,
+          );
+        }
+        if (selection.proposed.length === 0) {
+          throw new Error("selection finished with no accepted events");
+        }
+        if (
+          recoverableCodes.size > 0 &&
+          (selection.proposed.length !== recoverableCodes.size ||
+            selection.proposed.some((event) => !recoverableCodes.has(event.code)))
+        ) {
+          throw new Error("placement recovery must cover the frozen event set exactly");
+        }
+
+        // Commit as soon as design completes. SDK setup remains independent and
+        // can still be running in parallel while this progress becomes durable.
+        await patchPhase("persisting", `registering ${selection.proposed.length} events`);
+        const design = {
+          surveyHash: artifactContentHash(survey),
+          summary: selection.summary,
+          events: [...selection.proposed].sort((a, b) => a.code.localeCompare(b.code)),
+        };
+        const config = modelConfigForTask(input.models, "design", "design");
+        const committed = await runs.commitDesign(
+          runId,
+          design,
+          design.events.map(eventRequest),
+          modelMetadata(config),
+        );
+        const committedEvents = registeredFromSnapshot(
+          committed.events.filter((event) => event.projectId === bootstrap.project.id),
+        );
+        input.sink.emit({
+          phase: "persisting",
+          action: `designed and registered ${selection.proposed.length} events`,
+        });
+        const unresolved = projectEvents
+          .filter((event) => !committedEvents.some((candidate) => candidate.code === event.code))
+          .map((event) => event.code);
+        if (unresolved.length > 0) {
+          throw new Error(`could not recover placements for: ${unresolved.join(", ")}`);
+        }
+        return committedEvents;
+      })();
       const setupPromise = prepareSdkSetup(
         input,
         bootstrap,
         survey,
         bootstrap.run.integrationEvidence?.changedFiles ?? [],
       );
-      const [selection, setup] = await Promise.all([designPromise, setupPromise]);
-      preparedSetup = setup;
-      if (!setup.completed) {
-        throw new Error(setup.error ?? "Sol SDK setup did not complete");
+      const [designResult, setupResult] = await Promise.allSettled([
+        designPromise,
+        setupPromise,
+      ]);
+      if (setupResult.status === "fulfilled") {
+        preparedSetup = setupResult.value;
       }
-      if (!selection.finished) {
-        const reason = selection.outcome === "completed"
-          ? "design did not call finish_event_design"
-          : `design ${selection.outcomeDetail}`;
-        await failRun(reason);
-        return { kind: "aborted", reason };
+      if (designResult.status === "rejected") {
+        throw designResult.reason;
       }
-      if (selection.proposed.length === 0) {
-        await failRun("selection finished with no accepted events");
-        return { kind: "aborted", reason: "selection finished with no accepted events" };
-      }
+      registered = designResult.value;
 
-      if (
-        recoverableCodes.size > 0 &&
-        (selection.proposed.length !== recoverableCodes.size ||
-          selection.proposed.some((event) => !recoverableCodes.has(event.code)))
-      ) {
-        throw new Error("placement recovery must cover the frozen event set exactly");
+      // Survey/design and SDK setup intentionally run in parallel. Commit the
+      // validated design first so a setup failure cannot discard completed
+      // design work; a rerun will reuse the registered event set.
+      await patchPhase("binding");
+      if (setupResult.status === "rejected") {
+        const detail = setupResult.reason instanceof Error
+          ? setupResult.reason.message
+          : String(setupResult.reason);
+        throw new Error(`Sol SDK setup failed: ${detail}`);
       }
-
-      await patchPhase("persisting", `registering ${selection.proposed.length} events`);
-      const design = {
-        surveyHash: artifactContentHash(survey),
-        summary: selection.summary,
-        events: [...selection.proposed].sort((a, b) => a.code.localeCompare(b.code)),
-      };
-      const config = modelConfigForTask(input.models, "design", "design");
-      const committed = await runs.commitDesign(
-        runId,
-        design,
-        design.events.map(eventRequest),
-        modelMetadata(config),
-      );
-      registered = registeredFromSnapshot(
-        committed.events.filter((event) => event.projectId === bootstrap.project.id),
-      );
-      input.sink.emit({
-        phase: "persisting",
-        action: `designed and registered ${selection.proposed.length} events`,
-      });
-      const unresolved = projectEvents
-        .filter((event) => !registered.some((candidate) => candidate.code === event.code))
-        .map((event) => event.code);
-      if (unresolved.length > 0) {
-        throw new Error(`could not recover placements for: ${unresolved.join(", ")}`);
+      if (!setupResult.value.completed) {
+        throw new Error(setupResult.value.error ?? "Sol SDK setup did not complete");
       }
     } else {
       registered = placed;
@@ -1045,6 +1090,26 @@ function modelRoutes(models: EngineModelConfig): Record<string, Record<string, u
     };
   }
   return result;
+}
+
+function requiredModelGateways(
+  models: EngineModelConfig,
+): Array<keyof WizardCapabilities["modelGateways"]> {
+  const required = new Set<"anthropic" | "openai">();
+  for (
+    const task of
+      ["survey", "design", "sdk_setup", "cluster_edit", "review", "repair"] as const
+  ) {
+    const role = task === "survey" || task === "design"
+      ? task
+      : task === "review"
+        ? "review"
+        : "edit";
+    const model = (models[task] ?? models[role]).model.toLowerCase();
+    if (model.includes("claude")) required.add("anthropic");
+    else required.add("openai");
+  }
+  return [...required];
 }
 
 function registeredFromSnapshot(events: RunBootstrap["snapshot"]["events"]): RegisteredEvent[] {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.3
+
+- Preflight the authenticated model gateways before starting repository work,
+  with clear provider-availability failures instead of late raw routing errors.
+- Persist and register a completed event design independently while SDK setup
+  runs in parallel, retaining that progress when setup fails and recording the
+  failure under the binding phase.
+- Reserve “frozen” wording for the successful atomic server commit.
+
 ## 0.10.2
 
 - Preserve the actual provider, validation, review, repair, verification, and

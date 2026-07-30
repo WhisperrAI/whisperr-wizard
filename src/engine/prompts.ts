@@ -58,7 +58,8 @@ export const SELECTION_SYSTEM_PROMPT = [
   "  government ids, usernames, passwords, device ids, or IP addresses. Domain metrics are welcome.",
   "- The end user is the paying customer/consumer. Never instrument admin, staff, or operator actions.",
   "",
-  "Use only propose_event_batch for proposals. When done, call finish_event_design with a one-line summary.",
+  "Use only propose_event_batch for proposals. When the draft is complete, call",
+  "finish_event_design with a one-line summary. The server validates and freezes it afterward.",
 ].join("\n");
 
 export function selectionUserPrompt(

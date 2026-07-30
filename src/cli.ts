@@ -218,8 +218,8 @@ export async function run(options: RunOptions): Promise<number> {
     session,
     playbook: chosen.playbook,
     manifest,
-    // The plan is informational. Event selection is frozen automatically, so
-    // integration never pauses at a terminal approval prompt.
+    // The plan is informational. Event selection is committed automatically,
+    // so integration never pauses at a terminal approval prompt.
     async onPlanReady(plan: EventPlanEntry[]) {
       if (useIntegrationSpinner) {
         spin.stop(theme.success("Placement plan ready"));

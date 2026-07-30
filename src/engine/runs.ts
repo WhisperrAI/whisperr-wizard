@@ -110,6 +110,13 @@ export interface DesignCommitResult {
   created: boolean;
 }
 
+export interface WizardCapabilities {
+  modelGateways: {
+    anthropic: boolean;
+    openai: boolean;
+  };
+}
+
 export class RunsApiError extends Error {
   constructor(
     message: string,
@@ -192,6 +199,12 @@ export class RunsClient {
 
   getRun(runId: string): Promise<RunBootstrap> {
     return this.request<unknown>("GET", `/wizard/runs/${runId}`).then(normalizeRunBootstrap);
+  }
+
+  getCapabilities(): Promise<WizardCapabilities> {
+    return this.request<unknown>("GET", "/wizard/capabilities").then(
+      normalizeWizardCapabilities,
+    );
   }
 
   patchRun(
@@ -291,6 +304,24 @@ export class RunsClient {
       { ...completion },
     );
   }
+}
+
+function normalizeWizardCapabilities(payload: unknown): WizardCapabilities {
+  const value = record(payload);
+  const gateways = record(value?.modelGateways);
+  if (
+    !gateways ||
+    typeof gateways.anthropic !== "boolean" ||
+    typeof gateways.openai !== "boolean"
+  ) {
+    throw new RunsApiError("runs API returned invalid wizard capabilities");
+  }
+  return {
+    modelGateways: {
+      anthropic: gateways.anthropic,
+      openai: gateways.openai,
+    },
+  };
 }
 
 function normalizeItemWriteResult(payload: unknown): ItemWriteResult {

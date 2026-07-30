@@ -61,6 +61,7 @@ interface MockState {
   resumed?: boolean;
   failCompletion?: boolean;
   modelSessions?: Record<string, string>;
+  modelGateways?: { anthropic: boolean; openai: boolean };
 }
 
 function startMockRuntime(state: MockState): Promise<{ server: Server; port: number }> {
@@ -75,6 +76,15 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
         response.end(JSON.stringify(payload));
       };
       const url = request.url ?? "";
+      if (request.method === "GET" && url === "/wizard/capabilities") {
+        send({
+          modelGateways: state.modelGateways ?? {
+            anthropic: true,
+            openai: true,
+          },
+        });
+        return;
+      }
       if (request.method === "POST" && url === "/wizard/runs") {
         send({
           project: {
@@ -618,6 +628,44 @@ test("orchestrator reports the actual Sol SDK setup failure", async () => {
     if (result.kind !== "aborted") return;
     assert.match(result.reason, /provider rejected the setup request/);
     assert.doesNotMatch(result.reason, /deterministic validation/);
+    assert.equal(state.items.length, 1, "successful design is committed before setup failure");
+    assert.ok(
+      state.artifacts?.some((artifact) => artifact.kind === "event_design"),
+      "successful design artifact is retained",
+    );
+    assert.ok(
+      state.patches.some((patch) => patch.phase === "binding"),
+      "SDK setup failure is checkpointed in the binding phase",
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test("orchestrator fails preflight before invoking a model when OpenAI is unavailable", async () => {
+  const state: MockState = {
+    items: [],
+    completions: [],
+    patches: [],
+    snapshotEvents: [],
+    modelGateways: { anthropic: true, openai: false },
+  };
+  const { server, port } = await startMockRuntime(state);
+  const invoked: string[] = [];
+  try {
+    const result = await runEngine(engineInput(
+      initRepo(),
+      port,
+      scriptedProvider({ invoked }),
+      "gateway-unavailable",
+    ));
+    assert.equal(result.kind, "aborted");
+    if (result.kind !== "aborted") return;
+    assert.match(result.reason, /model gateway preflight failed/i);
+    assert.match(result.reason, /OpenAI model gateway is unavailable/i);
+    assert.deepEqual(invoked, []);
+    assert.equal(state.items.length, 0);
+    assert.equal(state.artifacts?.length, 0);
   } finally {
     server.close();
   }
