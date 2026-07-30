@@ -19,7 +19,7 @@ import type {
   EventPlacement,
   RoleOutcome,
 } from "./types.js";
-import { modelConfigFor } from "./types.js";
+import { describeRoleOutcome, modelConfigFor } from "./types.js";
 
 export interface ProposedEvent {
   code: string;
@@ -64,6 +64,7 @@ export interface SurveyArtifact {
 
 export interface SelectionResult {
   outcome: RoleOutcome["kind"];
+  outcomeDetail: string;
   /** True only when finish_event_design ran successfully — not when the model stream ended. */
   finished: boolean;
   proposed: ProposedEvent[];
@@ -406,6 +407,7 @@ export async function runSelection(
   );
   return {
     outcome: outcome.kind,
+    outcomeDetail: describeRoleOutcome(outcome),
     finished,
     proposed,
     summary,

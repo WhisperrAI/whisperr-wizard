@@ -155,6 +155,57 @@ test("openai provider binds a conversation and loops function calls", async () =
   assert.equal(conversationCreates.length, 2, "design and survey use isolated conversations");
 });
 
+test("openai provider preserves a terminal response error returned with HTTP 200", async () => {
+  const server = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      response.setHeader("Content-Type", "application/json");
+      if ((request.url ?? "").endsWith("/v1/conversations")) {
+        response.end(JSON.stringify({ id: "conv_failed" }));
+        return;
+      }
+      response.end(JSON.stringify({
+        id: "resp_failed",
+        status: "failed",
+        error: { message: "provider rejected the setup request" },
+        output: [],
+      }));
+    });
+  });
+  const port = await new Promise<number>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address ? address.port : 0);
+    });
+  });
+  const provider = createOpenAIProvider(
+    { apiBaseUrl: `http://127.0.0.1:${port}` } as WizardConfig,
+    { token: "tok", appId: "app", expiresAt: 0 } as WizardSession,
+  );
+  provider.onRunReady?.("wrun_failed");
+  const outcome = await provider.invoke(
+    {
+      role: "edit",
+      task: "sdk_setup",
+      sessionKey: "sdk_setup",
+      systemPrompt: "system",
+      userPrompt: "setup",
+      tools: [],
+      repositoryAccess: { mode: "sdk_setup", allowedFiles: [] },
+      allowRepoWrite: true,
+      cwd: mkdtempSync(join(tmpdir(), "openai-failed-")),
+    },
+    roleConfig,
+    () => {},
+  );
+  server.close();
+
+  assert.equal(outcome.kind, "failed");
+  if (outcome.kind === "failed") {
+    assert.match(outcome.error, /provider rejected the setup request/);
+  }
+});
+
 test("file tools are jailed to the repository", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "openai-jail-"));
   writeFileSync(join(cwd, "inside.txt"), "safe");

@@ -268,6 +268,7 @@ function scriptedProvider(options: {
   finishDesign?: boolean;
   zeroEvents?: boolean;
   invoked?: string[];
+  setupError?: string;
 } = {}): EngineProvider {
   return {
     name: "scripted",
@@ -306,6 +307,14 @@ function scriptedProvider(options: {
         return { kind: "completed", text: "designed", costUsd: 0, turns: 2 };
       }
       if (invocation.role === "edit" && invocation.task === "sdk_setup") {
+        if (options.setupError) {
+          return {
+            kind: "failed",
+            error: options.setupError,
+            costUsd: 0,
+            turns: 0,
+          };
+        }
         writeFileSync(
           join(invocation.cwd, "startup.ts"),
           [
@@ -587,6 +596,28 @@ test("orchestrator fails design when it freezes zero events", async () => {
     }
     assert.equal(state.items.length, 0);
     assert.equal(state.completions.length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test("orchestrator reports the actual Sol SDK setup failure", async () => {
+  const repo = initRepo();
+  const state: MockState = { items: [], completions: [], patches: [], snapshotEvents: [] };
+  const { server, port } = await startMockRuntime(state);
+  try {
+    const result = await runEngine(
+      engineInput(
+        repo,
+        port,
+        scriptedProvider({ setupError: "provider rejected the setup request" }),
+        "setup-error",
+      ),
+    );
+    assert.equal(result.kind, "aborted");
+    if (result.kind !== "aborted") return;
+    assert.match(result.reason, /provider rejected the setup request/);
+    assert.doesNotMatch(result.reason, /deterministic validation/);
   } finally {
     server.close();
   }

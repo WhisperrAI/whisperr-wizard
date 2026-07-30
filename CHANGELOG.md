@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.2
+
+- Preserve the actual provider, validation, review, repair, verification, and
+  run-persistence failure details instead of replacing them with generic phase
+  errors.
+- Reject terminal OpenAI response envelopes returned with HTTP 200, report the
+  exact failed verification command, and surface nonfatal checkpoint and
+  reporting failures in the CLI.
+
 ## 0.10.1
 
 - Persist the Opus survey conversation through the run's keyed `survey`

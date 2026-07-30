@@ -25,9 +25,11 @@ interface FunctionCallItem {
 
 interface ResponsePayload {
   id?: string;
+  status?: string;
   output?: Array<Record<string, unknown>>;
   output_text?: string;
   error?: { message?: string; code?: string; error?: { message?: string; code?: string } };
+  incomplete_details?: { reason?: string };
   usage?: { input_tokens?: number };
 }
 
@@ -228,8 +230,10 @@ export function createOpenAIProvider(
     );
     const text = await response.text();
     let payload: ResponsePayload & { code?: string; message?: string };
+    let parsed = false;
     try {
       payload = text ? (JSON.parse(text) as ResponsePayload) : {};
+      parsed = text.length > 0;
     } catch {
       payload = {};
     }
@@ -244,6 +248,13 @@ export function createOpenAIProvider(
       const error = new Error(detail || `gateway request failed (${response.status})`);
       (error as { code?: string }).code = top.code ?? nested?.code;
       throw error;
+    }
+    if (!parsed) {
+      throw new Error(
+        text
+          ? `model gateway returned invalid JSON (${response.status})`
+          : `model gateway returned an empty response (${response.status})`,
+      );
     }
     return payload;
   };
@@ -386,6 +397,19 @@ export function createOpenAIProvider(
               continue;
             }
             throw error;
+          }
+          const responseError = response.error?.error ?? response.error;
+          const terminalStatus = response.status?.toLowerCase();
+          if (
+            responseError?.message ||
+            terminalStatus === "failed" ||
+            terminalStatus === "cancelled" ||
+            terminalStatus === "incomplete"
+          ) {
+            const detail = responseError?.message ??
+              response.incomplete_details?.reason ??
+              `model response ended with status ${terminalStatus}`;
+            throw new Error(detail);
           }
           if ((response.usage?.input_tokens ?? 0) >= 787_500) {
             await tryCompact(gatewayFetch, roleConfig.model, conversation, sessionKey, task);

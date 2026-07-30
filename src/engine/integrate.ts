@@ -14,7 +14,7 @@ import type {
   EventIntegrationStatus,
   RoleInvocation,
 } from "./types.js";
-import { modelConfigFor } from "./types.js";
+import { describeRoleOutcome, modelConfigFor } from "./types.js";
 import {
   resolveVerifySteps,
   runVerificationStatus,
@@ -54,6 +54,11 @@ export interface IntegrationResult {
   identifyWired: boolean;
 }
 
+export interface ModelStepResult {
+  completed: boolean;
+  error?: string;
+}
+
 const REVIEW_CHECKLIST = [
   "- Events must fire after the confirmed outcome (post-await/success), never on intent or button tap.",
   "- View-appearance events must be deduplicated against re-renders and navigation returns.",
@@ -77,7 +82,7 @@ export async function runSdkSetupPass(
   deps: IntegrationDeps,
   bindings: GeneratedBindings,
   validate?: () => Promise<boolean>,
-): Promise<boolean> {
+): Promise<ModelStepResult> {
   deps.sink.emit({ phase: "binding", action: "installing SDK and wiring identify()" });
   const allowedFiles = await sdkSetupFiles(deps.worktree.path, deps.survey, bindings.relativePath);
   const invocation: RoleInvocation = {
@@ -111,6 +116,7 @@ export async function runSdkSetupPass(
     cwd: deps.worktree.path,
   };
   let followup = invocation;
+  let lastValidationFailure = "";
   for (;;) {
     const outcome = await deps.provider.invoke(
       followup,
@@ -118,7 +124,11 @@ export async function runSdkSetupPass(
       (action) => deps.sink.emit({ phase: "binding", action }),
     );
     if (outcome.kind !== "completed") {
-      return false;
+      const suffix = lastValidationFailure ? `; last validation: ${lastValidationFailure}` : "";
+      return {
+        completed: false,
+        error: `Sol SDK setup ${describeRoleOutcome(outcome)}${suffix}`,
+      };
     }
     await materializeSetupCredentials(
       deps.worktree.path,
@@ -126,18 +136,25 @@ export async function runSdkSetupPass(
       deps.ingestion.apiKey,
       deps.ingestion.baseUrl,
     );
+    let validationError = "";
     const valid = await (async () => {
       if (!validate) return true;
       try {
         return await validate();
-      } catch {
+      } catch (error) {
+        validationError = error instanceof Error ? error.message : String(error);
         return false;
       }
     })();
-    if (valid) return true;
+    if (valid) return { completed: true };
+    lastValidationFailure = validationError
+      ? `validator error: ${validationError}`
+      : "required SDK wiring is still missing";
     deps.sink.emit({
       phase: "binding",
-      action: "setup validation found missing wiring; returning diagnostics to the same Sol conversation",
+      action: validationError
+        ? `setup validation errored (${validationError.slice(0, 160)}); returning diagnostics to the same Sol conversation`
+        : "setup validation found missing wiring; returning diagnostics to the same Sol conversation",
     });
     followup = {
       ...invocation,
@@ -146,6 +163,7 @@ export async function runSdkSetupPass(
         "Inspect the current allowed files and repair the existing work in place.",
         "Ensure initialization, generated binding, login identify(), session-restoration identify(),",
         "and logout reset() are all present. Do not insert product events. Finish the same task.",
+        `Deterministic validation result: ${lastValidationFailure}.`,
       ].join("\n"),
     };
   }
@@ -311,7 +329,7 @@ export async function runClusterIntegration(
         clusters,
         cluster.id,
         "failed_resumable",
-        structural.notes || `edit ${edit.kind}`,
+        structural.notes || `Terra event insertion ${describeRoleOutcome(edit)}`,
       );
       deps.saveClusters(clusters);
       for (const placement of cluster.events) {
@@ -544,13 +562,16 @@ export async function reviewIntegratedFile(
     (action) => deps.sink.emit({ phase: "reviewing", file, action }),
   );
   if (outcome.kind !== "completed" || verdict === undefined) {
+    const detail = outcome.kind === "completed"
+      ? "completed without calling finish_review"
+      : describeRoleOutcome(outcome);
     return {
       ok: false,
       issues: events.map((event) => ({
         eventCode: event.code,
-        reason: `semantic review did not finish (${outcome.kind})`,
+        reason: `semantic review ${detail}`,
       })),
-      notes: `semantic review did not finish (${outcome.kind})`,
+      notes: `semantic review ${detail}`,
     };
   }
   return { ok: verdict === "pass" && issues.length === 0, issues, notes };
@@ -561,7 +582,7 @@ export async function repairIntegratedFile(
   file: string,
   events: RegisteredEvent[],
   review: SemanticReviewResult,
-): Promise<boolean> {
+): Promise<ModelStepResult> {
   deps.sink.emit({ phase: "reviewing", file, action: "Sol is repairing semantic review failures" });
   const outcome = await deps.provider.invoke(
     {
@@ -589,7 +610,9 @@ export async function repairIntegratedFile(
     modelConfigFor(deps.models, "repair", "edit"),
     (action) => deps.sink.emit({ phase: "reviewing", file, action }),
   );
-  return outcome.kind === "completed";
+  return outcome.kind === "completed"
+    ? { completed: true }
+    : { completed: false, error: `Sol semantic repair ${describeRoleOutcome(outcome)}` };
 }
 
 export async function finalizeIntegration(
@@ -610,9 +633,9 @@ export async function repairVerification(
   deps: IntegrationDeps,
   results: VerifyStepResult[],
   cycle = 1,
-): Promise<boolean> {
+): Promise<ModelStepResult> {
   const failed = results.filter((result) => !result.ok);
-  if (failed.length === 0) return true;
+  if (failed.length === 0) return { completed: true };
   deps.sink.emit({ phase: "verifying", action: "Sol is repairing final verification failures" });
   const allowedFiles = deps.allowedRepairFiles ?? deps.registered.map((event) => event.anchorFile);
   const outcome = await deps.provider.invoke(
@@ -636,5 +659,7 @@ export async function repairVerification(
     modelConfigFor(deps.models, "repair", "edit"),
     (action) => deps.sink.emit({ phase: "verifying", action }),
   );
-  return outcome.kind === "completed";
+  return outcome.kind === "completed"
+    ? { completed: true }
+    : { completed: false, error: `Sol verification repair ${describeRoleOutcome(outcome)}` };
 }

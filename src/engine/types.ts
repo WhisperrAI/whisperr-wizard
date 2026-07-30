@@ -84,6 +84,17 @@ export type RoleOutcome =
   | { kind: "context_overflow"; sessionId?: string; costUsd: number; turns: number }
   | { kind: "failed"; error: string; sessionId?: string; costUsd: number; turns: number };
 
+export function describeRoleOutcome(outcome: RoleOutcome): string {
+  if (outcome.kind === "failed") {
+    const detail = outcome.error.trim();
+    return detail ? `failed: ${detail}` : "failed without a provider error";
+  }
+  if (outcome.kind === "context_overflow") {
+    return "ended with an unrecovered context overflow";
+  }
+  return "completed";
+}
+
 export interface EngineProvider {
   name: string;
   onRunReady?(runId: string, resumeSessionId?: string): void;

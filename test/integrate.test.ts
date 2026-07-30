@@ -13,7 +13,12 @@ import {
 import { createProgressSink } from "../src/engine/output.js";
 import { placementsFor, type RegisteredEvent } from "../src/engine/selection.js";
 import type { EngineModelConfig, EngineProvider, RoleInvocation } from "../src/engine/types.js";
-import { resolveVerifySteps, runVerificationStatus, verifiedStatus } from "../src/engine/verify.js";
+import {
+  resolveVerifySteps,
+  runVerificationStatus,
+  verificationCommand,
+  verifiedStatus,
+} from "../src/engine/verify.js";
 import type { WorktreeHandle } from "../src/engine/worktree.js";
 
 const registered: RegisteredEvent[] = [
@@ -63,6 +68,13 @@ test("verify steps resolve from the repository honestly", () => {
   assert.equal(verifiedStatus([{ kind: "typecheck", command: "npm", args: [], ok: true, output: "" }]), "type_verified");
   assert.equal(verifiedStatus([{ kind: "typecheck", command: "npm", args: [], ok: false, output: "boom" }]), "applied");
   assert.equal(runVerificationStatus([]), "unavailable");
+  assert.equal(
+    verificationCommand([
+      { kind: "typecheck", command: "npm", args: ["run", "typecheck"], ok: false, output: "boom" },
+      { kind: "build", command: "npm", args: ["run", "build"], ok: true, output: "" },
+    ]),
+    "npm run typecheck",
+  );
 });
 
 test("SDK setup accepts deterministically valid changes from its fixed Sol owner", async () => {
@@ -97,7 +109,57 @@ test("SDK setup accepts deterministically valid changes from its fixed Sol owner
     onClusterIntegrated: async () => {},
   };
 
-  assert.equal(await runSdkSetupPass(deps, generateBindings("nextjs", registered), async () => true), true);
+  assert.deepEqual(
+    await runSdkSetupPass(deps, generateBindings("nextjs", registered), async () => true),
+    { completed: true },
+  );
+});
+
+test("SDK setup preserves the fixed Sol owner's terminal error", async () => {
+  const worktreePath = mkdtempSync(join(tmpdir(), "setup-error-"));
+  writeFileSync(join(worktreePath, "package.json"), "{}");
+  const deps: IntegrationDeps = {
+    provider: {
+      name: "sol",
+      async invoke() {
+        return {
+          kind: "failed",
+          error: "conversation binding was rejected",
+          costUsd: 0,
+          turns: 0,
+        };
+      },
+    },
+    models: {
+      survey: { model: "m" },
+      design: { model: "m" },
+      edit: { model: "sol" },
+      review: { model: "sol" },
+      sdk_setup: { model: "sol" },
+    },
+    worktree: {
+      kind: "snapshot",
+      path: worktreePath,
+      baseRef: "abc",
+      repoPath: worktreePath,
+    },
+    target: "nextjs",
+    playbookSystemPrompt: "system",
+    registered,
+    ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
+    sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
+    saveClusters: () => {},
+    discardChanges: async () => {},
+    onClusterIntegrated: async () => {},
+  };
+
+  const result = await runSdkSetupPass(
+    deps,
+    generateBindings("nextjs", registered),
+    async () => true,
+  );
+  assert.equal(result.completed, false);
+  assert.match(result.error ?? "", /conversation binding was rejected/);
 });
 
 test("cluster integration marks overflow clusters resumable and structurally verifies the rest", async () => {

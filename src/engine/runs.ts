@@ -150,12 +150,15 @@ export class RunsClient {
         body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch (error) {
-      throw new RunsApiError(error instanceof Error ? error.message : "request failed");
+      const detail = error instanceof Error ? error.message : "request failed";
+      throw new RunsApiError(`runs API ${method} ${path} could not be reached: ${detail}`);
     }
     let payload: unknown;
     const text = await response.text();
+    let parsed = false;
     try {
       payload = text.length > 0 ? JSON.parse(text) : {};
+      parsed = text.length > 0;
     } catch {
       payload = {};
     }
@@ -165,6 +168,14 @@ export class RunsClient {
         detail.message ?? `runs API ${method} ${path} failed`,
         response.status,
         detail.code,
+      );
+    }
+    if (!parsed) {
+      throw new RunsApiError(
+        text
+          ? `runs API ${method} ${path} returned invalid JSON`
+          : `runs API ${method} ${path} returned an empty response`,
+        response.status,
       );
     }
     return payload as T;

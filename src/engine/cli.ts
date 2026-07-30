@@ -1,6 +1,6 @@
 import * as p from "@clack/prompts";
 
-import { postRunReport } from "../core/report.js";
+import { postRunReport, scrubSummary } from "../core/report.js";
 import { pollFirstEvent } from "../core/verify.js";
 import { packageVersion } from "../core/version.js";
 import type { Playbook, WizardConfig, WizardSession } from "../types.js";
@@ -139,7 +139,7 @@ export async function tryEngineFlow(options: {
     p.log.warn(`Unapplied changes saved to ${result.partialPatchPath}`);
   }
 
-  await postRunReport(config, session, {
+  const reportResult = await postRunReport(config, session, {
     target: playbook.target.id,
     repo_fingerprint: fingerprint,
     identify_wired: result.identifyWired,
@@ -151,7 +151,7 @@ export async function tryEngineFlow(options: {
     verification_status: result.verificationStatus,
     cost_usd: 0,
     duration_ms: Date.now() - startedAt,
-    summary: result.summary.slice(0, 2000),
+    summary: scrubSummary(result.summary).slice(0, 2000),
     events: result.reportEvents,
     wizard_version: packageVersion(),
     planner_model: models.survey.model,
@@ -161,6 +161,13 @@ export async function tryEngineFlow(options: {
     model_routes: result.modelRoutes,
     exit_class: result.kind === "completed" ? "engine_completed" : "engine_partial",
   });
+  if (!reportResult.ok) {
+    const detail = [
+      reportResult.status ? `HTTP ${reportResult.status}` : "",
+      reportResult.detail ?? "",
+    ].filter(Boolean).join(": ");
+    p.log.warn(`Run report could not be saved${detail ? ` — ${detail}` : ""}`);
+  }
 
   if (result.applied && result.registered.length > 0) {
     const spin = p.spinner();

@@ -72,6 +72,7 @@ export function runVerifyStep(
   return new Promise((resolve) => {
     const child = spawn(step.command, step.args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
+    let timedOut = false;
     const capture = (chunk: unknown) => {
       if (output.length < 20_000) {
         output += String(chunk);
@@ -80,6 +81,7 @@ export function runVerifyStep(
     child.stdout.on("data", capture);
     child.stderr.on("data", capture);
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
     child.on("error", (error) => {
@@ -88,7 +90,10 @@ export function runVerifyStep(
     });
     child.on("close", (exitCode) => {
       clearTimeout(timer);
-      resolve({ ...step, ok: exitCode === 0, output });
+      const timeoutDetail = timedOut
+        ? `\nVerification timed out after ${Math.round(timeoutMs / 1000)} seconds.`
+        : "";
+      resolve({ ...step, ok: exitCode === 0 && !timedOut, output: output + timeoutDetail });
     });
   });
 }
@@ -133,6 +138,6 @@ export function runVerificationStatus(results: VerifyStepResult[]): "pending" | 
 }
 
 export function verificationCommand(results: VerifyStepResult[]): string | undefined {
-  const last = results[results.length - 1];
-  return last ? [last.command, ...last.args].join(" ") : undefined;
+  const relevant = results.find((result) => !result.ok) ?? results[results.length - 1];
+  return relevant ? [relevant.command, ...relevant.args].join(" ") : undefined;
 }
