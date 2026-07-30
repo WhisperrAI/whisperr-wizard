@@ -60,6 +60,7 @@ interface MockState {
   integrationEvidence?: Record<string, unknown>;
   resumed?: boolean;
   failCompletion?: boolean;
+  modelSessions?: Record<string, string>;
 }
 
 function startMockRuntime(state: MockState): Promise<{ server: Server; port: number }> {
@@ -96,9 +97,21 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
           app: {},
           snapshot: { setupStatus: "running", events: state.snapshotEvents },
           artifacts: state.artifacts,
+          modelSessions: state.modelSessions ?? {},
           ingestion: { apiKey: "pk_test", baseUrl: "https://api.example.test" },
           onboardingContext: { business: "Meal tracking app" },
         });
+        return;
+      }
+      if (
+        request.method === "PUT" &&
+        url === "/wizard/runs/wrun_1/model-sessions/survey"
+      ) {
+        const parsed = JSON.parse(body) as { task: string; conversationId: string };
+        assert.equal(parsed.task, "survey");
+        state.modelSessions ??= {};
+        state.modelSessions.survey = parsed.conversationId;
+        send({ sessionKey: "survey", conversationId: parsed.conversationId });
         return;
       }
       if (
@@ -183,6 +196,10 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
       }
       if (request.method === "PATCH") {
         const patch = body ? (JSON.parse(body) as Record<string, unknown>) : {};
+        if ("modelConversationId" in patch) {
+          send({ code: "wizard_run_conflict", message: "legacy conversation patch rejected" }, 409);
+          return;
+        }
         state.patches.push(patch);
         if (patch.integrationEvidence && typeof patch.integrationEvidence === "object") {
           state.integrationEvidence = patch.integrationEvidence as Record<string, unknown>;
@@ -259,9 +276,16 @@ function scriptedProvider(options: {
       if (invocation.role === "survey") {
         const finish = invocation.tools.find((tool) => tool.name === "finish_survey")!;
         await finish.handler(surveyArtifact);
-        return { kind: "completed", text: "surveyed", costUsd: 0, turns: 1 };
+        return {
+          kind: "completed",
+          text: "surveyed",
+          sessionId: "claude_session_1",
+          costUsd: 0,
+          turns: 1,
+        };
       }
       if (invocation.role === "design") {
+        assert.equal(invocation.resumeSessionId, "claude_session_1");
         if (!options.zeroEvents) {
           const propose = invocation.tools.find((tool) => tool.name === "propose_event_batch")!;
           await propose.handler({
@@ -373,6 +397,7 @@ test("orchestrator automatically freezes design, integrates, reviews, and verifi
     assert.equal(completion.verificationStatus, "passed");
     assert.ok(state.artifacts?.some((artifact) => artifact.kind === "survey"));
     assert.ok(state.artifacts?.some((artifact) => artifact.kind === "event_design"));
+    assert.equal(state.modelSessions?.survey, "claude_session_1");
     assert.ok(state.patches.some((patch) => {
       const evidence = patch.integrationEvidence as {
         events?: Array<{ eventCode?: string; status?: string }>;

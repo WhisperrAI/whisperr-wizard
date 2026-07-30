@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.1
+
+- Persist the Opus survey conversation through the run's keyed `survey`
+  session and resume event design in that same conversation.
+- Stop writing new pipeline sessions into the legacy conversation field and
+  report survey/design persistence failures under their actual phase.
+
 ## 0.10.0
 
 - Give each phase one fixed model owner: a single Opus 5 low/fast conversation

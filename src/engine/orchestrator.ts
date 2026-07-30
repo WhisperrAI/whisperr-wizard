@@ -154,7 +154,8 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   let survey = artifactContent<SurveyArtifact>(bootstrap, "survey");
   let registered: RegisteredEvent[];
   let preparedSetup: { handle: WorktreeHandle; completed: boolean } | undefined;
-  let surveySessionId: string | undefined = bootstrap.run.modelConversationId;
+  let surveySessionId: string | undefined =
+    bootstrap.modelSessions.survey ?? bootstrap.run.modelConversationId;
   try {
     const projectEvents = bootstrap.snapshot.events.filter(
       (event) => event.projectId === bootstrap.project.id,
@@ -187,7 +188,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         const config = modelConfigForTask(input.models, "survey", "survey");
         await runs.persistSurveyArtifact(runId, survey, modelMetadata(config));
         if (surveySessionId) {
-          await runs.patchRun(runId, { modelConversationId: surveySessionId });
+          await runs.saveModelSession(runId, "survey", "survey", surveySessionId);
         }
       } else {
         input.sink.emit({ phase: "surveying", action: "reusing the saved immutable survey" });
@@ -277,8 +278,9 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   } catch (error) {
     if (preparedSetup) await removeWorktree(preparedSetup.handle).catch(() => {});
     const reason = error instanceof Error ? error.message : String(error);
-    await failRun(`design failed: ${reason}`);
-    return { kind: "aborted", reason: `design failed: ${reason}` };
+    const stage = earlyPipelineFailureStage(activePhase);
+    await failRun(`${stage} failed: ${reason}`);
+    return { kind: "aborted", reason: `${stage} failed: ${reason}` };
   }
 
   if (registered.length === 0) {
@@ -764,6 +766,12 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       modelRoutes: modelRoutes(input.models),
     };
   }
+}
+
+function earlyPipelineFailureStage(phase: EnginePhase): string {
+  if (phase === "surveying") return "survey persistence";
+  if (phase === "persisting") return "design persistence";
+  return "design";
 }
 
 function artifactContent<T>(

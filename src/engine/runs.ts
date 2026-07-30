@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { WizardConfig, WizardSession } from "../types.js";
-import type { EnginePhase, EventIntegrationStatus } from "./types.js";
+import type { EnginePhase, EngineTask, EventIntegrationStatus } from "./types.js";
 
 export interface RunProject {
   id: string;
@@ -59,6 +59,7 @@ export interface RunBootstrap {
   snapshot: RunSnapshot;
   ingestion: { apiKey: string; baseUrl: string };
   artifacts: RunArtifact[];
+  modelSessions: Record<string, string>;
 }
 
 export type ItemKind = "event";
@@ -200,6 +201,19 @@ export class RunsClient {
     return this.patchRun(runId, { integrationEvidence: progress });
   }
 
+  saveModelSession(
+    runId: string,
+    sessionKey: string,
+    task: EngineTask,
+    conversationId: string,
+  ): Promise<{ sessionKey: string; conversationId: string }> {
+    return this.request<{ sessionKey: string; conversationId: string }>(
+      "PUT",
+      `/wizard/runs/${runId}/model-sessions/${encodeURIComponent(sessionKey)}`,
+      { task, conversationId },
+    );
+  }
+
   savePlacementManifest(
     runId: string,
     items: PlacementManifestItem[],
@@ -339,7 +353,20 @@ export function normalizeRunBootstrap(payload: unknown): RunBootstrap {
     },
     ingestion: { apiKey: ingestion.apiKey, baseUrl: ingestion.baseUrl },
     artifacts: normalizeArtifacts(value.artifacts ?? snapshotSource.artifacts),
+    modelSessions: normalizeModelSessions(value.modelSessions),
   };
+}
+
+function normalizeModelSessions(payload: unknown): Record<string, string> {
+  const value = record(payload);
+  if (!value) return {};
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      ([sessionKey, conversationId]) =>
+        sessionKey.trim().length > 0 && typeof conversationId === "string" &&
+        conversationId.trim().length > 0,
+    ),
+  ) as Record<string, string>;
 }
 
 function normalizeArtifacts(payload: unknown): RunArtifact[] {
