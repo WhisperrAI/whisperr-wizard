@@ -80,10 +80,9 @@ export function createClaudeProvider(
       let sessionId = invocation.resumeSessionId;
       let costUsd = 0;
       let turns = 0;
-      const deadline = Date.now() + roleConfig.maxMs;
 
       const outcome = (
-        kind: "completed" | "context_overflow" | "budget_exhausted" | "failed",
+        kind: "completed" | "context_overflow" | "failed",
         text = "",
         error = "",
       ): RoleOutcome =>
@@ -93,89 +92,105 @@ export function createClaudeProvider(
             ? { kind, error, sessionId, costUsd, turns }
             : { kind, sessionId, costUsd, turns };
 
-      try {
-        const task = invocation.task ?? invocation.role;
-        const sessionKey = invocation.sessionKey ?? task;
-        const customHeaders = [
-          process.env.ANTHROPIC_CUSTOM_HEADERS,
-          runId ? `X-Whisperr-Wizard-Run-ID: ${headerValue(runId)}` : "",
-          `X-Whisperr-Wizard-Task: ${headerValue(task)}`,
-          `X-Whisperr-Wizard-Session-Key: ${headerValue(sessionKey)}`,
-          `X-Whisperr-Wizard-Model: ${headerValue(roleConfig.model)}`,
-          `X-Whisperr-Wizard-Effort: ${headerValue(roleConfig.effort ?? "")}`,
-          `X-Whisperr-Wizard-Service-Tier: ${roleConfig.fastMode ? "fast" : "default"}`,
-          `X-Whisperr-Wizard-Fallback: ${invocation.fallback ? "true" : "false"}`,
-        ].filter(Boolean).join("\n");
-        const response = query({
-          prompt: invocation.userPrompt,
-          options: {
-            model: roleConfig.model,
-            cwd: invocation.cwd,
-            systemPrompt: invocation.systemPrompt,
-            thinking: { type: "adaptive" },
-            ...(roleConfig.effort ? { effort: roleConfig.effort as Options["effort"] } : {}),
-            tools: [...allowedTools],
-            ...(hostTools.length > 0
-              ? { mcpServers: { engine: createSdkMcpServer({ name: "engine", tools: hostTools }) } }
-              : {}),
-            hooks: buildToolPolicyHooks(invocation.cwd, trustedTools, allowedFiles),
-            canUseTool: createToolPermissionCallback(invocation.cwd, trustedTools, allowedFiles),
-            maxTurns: roleConfig.maxTurns,
-            ...(roleConfig.maxOutputTokens
-              ? { taskBudget: { total: roleConfig.maxOutputTokens } }
-              : {}),
-            ...((roleConfig.fastMode ?? supportsClaudeFastMode(roleConfig.model))
-              ? { settings: { fastMode: true } }
-              : {}),
-            ...(invocation.resumeSessionId ? { resume: invocation.resumeSessionId } : {}),
-            settingSources: [],
-            env: {
-              ...process.env,
-              ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+      const task = invocation.task ?? invocation.role;
+      const sessionKey = invocation.sessionKey ?? task;
+      const customHeaders = [
+        process.env.ANTHROPIC_CUSTOM_HEADERS,
+        runId ? `X-Whisperr-Wizard-Run-ID: ${headerValue(runId)}` : "",
+        `X-Whisperr-Wizard-Task: ${headerValue(task)}`,
+        `X-Whisperr-Wizard-Session-Key: ${headerValue(sessionKey)}`,
+        `X-Whisperr-Wizard-Model: ${headerValue(roleConfig.model)}`,
+        `X-Whisperr-Wizard-Effort: ${headerValue(roleConfig.effort ?? "")}`,
+        `X-Whisperr-Wizard-Service-Tier: ${roleConfig.fastMode ? "fast" : "default"}`,
+      ].filter(Boolean).join("\n");
+      let prompt = invocation.userPrompt;
+      let resume = invocation.resumeSessionId;
+      for (;;) {
+        try {
+          const response = query({
+            prompt,
+            options: {
+              model: roleConfig.model,
+              cwd: invocation.cwd,
+              systemPrompt: invocation.systemPrompt,
+              thinking: { type: "adaptive" },
+              ...(roleConfig.effort ? { effort: roleConfig.effort as Options["effort"] } : {}),
+              tools: [...allowedTools],
+              ...(hostTools.length > 0
+                ? { mcpServers: { engine: createSdkMcpServer({ name: "engine", tools: hostTools }) } }
+                : {}),
+              hooks: buildToolPolicyHooks(invocation.cwd, trustedTools, allowedFiles),
+              canUseTool: createToolPermissionCallback(invocation.cwd, trustedTools, allowedFiles),
+              settings: {
+                fastMode: roleConfig.fastMode ?? supportsClaudeFastMode(roleConfig.model),
+                autoCompactEnabled: true,
+                autoCompactWindow: 750_000,
+                switchModelsOnFlag: false,
+              },
+              ...(resume ? { resume } : {}),
+              settingSources: [],
+              env: {
+                ...process.env,
+                ANTHROPIC_CUSTOM_HEADERS: customHeaders,
+              },
             },
-          },
-        });
-        for await (const raw of response as AsyncIterable<StreamMessage>) {
-          if (raw.session_id) {
-            sessionId = raw.session_id;
+          });
+          let retry = false;
+          for await (const raw of response as AsyncIterable<StreamMessage>) {
+            if (raw.session_id) {
+              sessionId = raw.session_id;
+              resume = raw.session_id;
+            }
+            if (raw.type === "assistant") {
+              turns += 1;
+              const block = raw.message?.content?.find(
+                (candidate) => candidate.type === "text" || candidate.type === "tool_use",
+              );
+              if (block?.type === "text" && block.text?.trim()) {
+                onProgress((block.text.trim().split("\n")[0] ?? "").slice(0, 120));
+              } else if (block?.type === "tool_use" && block.name) {
+                onProgress(`using ${block.name}`);
+              }
+            } else if (raw.type === "result") {
+              costUsd = raw.total_cost_usd ?? 0;
+              const subtype = raw.subtype ?? "";
+              if (subtype === "success") {
+                return outcome("completed", raw.result ?? "");
+              }
+              const detail = raw.result ?? subtype;
+              if (classifyFailure(detail) === "context_overflow") {
+                prompt = rolloverPrompt(invocation.userPrompt);
+                resume = undefined;
+                retry = true;
+                break;
+              }
+              if (classifyFailure(detail) === "transient") {
+                onProgress("provider interrupted; retrying the same model and conversation");
+                await retryDelay();
+                retry = true;
+                break;
+              }
+              return outcome("failed", "", detail || "model run failed");
+            }
           }
-          if (raw.type === "assistant") {
-            turns += 1;
-            const block = raw.message?.content?.find(
-              (candidate) => candidate.type === "text" || candidate.type === "tool_use",
-            );
-            if (block?.type === "text" && block.text?.trim()) {
-              onProgress((block.text.trim().split("\n")[0] ?? "").slice(0, 120));
-            } else if (block?.type === "tool_use" && block.name) {
-              onProgress(`using ${block.name}`);
-            }
-            if (Date.now() > deadline) {
-              await (response as { interrupt?: () => Promise<void> }).interrupt?.();
-              return outcome("budget_exhausted");
-            }
-          } else if (raw.type === "result") {
-            costUsd = raw.total_cost_usd ?? 0;
-            const subtype = raw.subtype ?? "";
-            if (subtype === "success") {
-              return outcome("completed", raw.result ?? "");
-            }
-            if (subtype.includes("max_turns") || subtype.includes("max_budget")) {
-              return outcome("budget_exhausted");
-            }
-            const detail = raw.result ?? subtype;
-            if (classifyFailure(detail) === "context_overflow") {
-              return outcome("context_overflow");
-            }
-            return outcome("failed", "", detail || "model run failed");
+          if (retry) continue;
+          return outcome("failed", "", "model stream ended without a result");
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const failure = classifyFailure(detail);
+          if (failure === "context_overflow") {
+            prompt = rolloverPrompt(invocation.userPrompt);
+            resume = undefined;
+            onProgress("context rolled into a fresh conversation with the same Opus model");
+            continue;
           }
+          if (failure === "transient") {
+            onProgress("provider interrupted; retrying the same Opus model and conversation");
+            await retryDelay();
+            continue;
+          }
+          return outcome("failed", "", detail);
         }
-        return outcome("failed", "", "model stream ended without a result");
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        if (classifyFailure(detail) === "context_overflow") {
-          return outcome("context_overflow");
-        }
-        return outcome("failed", "", detail);
       }
     },
   };
@@ -183,4 +198,18 @@ export function createClaudeProvider(
 
 function headerValue(value: string): string {
   return value.replace(/[\r\n]/g, "").slice(0, 200);
+}
+
+function rolloverPrompt(original: string): string {
+  return [
+    original,
+    "",
+    "The provider compacted or replaced the prior context. Continue the same task with the same ownership.",
+    "Repository changes and server-side tool state are authoritative. Inspect current allowed files as needed,",
+    "do not repeat completed mutations, and finish the required task.",
+  ].join("\n");
+}
+
+function retryDelay(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 5_000));
 }

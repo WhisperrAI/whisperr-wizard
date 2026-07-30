@@ -1,9 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Cluster, ClusterStatus, EventPlacement } from "./types.js";
 
-export const MAX_CLUSTER_EVENTS = 4;
-export const MAX_CONCURRENT_CLUSTERS = 4;
-
 export function clusterIdFor(
   files: string[],
   eventIds: string[] = [],
@@ -27,20 +24,12 @@ export function deriveClusters(placements: EventPlacement[]): Cluster[] {
     byFile.set(placement.file, existing);
   }
 
-  // Split each file independently first. This is the invariant that lets the
-  // scheduler prevent two agents from ever editing the same file at once.
   const fileSlices: Array<{ file: string; position: number; events: EventPlacement[] }> = [];
   for (const file of [...byFile.keys()].sort()) {
     const events = [...byFile.get(file)!].sort((a, b) =>
       a.eventCode.localeCompare(b.eventCode) || a.eventId.localeCompare(b.eventId)
     );
-    for (let start = 0; start < events.length; start += MAX_CLUSTER_EVENTS) {
-      fileSlices.push({
-        file,
-        position: start / MAX_CLUSTER_EVENTS,
-        events: events.slice(start, start + MAX_CLUSTER_EVENTS),
-      });
-    }
+    fileSlices.push({ file, position: 0, events });
   }
 
   return fileSlices.map((slice) => {
@@ -61,7 +50,7 @@ export function deriveClusters(placements: EventPlacement[]): Cluster[] {
 
 export function nextConcurrentClusters(
   clusters: Cluster[],
-  limit = MAX_CONCURRENT_CLUSTERS,
+  limit = 1,
 ): Cluster[] {
   const selected: Cluster[] = [];
   const lockedFiles = new Set<string>();

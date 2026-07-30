@@ -9,7 +9,6 @@ import {
 import {
   clustersComplete,
   deriveClusters,
-  MAX_CLUSTER_EVENTS,
   nextConcurrentClusters,
   nextPendingCluster,
   transitionCluster,
@@ -40,7 +39,7 @@ test("failure classes decide cluster status honestly", () => {
   assert.equal(nextClusterStatusAfterFailure("fatal", 1), "blocked");
 });
 
-test("deriveClusters groups by directory and bounds cluster size", () => {
+test("deriveClusters creates one complete cluster per file", () => {
   const placements: EventPlacement[] = [];
   for (let index = 0; index < 11; index += 1) {
     placements.push(placement(`diary_event_${index}`, `Features/Diary/File${index % 2}.swift`));
@@ -50,7 +49,6 @@ test("deriveClusters groups by directory and bounds cluster size", () => {
 
   const clusters = deriveClusters(placements);
   for (const cluster of clusters) {
-    assert.ok(cluster.events.length <= MAX_CLUSTER_EVENTS, `cluster too large: ${cluster.events.length}`);
     assert.equal(cluster.status, "pending");
     assert.equal(cluster.attempts, 0);
   }
@@ -59,7 +57,7 @@ test("deriveClusters groups by directory and bounds cluster size", () => {
   const diaryClusters = clusters.filter((cluster) =>
     cluster.files.some((file) => file.includes("Diary")),
   );
-  assert.ok(diaryClusters.length >= 2, "11 diary events must split across clusters");
+  assert.equal(diaryClusters.length, 2, "each diary file is owned by one cluster");
 });
 
 test("clusters never mix repository files", () => {
@@ -73,7 +71,7 @@ test("clusters never mix repository files", () => {
   assert.ok(clusters.every((cluster) => cluster.files.length === 1));
 });
 
-test("cluster IDs stay unique across slices and concurrent waves lock files", () => {
+test("cluster IDs stay unique and one Terra session schedules files serially", () => {
   const placements = Array.from({ length: 10 }, (_, index) =>
     placement(`same_file_${index}`, "src/shared.ts")
   );
@@ -85,16 +83,14 @@ test("cluster IDs stay unique across slices and concurrent waves lock files", ()
   );
   const clusters = deriveClusters(placements);
   assert.equal(new Set(clusters.map((cluster) => cluster.id)).size, clusters.length);
-  assert.ok(clusters.every((cluster) => cluster.events.length <= 4));
-
-  const wave = nextConcurrentClusters(clusters, 4);
-  assert.ok(wave.length <= 4);
+  const wave = nextConcurrentClusters(clusters);
+  assert.equal(wave.length, 1);
   const files = wave.flatMap((cluster) => cluster.files);
   assert.equal(new Set(files).size, files.length, "a file may be owned by only one concurrent worker");
   assert.ok(wave.every((cluster) => cluster.files.length === 1));
   assert.ok(
-    clusters.filter((cluster) => cluster.files.includes("src/shared.ts")).length >= 3,
-    "ten same-file events must be split into serial single-file clusters",
+    clusters.filter((cluster) => cluster.files.includes("src/shared.ts")).length === 1,
+    "all same-file events must remain in one Terra-owned cluster",
   );
 });
 
@@ -106,8 +102,8 @@ for (const eventCount of [20, 100, 200]) {
     let clusters = deriveClusters(placements);
     const scheduled: string[] = [];
     while (!clustersComplete(clusters)) {
-      const wave = nextConcurrentClusters(clusters, 4);
-      assert.ok(wave.length > 0 && wave.length <= 4);
+      const wave = nextConcurrentClusters(clusters);
+      assert.equal(wave.length, 1);
       const files = wave.flatMap((cluster) => cluster.files);
       assert.equal(new Set(files).size, files.length);
       for (const cluster of wave) {

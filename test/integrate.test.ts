@@ -65,27 +65,22 @@ test("verify steps resolve from the repository honestly", () => {
   assert.equal(runVerificationStatus([]), "unavailable");
 });
 
-test("SDK setup accepts deterministically valid changes at the model turn limit", async () => {
+test("SDK setup accepts deterministically valid changes from its fixed Sol owner", async () => {
   const worktreePath = mkdtempSync(join(tmpdir(), "setup-turn-limit-"));
   writeFileSync(join(worktreePath, "package.json"), "{}");
-  const worktree: WorktreeHandle = { path: worktreePath, baseRef: "abc", repoPath: worktreePath };
+  const worktree: WorktreeHandle = { kind: "snapshot", path: worktreePath, baseRef: "abc", repoPath: worktreePath };
   const models: EngineModelConfig = {
-    survey: { model: "m", maxTurns: 5, maxMs: 1000 },
-    design: { model: "m", maxTurns: 5, maxMs: 1000 },
-    edit: { model: "m", maxTurns: 5, maxMs: 1000 },
-    review: { model: "m", maxTurns: 5, maxMs: 1000 },
-    sdk_setup: { model: "opus", maxTurns: 5, maxMs: 1000 },
-    repair: { model: "sol", maxTurns: 5, maxMs: 1000 },
+    survey: { model: "m" },
+    design: { model: "m" },
+    edit: { model: "m" },
+    review: { model: "m" },
+    sdk_setup: { model: "sol" },
+    repair: { model: "sol" },
   };
-  let fallbackCalls = 0;
   const provider: EngineProvider = {
     name: "hybrid",
     async invoke() {
-      return { kind: "budget_exhausted", costUsd: 0, turns: 5 };
-    },
-    async invokeFallback() {
-      fallbackCalls += 1;
-      return { kind: "completed", text: "unused", costUsd: 0, turns: 1 };
+      return { kind: "completed", text: "done", costUsd: 0, turns: 1 };
     },
   };
   const deps: IntegrationDeps = {
@@ -103,17 +98,16 @@ test("SDK setup accepts deterministically valid changes at the model turn limit"
   };
 
   assert.equal(await runSdkSetupPass(deps, generateBindings("nextjs", registered), async () => true), true);
-  assert.equal(fallbackCalls, 0);
 });
 
 test("cluster integration marks overflow clusters resumable and structurally verifies the rest", async () => {
   const worktreePath = mkdtempSync(join(tmpdir(), "integrate-"));
-  const worktree: WorktreeHandle = { path: worktreePath, baseRef: "abc", repoPath: worktreePath };
+  const worktree: WorktreeHandle = { kind: "snapshot", path: worktreePath, baseRef: "abc", repoPath: worktreePath };
   const models: EngineModelConfig = {
-    survey: { model: "m", maxTurns: 5, maxMs: 1000 },
-    design: { model: "m", maxTurns: 5, maxMs: 1000 },
-    edit: { model: "m", maxTurns: 5, maxMs: 1000 },
-    review: { model: "m", maxTurns: 5, maxMs: 1000 },
+    survey: { model: "m" },
+    design: { model: "m" },
+    edit: { model: "m" },
+    review: { model: "m" },
   };
   let editCalls = 0;
   const provider: EngineProvider = {
@@ -168,39 +162,40 @@ test("cluster integration marks overflow clusters resumable and structurally ver
   assert.ok(saved.length >= 4);
 });
 
-test("invalid Terra cluster is rolled back before a Sol escalation", async () => {
+test("invalid Terra work is returned to the same Terra conversation until valid", async () => {
   const worktreePath = mkdtempSync(join(tmpdir(), "integrate-fallback-"));
   mkdirSync(join(worktreePath, "src/auth"), { recursive: true });
   writeFileSync(join(worktreePath, "src/auth/signup.ts"), "export function signup() {}\n");
-  const worktree: WorktreeHandle = { path: worktreePath, baseRef: "abc", repoPath: worktreePath };
+  const worktree: WorktreeHandle = { kind: "snapshot", path: worktreePath, baseRef: "abc", repoPath: worktreePath };
   const models: EngineModelConfig = {
-    survey: { model: "terra", maxTurns: 5, maxMs: 1000 },
-    design: { model: "opus", maxTurns: 5, maxMs: 1000 },
-    edit: { model: "opus", maxTurns: 5, maxMs: 1000 },
-    review: { model: "opus", maxTurns: 5, maxMs: 1000 },
-    cluster_edit: { model: "terra", maxTurns: 5, maxMs: 1000 },
-    sdk_setup: { model: "opus", maxTurns: 5, maxMs: 1000 },
-    repair: { model: "sol", maxTurns: 5, maxMs: 1000 },
+    survey: { model: "terra" },
+    design: { model: "opus" },
+    edit: { model: "sol" },
+    review: { model: "sol" },
+    cluster_edit: { model: "terra" },
+    sdk_setup: { model: "sol" },
+    repair: { model: "sol" },
   };
-  let discarded = 0;
+  let terraCalls = 0;
+  const sessionKeys: string[] = [];
   const provider: EngineProvider = {
     name: "hybrid",
     async invoke(invocation) {
       if (invocation.task === "cluster_edit") {
-        writeFileSync(join(invocation.cwd, "src/auth/signup.ts"), "export function signup() { /* incomplete */ }\n");
-        return { kind: "completed", text: "incomplete", costUsd: 0, turns: 1 };
+        terraCalls += 1;
+        sessionKeys.push(invocation.sessionKey ?? "");
+        if (terraCalls === 1) {
+          writeFileSync(join(invocation.cwd, "src/auth/signup.ts"), "export function signup() { /* incomplete */ }\n");
+          return { kind: "completed", text: "incomplete", costUsd: 0, turns: 1 };
+        }
+        writeFileSync(
+          join(invocation.cwd, "src/auth/signup.ts"),
+          'import { WhisperrEvents } from "../../whisperr-events";\n' +
+            "export function signup() { WhisperrEvents.trialStarted({ plan, seatCount }); }\n",
+        );
+        return { kind: "completed", text: "fixed", costUsd: 0, turns: 1 };
       }
       return { kind: "completed", text: "VERDICT: pass", costUsd: 0, turns: 1 };
-    },
-    async invokeFallback(invocation) {
-      assert.equal(discarded, 1, "rollback must happen before Sol starts");
-      assert.equal(invocation.task, "repair");
-      writeFileSync(
-        join(invocation.cwd, "src/auth/signup.ts"),
-        'import { WhisperrEvents } from "../../whisperr-events";\n' +
-          "export function signup() { WhisperrEvents.trialStarted({ plan, seatCount }); }\n",
-      );
-      return { kind: "completed", text: "fixed", costUsd: 0, turns: 1 };
     },
   };
   const cluster = {
@@ -220,12 +215,10 @@ test("invalid Terra cluster is rolled back before a Sol escalation", async () =>
     ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
     sink: createProgressSink({ json: false, isTTY: false, write: () => {} }),
     saveClusters: () => {},
-    discardChanges: async () => {
-      discarded += 1;
-      writeFileSync(join(worktreePath, "src/auth/signup.ts"), "export function signup() {}\n");
-    },
+    discardChanges: async () => {},
     onClusterIntegrated: async () => {},
   }, [cluster], async () => "diff");
-  assert.equal(discarded, 1);
+  assert.equal(terraCalls, 2);
+  assert.deepEqual(sessionKeys, ["event_insertion", "event_insertion"]);
   assert.equal(outcome.eventStatuses.get("trial_started"), "syntax_verified");
 });

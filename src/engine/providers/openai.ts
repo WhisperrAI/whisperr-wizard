@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { join, resolve, sep } from "node:path";
 
 import {
@@ -27,6 +28,7 @@ interface ResponsePayload {
   output?: Array<Record<string, unknown>>;
   output_text?: string;
   error?: { message?: string; code?: string; error?: { message?: string; code?: string } };
+  usage?: { input_tokens?: number };
 }
 
 function jailedPath(cwd: string, candidate: string): string {
@@ -71,7 +73,7 @@ export function fileTools(
   const tools: EngineTool[] = [
     {
       name: "read_file",
-      description: "Read a repository file (UTF-8, truncated at 40000 chars).",
+      description: "Read a repository UTF-8 file.",
       inputSchema: {},
       jsonSchema: {
         type: "object",
@@ -81,7 +83,7 @@ export function fileTools(
       handler: async (input) => {
         const path = guardedPath(cwd, "Read", String(input.path ?? ""), allowedFiles);
         const content = readFileSync(path, "utf8");
-        return { content: content.slice(0, 40_000) };
+        return { content };
       },
     },
     {
@@ -101,7 +103,7 @@ export function fileTools(
             const kind = statSync(join(target, entry)).isDirectory() ? "dir" : "file";
             return `${kind}:${entry}`;
           });
-        return { entries: entries.slice(0, 500) };
+        return { entries };
       },
     },
   ];
@@ -147,8 +149,47 @@ export function fileTools(
         },
       },
     );
+    if (access.mode === "sdk_setup") {
+      tools.push({
+        name: "run_setup_command",
+        description:
+          "Run a policy-approved package installation or repository verification command for SDK setup.",
+        inputSchema: {},
+        jsonSchema: {
+          type: "object",
+          properties: { command: { type: "string" } },
+          required: ["command"],
+        },
+        handler: async (input) => {
+          const command = String(input.command ?? "").trim();
+          const decision = evaluateToolUse("Bash", { command }, {
+            repoPath: cwd,
+            allowedFiles,
+          });
+          if (decision.behavior === "deny") {
+            return { ok: false, reason: decision.message };
+          }
+          return runCommand(cwd, command);
+        },
+      });
+    }
   }
   return tools;
+}
+
+function runCommand(cwd: string, command: string): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    const child = spawn("/bin/sh", ["-lc", command], {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", (error) => resolve({ ok: false, stdout, stderr: String(error) }));
+    child.on("close", (code) => resolve({ ok: code === 0, exitCode: code, stdout, stderr }));
+  });
 }
 
 export function createOpenAIProvider(
@@ -180,7 +221,6 @@ export function createOpenAIProvider(
             : {
                 "X-Whisperr-Wizard-Session-Key": sessionKey,
                 "X-Whisperr-Wizard-Task": task,
-                "X-Whisperr-Wizard-Fallback": sessionKey.startsWith("fallback:") ? "true" : "false",
               }),
         },
         body: JSON.stringify(body),
@@ -264,12 +304,14 @@ export function createOpenAIProvider(
       let costUsd = 0;
       let turns = 0;
       const task = invocation.task ?? invocation.role;
-      const sessionKey = invocation.sessionKey?.trim() || "legacy";
+      const baseSessionKey = invocation.sessionKey?.trim() || "legacy";
+      let conversationGeneration = 0;
+      let sessionKey = baseSessionKey;
       let activeConversationId = sessionKey === "legacy"
         ? legacyConversationId
         : conversationIds.get(sessionKey);
       const outcome = (
-        kind: "completed" | "context_overflow" | "budget_exhausted" | "failed",
+        kind: "completed" | "context_overflow" | "failed",
         text = "",
         error = "",
       ): RoleOutcome =>
@@ -292,34 +334,62 @@ export function createOpenAIProvider(
       }));
 
       try {
-        const conversation = await ensureConversation(
+        let conversation = await ensureConversation(
           sessionKey,
           task,
           invocation.resumeSessionId,
         );
         activeConversationId = conversation;
-        const deadline = Date.now() + roleConfig.maxMs;
         let input: Array<Record<string, unknown>> = [
           { role: "user", content: invocation.userPrompt },
         ];
 
-        for (let turn = 0; turn < roleConfig.maxTurns; turn += 1) {
-          turns = turn + 1;
-          if (Date.now() > deadline) {
-            return outcome("budget_exhausted");
+        for (;;) {
+          turns += 1;
+          let response: ResponsePayload;
+          try {
+            response = await gatewayFetch("/v1/responses", {
+              model: roleConfig.model,
+              instructions: invocation.systemPrompt,
+              conversation,
+              input,
+              tools: toolDefs,
+              reasoning: {
+                ...(roleConfig.effort ? { effort: roleConfig.effort } : {}),
+                summary: "detailed",
+                context: "all_turns",
+              },
+              ...(roleConfig.serviceTier ? { service_tier: roleConfig.serviceTier } : {}),
+            }, sessionKey, task);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const failure = classifyFailure(detail);
+            if (failure === "transient") {
+              onProgress("provider interrupted; retrying the same model and conversation");
+              await retryDelay();
+              continue;
+            }
+            if (failure === "context_overflow") {
+              const compacted = await tryCompact(
+                gatewayFetch, roleConfig.model, conversation, sessionKey, task,
+              );
+              if (compacted) continue;
+              conversationGeneration += 1;
+              sessionKey = `${baseSessionKey}:generation:${conversationGeneration}`;
+              conversation = await ensureConversation(sessionKey, task);
+              activeConversationId = conversation;
+              input = [{
+                role: "user",
+                content: rolloverPrompt(invocation.userPrompt),
+              }];
+              onProgress("context rolled into a fresh conversation with the same model");
+              continue;
+            }
+            throw error;
           }
-          const response = await gatewayFetch("/v1/responses", {
-            model: roleConfig.model,
-            instructions: invocation.systemPrompt,
-            conversation,
-            input,
-            tools: toolDefs,
-            ...(roleConfig.effort ? { reasoning: { effort: roleConfig.effort } } : {}),
-            ...(roleConfig.serviceTier ? { service_tier: roleConfig.serviceTier } : {}),
-            ...(roleConfig.maxOutputTokens
-              ? { max_output_tokens: roleConfig.maxOutputTokens }
-              : {}),
-          }, sessionKey, task);
+          if ((response.usage?.input_tokens ?? 0) >= 787_500) {
+            await tryCompact(gatewayFetch, roleConfig.model, conversation, sessionKey, task);
+          }
           const items = response.output ?? [];
           const calls = items.filter(
             (item) => item.type === "function_call",
@@ -361,7 +431,6 @@ export function createOpenAIProvider(
           }
           input = results;
         }
-        return outcome("budget_exhausted");
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         if (classifyFailure(detail) === "context_overflow") {
@@ -371,4 +440,38 @@ export function createOpenAIProvider(
       }
     },
   };
+}
+
+async function tryCompact(
+  gatewayFetch: (
+    path: string,
+    body: Record<string, unknown>,
+    sessionKey: string,
+    task: string,
+  ) => Promise<ResponsePayload>,
+  model: string,
+  conversation: string,
+  sessionKey: string,
+  task: string,
+): Promise<boolean> {
+  try {
+    await gatewayFetch("/v1/responses/compact", { model, conversation }, sessionKey, task);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function rolloverPrompt(original: string): string {
+  return [
+    original,
+    "",
+    "Continue this same task in a replacement context using the same model.",
+    "The current repository files and persisted wizard artifacts are authoritative.",
+    "Do not repeat completed changes; inspect allowed files and finish the remaining work.",
+  ].join("\n");
+}
+
+function retryDelay(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 5_000));
 }

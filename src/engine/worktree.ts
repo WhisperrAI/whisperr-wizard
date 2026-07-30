@@ -17,6 +17,7 @@ export interface WorktreeHandle {
   path: string;
   baseRef: string;
   repoPath: string;
+  kind: "git" | "snapshot";
 }
 
 interface GitResult {
@@ -88,7 +89,28 @@ export async function createWorktree(
 ): Promise<WorktreeHandle> {
   const inside = await git(repoPath, ["rev-parse", "--is-inside-work-tree"]);
   if (!inside.ok) {
-    throw new WorktreeError("not_a_repo", "the target directory is not a git repository");
+    const path = await mkdtemp(join(tmpdir(), "whisperr-snapshot-"));
+    const excluded = new Set([
+      ".git", "node_modules", ".next", "dist", "build", "coverage",
+      ".cache", ".turbo", ".venv", "vendor",
+    ]);
+    await cp(repoPath, path, {
+      recursive: true,
+      force: true,
+      filter: (source) => {
+        const rel = relative(repoPath, source);
+        return rel === "" || !rel.split(sep).some((part) => excluded.has(part));
+      },
+    });
+    await must(path, ["init"]);
+    await must(path, ["add", "-A"]);
+    await must(path, [
+      "-c", "user.name=Whisperr Wizard",
+      "-c", "user.email=wizard@whisperr.net",
+      "commit", "--no-gpg-sign", "-m", "Whisperr non-git baseline",
+    ]);
+    const baseRef = (await must(path, ["rev-parse", "HEAD"])).trim();
+    return { path, baseRef, repoPath, kind: "snapshot" };
   }
   const dirty = await dirtyFiles(repoPath);
   const allowed = new Set(allowedDirtyFiles);
@@ -113,7 +135,7 @@ export async function createWorktree(
     ]);
     baseRef = (await must(path, ["rev-parse", "HEAD"])).trim();
   }
-  return { path, baseRef, repoPath };
+  return { path, baseRef, repoPath, kind: "git" };
 }
 
 export async function worktreePatch(handle: WorktreeHandle): Promise<string> {
@@ -183,6 +205,10 @@ export async function savePartialPatch(handle: WorktreeHandle, destination: stri
 }
 
 export async function removeWorktree(handle: WorktreeHandle): Promise<void> {
+  if (handle.kind === "snapshot") {
+    await rm(handle.path, { recursive: true, force: true });
+    return;
+  }
   await git(handle.repoPath, ["worktree", "remove", "--force", handle.path]);
   await git(handle.repoPath, ["worktree", "prune"]);
 }

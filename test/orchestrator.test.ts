@@ -202,32 +202,23 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
 }
 
 const models: EngineModelConfig = {
-  survey: { model: "claude-opus-5", effort: "low", fastMode: true, maxTurns: 30, maxMs: 60_000 },
-  design: { model: "claude-opus-5", effort: "low", fastMode: true, maxTurns: 20, maxMs: 60_000 },
-  edit: { model: "claude-opus-5", effort: "low", fastMode: true, maxTurns: 30, maxMs: 60_000 },
+  survey: { model: "claude-opus-5", effort: "low", fastMode: true },
+  design: { model: "claude-opus-5", effort: "low", fastMode: true },
+  edit: { model: "gpt-5.6-sol", effort: "medium", serviceTier: "priority" },
   review: {
     model: "gpt-5.6-sol",
     effort: "medium",
     serviceTier: "priority",
-    maxTurns: 8,
-    maxMs: 60_000,
-    maxOutputTokens: 4_000,
   },
   cluster_edit: {
     model: "gpt-5.6-terra",
     effort: "medium",
     serviceTier: "priority",
-    maxTurns: 20,
-    maxMs: 60_000,
-    maxOutputTokens: 8_000,
   },
   repair: {
     model: "gpt-5.6-sol",
     effort: "medium",
     serviceTier: "priority",
-    maxTurns: 30,
-    maxMs: 60_000,
-    maxOutputTokens: 12_000,
   },
 };
 
@@ -393,10 +384,10 @@ test("orchestrator automatically freezes design, integrates, reviews, and verifi
     }), "cluster progress is checkpointed before Sol review");
     assert.ok(existsSync(join(repo, "whisperr-events.ts")));
     assert.ok(invoked.includes("survey:survey"));
-    assert.ok(invoked.includes("design:design"));
+    assert.ok(invoked.includes("design:survey"));
     assert.ok(invoked.some((entry) => entry.startsWith("sdk_setup:sdk_setup")));
     assert.ok(invoked.some((entry) => entry.startsWith("cluster_edit:")));
-    assert.ok(invoked.some((entry) => entry.startsWith("review:review:")));
+    assert.ok(invoked.some((entry) => entry.startsWith("review:semantic_review")));
   } finally {
     server.close();
   }
@@ -499,7 +490,11 @@ test("orchestrator resumes verified server progress without survey, design, or e
       },
       "resume-progress",
     ));
-    assert.equal(result.kind, "completed");
+    assert.equal(
+      result.kind,
+      "completed",
+      result.kind === "partial" ? result.summary : undefined,
+    );
     assert.deepEqual(invoked, []);
     assert.equal(state.items.length, 0);
     assert.equal(state.completions.length, 1);

@@ -14,9 +14,6 @@ const roleConfig: RoleModelConfig = {
   model: "gpt-5.6-sol",
   effort: "medium",
   serviceTier: "priority",
-  maxTurns: 6,
-  maxMs: 30_000,
-  maxOutputTokens: 4_000,
 };
 
 test("OpenAI file tools hide and deny secret material", async () => {
@@ -147,9 +144,13 @@ test("openai provider binds a conversation and loops function calls", async () =
   assert.ok(tools.some((tool) => tool.name === "probe"));
   assert.ok(!tools.some((tool) => tool.name === "read_file"));
   assert.ok(!tools.some((tool) => tool.name === "write_file"));
-  assert.deepEqual(seen[1].body.reasoning, { effort: "medium" });
+  assert.deepEqual(seen[1].body.reasoning, {
+    effort: "medium",
+    summary: "detailed",
+    context: "all_turns",
+  });
   assert.equal(seen[1].body.service_tier, "priority");
-  assert.equal(seen[1].body.max_output_tokens, 4_000);
+  assert.equal("max_output_tokens" in seen[1].body, false);
   const conversationCreates = seen.filter((request) => request.path.endsWith("/v1/conversations"));
   assert.equal(conversationCreates.length, 2, "design and survey use isolated conversations");
 });
@@ -238,7 +239,7 @@ test("routed provider dispatches by role and fans out run binding", async () => 
   assert.deepEqual(calls.filter((entry) => entry.startsWith("invoke:")), ["invoke:openai", "invoke:claude"]);
 });
 
-test("a Terra circuit failure does not disable the Sol review route", async () => {
+test("fixed routes never reassign Terra work to Sol after a failure", async () => {
   const calls: string[] = [];
   const openai: EngineProvider = {
     name: "openai",
@@ -254,17 +255,11 @@ test("a Terra circuit failure does not disable the Sol review route", async () =
     model: "gpt-5.6-sol",
     effort: "medium",
     serviceTier: "priority",
-    maxTurns: 30,
-    maxMs: 1000,
   };
   const routed = createRoutedProvider({
-    cluster_edit: {
-      provider: openai,
-      concurrency: 4,
-      fallbackConfig: solConfig,
-    },
-    review: { provider: openai, concurrency: 2 },
-  }, openai, 2);
+    cluster_edit: { provider: openai },
+    review: { provider: openai },
+  }, openai);
   const invocation = {
     role: "edit" as const,
     task: "cluster_edit" as const,
@@ -278,8 +273,6 @@ test("a Terra circuit failure does not disable the Sol review route", async () =
     model: "gpt-5.6-terra",
     effort: "medium",
     serviceTier: "priority",
-    maxTurns: 20,
-    maxMs: 1000,
   };
   const first = await routed.invoke(invocation, terraConfig, () => {});
   assert.equal(first.kind, "failed", "the current dirty attempt must be rolled back by the caller");
@@ -296,6 +289,6 @@ test("a Terra circuit failure does not disable the Sol review route", async () =
   );
   assert.equal(review.kind, "completed");
   const next = await routed.invoke(invocation, terraConfig, () => {});
-  assert.equal(next.kind, "completed");
-  assert.deepEqual(calls, ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-sol"]);
+  assert.equal(next.kind, "failed");
+  assert.deepEqual(calls, ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-terra"]);
 });

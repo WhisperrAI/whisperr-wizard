@@ -236,21 +236,11 @@ export async function runSurvey(
     cwd: repoPath,
     resumeSessionId,
   };
-  let outcome = await provider.invoke(
+  const outcome = await provider.invoke(
     invocation,
     modelConfigFor(models, "survey", "survey"),
     (action) => sink.emit({ phase: "surveying", action }),
   );
-  if (outcome.kind === "completed" && !finished && provider.invokeFallback) {
-    survey = undefined;
-    finished = false;
-    sink.emit({ phase: "surveying", action: "Opus survey was invalid; retrying once with Sol" });
-    outcome = await provider.invokeFallback(
-      { ...invocation, sessionKey: "survey:sol_retry" },
-      modelConfigFor(models, "repair", "survey"),
-      (action) => sink.emit({ phase: "surveying", action }),
-    );
-  }
   return { survey, finished, outcome };
 }
 
@@ -264,6 +254,7 @@ export async function runSelection(
   sink: ProgressSink,
   existingEventCodes = bootstrap.snapshot.events.map((event) => event.code),
   recoveryCodes: string[] = [],
+  resumeSessionId?: string,
 ): Promise<SelectionResult> {
   const proposed: ProposedEvent[] = [];
   const seen = new Set<string>();
@@ -394,7 +385,7 @@ export async function runSelection(
   const invocation = {
     role: "design" as const,
     task: "design" as const,
-    sessionKey: "design",
+    sessionKey: "survey",
     systemPrompt: SELECTION_SYSTEM_PROMPT,
     userPrompt: selectionUserPrompt(
       JSON.stringify(survey),
@@ -406,29 +397,13 @@ export async function runSelection(
     repositoryAccess: { mode: "none" as const },
     allowRepoWrite: false,
     cwd: repoPath,
+    resumeSessionId,
   };
-  let outcome = await provider.invoke(
+  const outcome = await provider.invoke(
     invocation,
     modelConfigFor(models, "design", "design"),
     (action) => sink.emit({ phase: "designing", action }),
   );
-  if (
-    outcome.kind === "completed" &&
-    (!finished || proposed.length === 0) &&
-    provider.invokeFallback
-  ) {
-    proposed.length = 0;
-    seen.clear();
-    summary = "";
-    finished = false;
-    sink.emit({ phase: "designing", action: "Opus design was invalid; retrying once with Sol" });
-    outcome = await provider.invokeFallback(
-      { ...invocation, sessionKey: "design:sol_retry" },
-      modelConfigFor(models, "repair", "design"),
-      (action) => sink.emit({ phase: "designing", action }),
-    );
-  }
-
   return {
     outcome: outcome.kind,
     finished,

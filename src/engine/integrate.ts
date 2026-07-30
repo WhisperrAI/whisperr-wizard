@@ -1,11 +1,9 @@
-import { createHash } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 
 import { z } from "zod";
 
 import { eventWrapperName, generateBindings, type GeneratedBindings } from "./bindings.js";
-import { MAX_CLUSTER_ATTEMPTS, classifyFailure, nextClusterStatusAfterFailure } from "./budgets.js";
 import { clustersComplete, nextPendingCluster, transitionCluster } from "./clusters.js";
 import type { ProgressSink } from "./output.js";
 import type { RegisteredEvent, SurveyArtifact } from "./selection.js";
@@ -90,7 +88,8 @@ export async function runSdkSetupPass(
     userPrompt: [
       "CORE SETUP for the Whisperr SDK in this repository. Do exactly this, then stop:",
       "1. Add and install the Whisperr SDK dependency for this stack.",
-      `2. Initialize it once at app startup with API key ${deps.ingestion.apiKey} and base URL ${deps.ingestion.baseUrl}.`,
+      "2. Initialize it once at app startup. Use the literal placeholders",
+      "   __WHISPERR_API_KEY__ and __WHISPERR_BASE_URL__; the wizard replaces them after your call.",
       `3. The deterministic bindings module at ${bindings.relativePath} queues events until bound.`,
       `   ${bindings.bindInstruction}`,
       "   Never edit the generated bindings content.",
@@ -111,44 +110,65 @@ export async function runSdkSetupPass(
     allowRepoWrite: true,
     cwd: deps.worktree.path,
   };
-  let outcome = await deps.provider.invoke(
-    invocation,
-    modelConfigFor(deps.models, "sdk_setup", "edit"),
-    (action) => deps.sink.emit({ phase: "binding", action }),
-  );
-  const passesValidation = async () => {
-    if (!validate) return outcome.kind === "completed";
-    try {
-      return await validate();
-    } catch {
-      return false;
-    }
-  };
-  let valid = await passesValidation();
-  if (valid && outcome.kind !== "completed") {
-    deps.sink.emit({
-      phase: "binding",
-      action: `setup changes passed deterministic validation after ${outcome.kind.replaceAll("_", " ")}`,
-    });
-  }
-  if (!valid && deps.provider.invokeFallback) {
-    await deps.discardChanges();
-    await writeFile(join(deps.worktree.path, bindings.relativePath), bindings.content);
-    deps.sink.emit({ phase: "binding", action: "Opus setup rolled back; retrying with Sol" });
-    outcome = await deps.provider.invokeFallback(
-      { ...invocation, sessionKey: "sdk_setup:sol" },
-      modelConfigFor(deps.models, "repair", "edit"),
+  let followup = invocation;
+  for (;;) {
+    const outcome = await deps.provider.invoke(
+      followup,
+      modelConfigFor(deps.models, "sdk_setup", "edit"),
       (action) => deps.sink.emit({ phase: "binding", action }),
     );
-    valid = await passesValidation();
-    if (valid && outcome.kind !== "completed") {
-      deps.sink.emit({
-        phase: "binding",
-        action: `Sol setup passed deterministic validation after ${outcome.kind.replaceAll("_", " ")}`,
-      });
+    if (outcome.kind !== "completed") {
+      return false;
+    }
+    await materializeSetupCredentials(
+      deps.worktree.path,
+      allowedFiles,
+      deps.ingestion.apiKey,
+      deps.ingestion.baseUrl,
+    );
+    const valid = await (async () => {
+      if (!validate) return true;
+      try {
+        return await validate();
+      } catch {
+        return false;
+      }
+    })();
+    if (valid) return true;
+    deps.sink.emit({
+      phase: "binding",
+      action: "setup validation found missing wiring; returning diagnostics to the same Sol conversation",
+    });
+    followup = {
+      ...invocation,
+      userPrompt: [
+        "The SDK setup is not yet structurally complete.",
+        "Inspect the current allowed files and repair the existing work in place.",
+        "Ensure initialization, generated binding, login identify(), session-restoration identify(),",
+        "and logout reset() are all present. Do not insert product events. Finish the same task.",
+      ].join("\n"),
+    };
+  }
+}
+
+async function materializeSetupCredentials(
+  repoPath: string,
+  allowedFiles: string[],
+  apiKey: string,
+  baseUrl: string,
+): Promise<void> {
+  for (const file of allowedFiles) {
+    try {
+      const path = join(repoPath, file);
+      const content = await readFile(path, "utf8");
+      const materialized = content
+        .replaceAll("__WHISPERR_API_KEY__", apiKey)
+        .replaceAll("__WHISPERR_BASE_URL__", baseUrl);
+      if (materialized !== content) await writeFile(path, materialized);
+    } catch {
+      // Optional files may disappear during package installation.
     }
   }
-  return valid;
 }
 
 async function sdkSetupFiles(
@@ -247,7 +267,7 @@ export async function runClusterIntegration(
     const invocation: RoleInvocation = {
         role: "edit",
         task: "cluster_edit",
-        sessionKey: cluster.id,
+        sessionKey: "event_insertion",
         systemPrompt: deps.playbookSystemPrompt,
         userPrompt: clusterPrompt(cluster, deps.registered, bindings),
         tools: [],
@@ -263,16 +283,23 @@ export async function runClusterIntegration(
     );
 
     let structural = await structuralClusterCheck(deps.worktree.path, cluster);
-    if (!structural.ok && deps.provider.invokeFallback) {
-      await deps.discardChanges();
+    while (!structural.ok && edit.kind === "completed") {
       deps.sink.emit({
         phase: "integrating",
         cluster: { index, total },
-        action: "Terra attempt rolled back; retrying the clean cluster with Sol",
+        action: "structural checks found missing work; returning it to the same Terra conversation",
       });
-      edit = await deps.provider.invokeFallback(
-        { ...invocation, task: "repair", sessionKey: `cluster_sol:${cluster.id}` },
-        modelConfigFor(deps.models, "repair", "edit"),
+      edit = await deps.provider.invoke(
+        {
+          ...invocation,
+          userPrompt: [
+            clusterPrompt(cluster, deps.registered, bindings),
+            "",
+            `Deterministic validation failed: ${structural.notes}`,
+            "Repair the current file in place and finish this same insertion task.",
+          ].join("\n"),
+        },
+        modelConfigFor(deps.models, "cluster_edit", "edit"),
         (action) =>
           deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
       );
@@ -280,24 +307,16 @@ export async function runClusterIntegration(
     }
 
     if (!structural.ok) {
-      const failure =
-        edit.kind === "context_overflow"
-          ? "context_overflow"
-          : edit.kind === "budget_exhausted"
-            ? "context_overflow"
-            : classifyFailure(edit.kind === "failed" ? edit.error : "");
-      const nextStatus = nextClusterStatusAfterFailure(failure, cluster.attempts);
       clusters = transitionCluster(
         clusters,
         cluster.id,
-        nextStatus,
+        "failed_resumable",
         structural.notes || `edit ${edit.kind}`,
       );
       deps.saveClusters(clusters);
       for (const placement of cluster.events) {
         eventStatuses.set(placement.eventCode, "failed");
       }
-      await deps.discardChanges();
       continue;
     }
 
@@ -427,7 +446,7 @@ export async function reviewIntegratedFile(
   deps: IntegrationDeps,
   file: string,
   events: RegisteredEvent[],
-  sessionSuffix = "",
+  _sessionSuffix = "",
 ): Promise<SemanticReviewResult> {
   let verdict: "pass" | "fail" | undefined;
   let issues: SemanticReviewIssue[] = [];
@@ -494,12 +513,11 @@ export async function reviewIntegratedFile(
     payloadSchema: event.payloadSchema,
   }));
   const surveyAnchors = deps.survey?.integratableCallSites.filter((anchor) => anchor.file === file) ?? [];
-  const key = createHash("sha256").update(file).digest("hex").slice(0, 12);
   const outcome = await deps.provider.invoke(
     {
       role: "review",
       task: "review",
-      sessionKey: `review:${key}${sessionSuffix}`,
+      sessionKey: "semantic_review",
       systemPrompt: [
         "You are the file-isolated semantic review pass for product analytics instrumentation.",
         "Use finish_review exactly once. Do not browse the repository and do not edit files.",
@@ -544,13 +562,12 @@ export async function repairIntegratedFile(
   events: RegisteredEvent[],
   review: SemanticReviewResult,
 ): Promise<boolean> {
-  const key = createHash("sha256").update(file).digest("hex").slice(0, 12);
   deps.sink.emit({ phase: "reviewing", file, action: "Sol is repairing semantic review failures" });
   const outcome = await deps.provider.invoke(
     {
       role: "edit",
       task: "repair",
-      sessionKey: `semantic_repair:${key}`,
+      sessionKey: "semantic_review",
       systemPrompt: deps.playbookSystemPrompt,
       userPrompt: [
         `Repair only ${file}.`,
@@ -602,7 +619,7 @@ export async function repairVerification(
     {
       role: "edit",
       task: "repair",
-      sessionKey: `final_repair:${cycle}`,
+      sessionKey: "semantic_review",
       systemPrompt: deps.playbookSystemPrompt,
       userPrompt: [
         "The one final repository verification failed after all instrumentation patches were merged.",

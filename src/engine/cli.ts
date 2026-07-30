@@ -11,8 +11,6 @@ import { createOpenAIProvider } from "./providers/openai.js";
 import { createRoutedProvider } from "./providers/router.js";
 import type { EngineModelConfig } from "./types.js";
 
-const MINUTE = 60_000;
-
 export function engineModelConfig(config: WizardConfig): EngineModelConfig {
   const model = (task: string, fallback: string) =>
     process.env[`WHISPERR_WIZARD_ENGINE_${task.toUpperCase()}_MODEL`]?.trim() || fallback;
@@ -22,14 +20,12 @@ export function engineModelConfig(config: WizardConfig): EngineModelConfig {
   const opusOnly = process.env.WHISPERR_WIZARD_PRESET?.trim() === "claude-default" ||
     config.offline === true;
   if (opusOnly) {
-    // Emergency rollback preset intentionally preserves the previous Opus-only
-    // behavior and budgets.
-    const survey = { model: model("survey", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 5 * MINUTE };
-    const design = { model: model("design", opus), effort: "medium", fastMode: true, maxTurns: 80, maxMs: 20 * MINUTE };
-    const sdkSetup = { model: model("sdk_setup", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE };
-    const clusterEdit = { model: model("cluster_edit", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE };
-    const repair = { model: model("repair", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
-    const review = { model: model("review", opus), effort: "medium", fastMode: true, maxTurns: 30, maxMs: 8 * MINUTE };
+    const survey = { model: model("survey", opus), effort: "low", fastMode: true };
+    const design = { model: model("design", opus), effort: "low", fastMode: true };
+    const sdkSetup = { model: model("sdk_setup", opus), effort: "medium", fastMode: true };
+    const clusterEdit = { model: model("cluster_edit", opus), effort: "medium", fastMode: true };
+    const repair = { model: model("repair", opus), effort: "medium", fastMode: true };
+    const review = { model: model("review", opus), effort: "medium", fastMode: true };
     return {
       survey,
       design,
@@ -40,34 +36,27 @@ export function engineModelConfig(config: WizardConfig): EngineModelConfig {
       repair,
     };
   }
-  const survey = { model: model("survey", opus), effort: "low", fastMode: true, maxTurns: 30, maxMs: 5 * MINUTE };
-  const design = { model: model("design", opus), effort: "low", fastMode: true, maxTurns: 20, maxMs: 5 * MINUTE };
-  const sdkSetup = { model: model("sdk_setup", opus), effort: "low", fastMode: true, maxTurns: 30, maxMs: 6 * MINUTE };
-  const clusterEdit = opusOnly
-    ? { model: model("cluster_edit", opus), effort: "medium", fastMode: true, maxTurns: 60, maxMs: 12 * MINUTE }
-    : {
-        model: model("cluster_edit", terra),
-        effort: "medium",
-        serviceTier: "priority" as const,
-        maxTurns: 20,
-        maxMs: 4 * MINUTE,
-        maxOutputTokens: 8_000,
-      };
+  const survey = { model: model("survey", opus), effort: "low", fastMode: true };
+  const design = { model: model("design", opus), effort: "low", fastMode: true };
+  const sdkSetup = {
+    model: model("sdk_setup", sol),
+    effort: "medium",
+    serviceTier: "priority" as const,
+  };
+  const clusterEdit = {
+    model: model("cluster_edit", terra),
+    effort: "medium",
+    serviceTier: "priority" as const,
+  };
   const repair = {
     model: model("repair", sol),
     effort: "medium",
     serviceTier: "priority" as const,
-    maxTurns: 30,
-    maxMs: 8 * MINUTE,
-    maxOutputTokens: 12_000,
   };
   const review = {
     model: model("review", sol),
     effort: "medium",
     serviceTier: "priority" as const,
-    maxTurns: 8,
-    maxMs: 3 * MINUTE,
-    maxOutputTokens: 4_000,
   };
   return {
     survey,
@@ -85,17 +74,17 @@ export function engineProvider(config: WizardConfig, session: WizardSession) {
   const models = engineModelConfig(config);
   const preset = process.env.WHISPERR_WIZARD_PRESET?.trim() ?? "hybrid";
   if (preset === "claude-default" || config.offline) {
-    return createRoutedProvider({}, claude, 2);
+    return createRoutedProvider({}, claude);
   }
   const openai = createOpenAIProvider(config, session);
   return createRoutedProvider({
-    survey: { provider: claude, concurrency: 3, fallbackConfig: models.repair },
-    design: { provider: claude, concurrency: 3, fallbackConfig: models.repair },
-    sdk_setup: { provider: claude, concurrency: 2, fallbackConfig: models.repair },
-    cluster_edit: { provider: openai, concurrency: 4, fallbackConfig: models.repair },
-    review: { provider: openai, concurrency: 2, fallbackConfig: models.review },
-    repair: { provider: openai, concurrency: 2, fallbackConfig: models.repair },
-  }, openai, 2);
+    survey: { provider: claude },
+    design: { provider: claude },
+    sdk_setup: { provider: openai },
+    cluster_edit: { provider: openai },
+    review: { provider: openai },
+    repair: { provider: openai },
+  }, openai);
 }
 
 export interface EngineFlowResult {

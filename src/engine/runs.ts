@@ -86,6 +86,16 @@ export interface IntegrationProgress {
   events: IntegrationEventEvidence[];
 }
 
+export interface PlacementManifestItem {
+  eventCode: string;
+  file: string;
+  startLine?: number;
+  endLine?: number;
+  wrapper: string;
+  payloadKeys: string[];
+  status: EventIntegrationStatus;
+}
+
 export interface ArtifactModelMetadata {
   model: string;
   effort?: string;
@@ -188,6 +198,17 @@ export class RunsClient {
 
   saveProgress(runId: string, progress: IntegrationProgress): Promise<RunRecord> {
     return this.patchRun(runId, { integrationEvidence: progress });
+  }
+
+  savePlacementManifest(
+    runId: string,
+    items: PlacementManifestItem[],
+  ): Promise<{ saved: number }> {
+    return this.request<{ saved: number }>(
+      "POST",
+      `/wizard/runs/${runId}/placements`,
+      { items },
+    );
   }
 
   writeItem(

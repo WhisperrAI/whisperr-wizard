@@ -13,7 +13,7 @@ test("fast mode is enabled only for supported Opus models", () => {
   assert.equal(supportsClaudeFastMode("custom-opus-model"), false);
 });
 
-test("default pipeline pins Opus low/fast, Terra medium/priority, and Sol medium/priority", () => {
+test("default pipeline fixes task ownership and has no application task caps", () => {
   const roleKeys = ["SURVEY", "DESIGN", "SDK_SETUP", "CLUSTER_EDIT", "REPAIR", "REVIEW"].map(
     (role) => `WHISPERR_WIZARD_ENGINE_${role}_MODEL`,
   );
@@ -26,28 +26,26 @@ test("default pipeline pins Opus low/fast, Terra medium/priority, and Sol medium
       plannerModel: "claude-opus-5",
       effort: "high",
     } as WizardConfig);
-    for (const task of ["survey", "design", "sdk_setup"] as const) {
+    for (const task of ["survey", "design"] as const) {
       assert.equal(models[task]?.model, "claude-opus-5");
       assert.equal(models[task]?.effort, "low");
       assert.equal(models[task]?.fastMode, true);
       assert.equal(supportsClaudeFastMode(models[task]!.model), true);
     }
+    assert.equal(models.sdk_setup?.model, "gpt-5.6-sol");
+    assert.equal(models.sdk_setup?.effort, "medium");
+    assert.equal(models.sdk_setup?.serviceTier, "priority");
     assert.equal(models.cluster_edit?.model, "gpt-5.6-terra");
     assert.equal(models.cluster_edit?.effort, "medium");
     assert.equal(models.cluster_edit?.serviceTier, "priority");
-    assert.equal(models.cluster_edit?.maxTurns, 20);
-    assert.equal(models.cluster_edit?.maxMs, 4 * 60_000);
-    assert.equal(models.cluster_edit?.maxOutputTokens, 8_000);
     for (const task of ["repair", "review"] as const) {
       assert.equal(models[task]?.model, "gpt-5.6-sol");
       assert.equal(models[task]?.effort, "medium");
       assert.equal(models[task]?.serviceTier, "priority");
     }
-    assert.equal(models.design?.maxTurns, 20);
-    assert.equal(models.sdk_setup?.maxTurns, 30);
-    assert.equal(models.review?.maxTurns, 8);
-    assert.equal(models.review?.maxOutputTokens, 4_000);
-    assert.equal(models.repair?.maxOutputTokens, 12_000);
+    assert.equal("maxTurns" in models.design!, false);
+    assert.equal("maxMs" in models.sdk_setup!, false);
+    assert.equal("maxOutputTokens" in models.review!, false);
   } finally {
     for (const [key, value] of previous) {
       if (value === undefined) delete process.env[key];

@@ -21,10 +21,10 @@ import type { EngineModelConfig, EngineProvider, RoleInvocation } from "../src/e
 const sink = createProgressSink({ json: false, isTTY: false, write: () => {} });
 
 const models: EngineModelConfig = {
-  survey: { model: "m", maxTurns: 5, maxMs: 1000 },
-  design: { model: "m", maxTurns: 5, maxMs: 1000 },
-  edit: { model: "m", maxTurns: 5, maxMs: 1000 },
-  review: { model: "m", maxTurns: 5, maxMs: 1000 },
+  survey: { model: "m" },
+  design: { model: "m" },
+  edit: { model: "m" },
+  review: { model: "m" },
 };
 
 function bootstrap(existing: string[] = []): RunBootstrap {
@@ -118,7 +118,7 @@ test("validateProposedEvent normalizes and rejects PII payload fields", () => {
 test("runSelection collects valid proposals and blocks rejected codes", async () => {
   const provider = scriptedProvider(async (invocation) => {
     assert.equal(invocation.repositoryAccess?.mode, "none");
-    assert.equal(invocation.sessionKey, "design");
+    assert.equal(invocation.sessionKey, "survey");
     assert.deepEqual(invocation.tools.map((tool) => tool.name), [
       "propose_event_batch",
       "finish_event_design",

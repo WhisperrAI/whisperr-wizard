@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.0
+
+- Give each phase one fixed model owner: a single Opus 5 low/fast conversation
+  surveys and designs, Sol medium/priority owns SDK setup, Terra
+  medium/priority owns all event insertion, and a separate Sol
+  medium/priority conversation owns semantic and verification repair.
+- Run SDK setup beside event design after the saved survey, remove wizard
+  turn/time/output/spend quotas and model fallbacks, retry transient failures
+  with the same owner, and compact or roll context without switching models.
+- Serialize complete per-file event work through one Terra conversation, retain
+  deterministic validation and final verification, and support non-Git
+  repositories through isolated temporary snapshots.
+- Persist a lightweight placement manifest and send task/session metadata on
+  every model call so the runtime can retain encrypted prompts, exposed
+  reasoning, responses, and terminal outcomes.
+
 ## 0.8.0
 
 - Make the hybrid router the default: Terra medium with priority processing

@@ -29,10 +29,6 @@ export interface RoleModelConfig {
   effort?: string;
   serviceTier?: "default" | "priority";
   fastMode?: boolean;
-  /** Provider-side cap for one response/task, independent of turn limits. */
-  maxOutputTokens?: number;
-  maxTurns: number;
-  maxMs: number;
 }
 
 /**
@@ -58,8 +54,6 @@ export interface RoleInvocation {
   sessionKey?: string;
   /** Explicit repository boundary for this invocation. */
   repositoryAccess?: RepositoryAccess;
-  /** True when this call is an escalated route rather than the primary model. */
-  fallback?: boolean;
   systemPrompt: string;
   userPrompt: string;
   tools: EngineTool[];
@@ -88,22 +82,12 @@ export interface RepositoryAccess {
 export type RoleOutcome =
   | { kind: "completed"; text: string; sessionId?: string; costUsd: number; turns: number }
   | { kind: "context_overflow"; sessionId?: string; costUsd: number; turns: number }
-  | { kind: "budget_exhausted"; sessionId?: string; costUsd: number; turns: number }
   | { kind: "failed"; error: string; sessionId?: string; costUsd: number; turns: number };
 
 export interface EngineProvider {
   name: string;
   onRunReady?(runId: string, resumeSessionId?: string): void;
   invoke(
-    invocation: RoleInvocation,
-    config: RoleModelConfig,
-    onProgress: (action: string) => void,
-  ): Promise<RoleOutcome>;
-  /**
-   * Invoke the fallback route for a task. Write tasks call this only after
-   * rolling their isolated worktree back to a clean checkpoint.
-   */
-  invokeFallback?(
     invocation: RoleInvocation,
     config: RoleModelConfig,
     onProgress: (action: string) => void,
