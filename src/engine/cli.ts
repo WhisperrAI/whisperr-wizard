@@ -123,6 +123,7 @@ export async function tryEngineFlow(options: {
       ? "backend"
       : "frontend",
     playbookSystemPrompt: playbook.systemPrompt,
+    sdkSetup: playbook.sdkSetup,
     sink,
   });
 

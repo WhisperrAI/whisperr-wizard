@@ -1,9 +1,12 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 
 import { z } from "zod";
 
 import { eventWrapperName, generateBindings, type GeneratedBindings } from "./bindings.js";
+import { formatSetupFailures, type SetupValidationResult } from "./setup-validation.js";
+import type { SdkSetupMetadata } from "../types.js";
+import { sdkSetupFor } from "../core/playbooks/sdk-setup.js";
 import { clustersComplete, nextPendingCluster, transitionCluster } from "./clusters.js";
 import type { ProgressSink } from "./output.js";
 import type { RegisteredEvent, SurveyArtifact } from "./selection.js";
@@ -31,6 +34,7 @@ export interface IntegrationDeps {
   worktree: WorktreeHandle;
   target: string;
   playbookSystemPrompt: string;
+  sdkSetup?: SdkSetupMetadata;
   registered: RegisteredEvent[];
   ingestion: { apiKey: string; baseUrl: string };
   survey?: SurveyArtifact;
@@ -57,6 +61,8 @@ export interface IntegrationResult {
 export interface ModelStepResult {
   completed: boolean;
   error?: string;
+  validation?: SetupValidationResult;
+  manualConfigurationWarnings?: string[];
 }
 
 const REVIEW_CHECKLIST = [
@@ -72,8 +78,9 @@ export async function writeBindingsModule(
   worktree: WorktreeHandle,
   target: string,
   registered: RegisteredEvent[],
+  sourceFiles: string[] = [],
 ): Promise<GeneratedBindings> {
-  const bindings = generateBindings(target, registered);
+  const bindings = generateBindings(target, registered, sourceFiles);
   await writeFile(join(worktree.path, bindings.relativePath), bindings.content);
   return bindings;
 }
@@ -81,25 +88,30 @@ export async function writeBindingsModule(
 export async function runSdkSetupPass(
   deps: IntegrationDeps,
   bindings: GeneratedBindings,
-  validate?: () => Promise<boolean>,
+  validate?: (allowedFiles: string[]) => Promise<SetupValidationResult | boolean>,
 ): Promise<ModelStepResult> {
   deps.sink.emit({ phase: "binding", action: "installing SDK and wiring identify()" });
-  const allowedFiles = await sdkSetupFiles(deps.worktree.path, deps.survey, bindings.relativePath);
+  const setup = deps.sdkSetup ?? sdkSetupFor(deps.target);
+  const allowedFiles = await sdkSetupFiles(deps.worktree.path, deps.survey, bindings.relativePath, setup);
+  const stateful = setup.lifecycleMode === "stateful";
   const invocation: RoleInvocation = {
     role: "edit",
     task: "sdk_setup",
     sessionKey: "sdk_setup",
-    systemPrompt: deps.playbookSystemPrompt,
+    systemPrompt: setup.guide,
     userPrompt: [
       "CORE SETUP for the Whisperr SDK in this repository. Do exactly this, then stop:",
-      "1. Add and install the Whisperr SDK dependency for this stack.",
-      "2. Initialize it once at app startup. Use the literal placeholders",
-      "   __WHISPERR_API_KEY__ and __WHISPERR_BASE_URL__; the wizard replaces them after your call.",
+      `1. Add the expected dependency: ${setup.requiredPackages.join(", ")}.`,
+      stateful
+        ? "2. Initialize it once at app startup. Use __WHISPERR_API_KEY__ and __WHISPERR_BASE_URL__; the wizard materializes the publishable client credential."
+        : "2. Create one server client using WHISPERR_API_KEY from the deployment environment and __WHISPERR_BASE_URL__. Never hardcode the server key.",
       `3. The deterministic bindings module at ${bindings.relativePath} queues events until bound.`,
       `   ${bindings.bindInstruction}`,
       "   Never edit the generated bindings content.",
-      "4. Wire identify() for the END USER (paying customer) at login success AND session restoration.",
-      "5. Wire reset() at every end-user logout anchor.",
+      stateful
+        ? "4. Wire identify() for the END USER at the canonical login/session restoration implementation. Wire reset() once in the canonical logout implementation."
+        : "4. Wire identify(externalUserId, ...) at a canonical end-user path. Server calls pass user ID per call; do not add reset() behavior.",
+      "Classify anchors as canonical implementations or callers before editing. Do not duplicate lifecycle calls to touch every anchor.",
       "Never instrument admin/staff/operator paths. Do not insert any product event calls. Do not run builds.",
       "",
       `Saved stack and identity anchors:\n${JSON.stringify({
@@ -116,15 +128,15 @@ export async function runSdkSetupPass(
     cwd: deps.worktree.path,
   };
   let followup = invocation;
-  let lastValidationFailure = "";
-  for (;;) {
+  let lastValidation: SetupValidationResult | undefined;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     const outcome = await deps.provider.invoke(
       followup,
       modelConfigFor(deps.models, "sdk_setup", "edit"),
       (action) => deps.sink.emit({ phase: "binding", action }),
     );
     if (outcome.kind !== "completed") {
-      const suffix = lastValidationFailure ? `; last validation: ${lastValidationFailure}` : "";
+      const suffix = lastValidation ? `; last validation: ${formatSetupFailures(lastValidation)}` : "";
       return {
         completed: false,
         error: `Sol SDK setup ${describeRoleOutcome(outcome)}${suffix}`,
@@ -135,38 +147,54 @@ export async function runSdkSetupPass(
       allowedFiles,
       deps.ingestion.apiKey,
       deps.ingestion.baseUrl,
+      setup.credentialMode,
     );
+    if (!validate) return { completed: true };
     let validationError = "";
-    const valid = await (async () => {
-      if (!validate) return true;
+    const rawAssessment = await (async () => {
       try {
-        return await validate();
+        return await validate(allowedFiles);
       } catch (error) {
         validationError = error instanceof Error ? error.message : String(error);
-        return false;
+        return undefined;
       }
     })();
-    if (valid) return { completed: true };
-    lastValidationFailure = validationError
-      ? `validator error: ${validationError}`
-      : "required SDK wiring is still missing";
+    if (rawAssessment === true) return { completed: true };
+    const assessment = rawAssessment === false
+        ? { ok: false, passed: [], failed: [{ id: "setup", message: "required SDK wiring is still missing", files: [] }], warnings: [], evidenceFiles: [], manualConfigurationWarnings: [] }
+        : rawAssessment;
+    if (assessment?.ok) {
+      for (const warning of assessment.manualConfigurationWarnings) {
+        deps.sink.emit({ phase: "binding", action: `manual configuration required: ${warning}` });
+      }
+      return { completed: true, validation: assessment, manualConfigurationWarnings: assessment.manualConfigurationWarnings };
+    }
+    if (!assessment) return { completed: false, error: `SDK setup validator error: ${validationError}` };
+    lastValidation = assessment;
+    if (attempt === 1) break;
+    const failureText = formatSetupFailures(assessment);
+    const preserved = assessment.passed.map((check) => check.id).join(", ") || "none";
     deps.sink.emit({
       phase: "binding",
-      action: validationError
-        ? `setup validation errored (${validationError.slice(0, 160)}); returning diagnostics to the same Sol conversation`
-        : "setup validation found missing wiring; returning diagnostics to the same Sol conversation",
+      action: "setup validation found missing wiring; returning exact diagnostics to the same Sol conversation",
     });
     followup = {
       ...invocation,
+      resumeSessionId: outcome.sessionId,
       userPrompt: [
-        "The SDK setup is not yet structurally complete.",
-        "Inspect the current allowed files and repair the existing work in place.",
-        "Ensure initialization, generated binding, login identify(), session-restoration identify(),",
-        "and logout reset() are all present. Do not insert product events. Finish the same task.",
-        `Deterministic validation result: ${lastValidationFailure}.`,
+        "Repair only the exact failed SDK setup checks below in the current work.",
+        `Failed checks: ${failureText}`,
+        `Already-passed checks that must not regress: ${preserved}.`,
+        "Keep generated bindings immutable, do not add product events, self-review once, then finish.",
       ].join("\n"),
     };
   }
+  return {
+    completed: false,
+    error: `SDK setup remains incomplete after one targeted follow-up: ${lastValidation ? formatSetupFailures(lastValidation) : "unknown validation failure"}`,
+    validation: lastValidation,
+    manualConfigurationWarnings: lastValidation?.manualConfigurationWarnings,
+  };
 }
 
 async function materializeSetupCredentials(
@@ -174,13 +202,14 @@ async function materializeSetupCredentials(
   allowedFiles: string[],
   apiKey: string,
   baseUrl: string,
+  credentialMode: SdkSetupMetadata["credentialMode"],
 ): Promise<void> {
   for (const file of allowedFiles) {
     try {
       const path = join(repoPath, file);
       const content = await readFile(path, "utf8");
       const materialized = content
-        .replaceAll("__WHISPERR_API_KEY__", apiKey)
+        .replaceAll("__WHISPERR_API_KEY__", credentialMode === "publishable" ? apiKey : "WHISPERR_API_KEY")
         .replaceAll("__WHISPERR_BASE_URL__", baseUrl);
       if (materialized !== content) await writeFile(path, materialized);
     } catch {
@@ -189,10 +218,11 @@ async function materializeSetupCredentials(
   }
 }
 
-async function sdkSetupFiles(
+export async function sdkSetupFiles(
   repoPath: string,
   survey: SurveyArtifact | undefined,
   bindingsFile: string,
+  metadata: SdkSetupMetadata,
 ): Promise<string[]> {
   const candidates = new Set<string>([
     bindingsFile,
@@ -204,12 +234,27 @@ async function sdkSetupFiles(
     ) ?? []),
     "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
     "bun.lock", "bun.lockb", "pyproject.toml", "requirements.txt", "Pipfile",
-    "Package.swift", "Podfile", "pubspec.yaml", "go.mod", "composer.json",
+    "Package.swift", "Project.swift", "project.yml", "Podfile", "pubspec.yaml", "go.mod", "composer.json", "composer.lock",
     "tsconfig.json", "next.config.js", "next.config.mjs", "next.config.ts",
     "vite.config.js", "vite.config.ts", "app.json", "Info.plist",
+    ".env.example", ".env.sample",
   ]);
+  const sourceFiles = [
+    ...(survey?.stack.entryPoints ?? []),
+    ...(survey?.identifyAnchors.map((anchor) => anchor.file) ?? []),
+    ...(survey?.logoutAnchors.map((anchor) => anchor.file) ?? []),
+  ];
+  const sourceDirs = new Set(sourceFiles.map((file) => dirname(file)).filter((dir) => dir !== "."));
+  if (sourceDirs.size === 0 || sourceFiles.some((file) => dirname(file) === ".")) sourceDirs.add(".");
+  for (const dir of sourceDirs) {
+    for (const name of metadata.allowedNewSetupModules) candidates.add(dir === "." ? name : `${dir}/${name}`);
+  }
   const available: string[] = [];
   for (const file of candidates) {
+    if (file === bindingsFile || metadata.allowedNewSetupModules.some((name) => file === name || file.endsWith(`/${name}`)) || /^\.env\.(?:example|sample)$/.test(file)) {
+      available.push(file.replaceAll("\\", "/"));
+      continue;
+    }
     try {
       if ((await stat(join(repoPath, file))).isFile()) available.push(file.replaceAll("\\", "/"));
     } catch {
@@ -231,13 +276,14 @@ function clusterPrompt(
   cluster: Cluster,
   registered: RegisteredEvent[],
   bindings: GeneratedBindings,
+  target = "",
 ): string {
   const byCode = new Map(registered.map((event) => [event.code, event]));
   const briefs = cluster.events.map((placement) => {
     const event = byCode.get(placement.eventCode);
     const fields = Object.keys(event?.payloadSchema ?? {});
     return [
-      `- ${placement.eventCode}: call the generated wrapper from ${bindings.relativePath}`,
+      `- ${placement.eventCode}: call ${eventWrapperName(placement.eventCode, target)} from ${bindings.relativePath}`,
       `  anchor: ${placement.file}${placement.symbol ? ` (${placement.symbol})` : ""}`,
       `  why: ${event?.reasoning ?? ""}`,
       fields.length > 0 ? `  payload fields: ${fields.join(", ")}` : "  payload: none",
@@ -264,7 +310,7 @@ export async function runClusterIntegration(
 ): Promise<{ clusters: Cluster[]; eventStatuses: Map<string, EventIntegrationStatus> }> {
   let clusters = initialClusters;
   const eventStatuses = new Map<string, EventIntegrationStatus>();
-  const bindings = generateBindings(deps.target, deps.registered);
+  const bindings = generateBindings(deps.target, deps.registered, surveyFiles(deps.survey));
   const total = clusters.length;
 
   for (;;) {
@@ -287,7 +333,7 @@ export async function runClusterIntegration(
         task: "cluster_edit",
         sessionKey: "event_insertion",
         systemPrompt: deps.playbookSystemPrompt,
-        userPrompt: clusterPrompt(cluster, deps.registered, bindings),
+        userPrompt: clusterPrompt(cluster, deps.registered, bindings, deps.target),
         tools: [],
         repositoryAccess: { mode: "cluster", allowedFiles: cluster.files },
         allowRepoWrite: true,
@@ -300,7 +346,7 @@ export async function runClusterIntegration(
         deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
     );
 
-    let structural = await structuralClusterCheck(deps.worktree.path, cluster);
+    let structural = await structuralClusterCheck(deps.worktree.path, cluster, deps.target);
     while (!structural.ok && edit.kind === "completed") {
       deps.sink.emit({
         phase: "integrating",
@@ -311,7 +357,7 @@ export async function runClusterIntegration(
         {
           ...invocation,
           userPrompt: [
-            clusterPrompt(cluster, deps.registered, bindings),
+            clusterPrompt(cluster, deps.registered, bindings, deps.target),
             "",
             `Deterministic validation failed: ${structural.notes}`,
             "Repair the current file in place and finish this same insertion task.",
@@ -321,7 +367,7 @@ export async function runClusterIntegration(
         (action) =>
           deps.sink.emit({ phase: "integrating", cluster: { index, total }, action }),
       );
-      structural = await structuralClusterCheck(deps.worktree.path, cluster);
+      structural = await structuralClusterCheck(deps.worktree.path, cluster, deps.target);
     }
 
     if (!structural.ok) {
@@ -353,9 +399,18 @@ export async function runClusterIntegration(
   return { clusters, eventStatuses };
 }
 
+function surveyFiles(survey?: SurveyArtifact): string[] {
+  return [
+    ...(survey?.stack.entryPoints ?? []),
+    ...(survey?.identifyAnchors.map((anchor) => anchor.file) ?? []),
+    ...(survey?.logoutAnchors.map((anchor) => anchor.file) ?? []),
+  ];
+}
+
 export async function structuralClusterCheck(
   repoPath: string,
   cluster: Cluster,
+  target = "",
 ): Promise<{ ok: boolean; notes: string }> {
   const allowed = new Set(cluster.files);
   const missing: string[] = [];
@@ -372,7 +427,7 @@ export async function structuralClusterCheck(
         continue;
       }
       const content = await readFile(path, "utf8");
-      const wrapper = eventWrapperName(placement.eventCode);
+      const wrapper = eventWrapperName(placement.eventCode, target);
       if (!content.includes(wrapper)) {
         missing.push(`${placement.eventCode}: wrapper call missing from ${placement.file}`);
       }

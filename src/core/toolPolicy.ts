@@ -118,6 +118,7 @@ export function isSecretPathLike(value: string): boolean {
     if (!part || part === "." || part === "**") continue;
     if (SECRET_DIRECTORIES.has(part)) return true;
     if (SECRET_EXACT_FILES.has(part)) return true;
+    if (part === ".env.example" || part === ".env.sample") continue;
     if (
       part === ".env" ||
       part === ".envrc" ||

@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "nextjs",
@@ -65,5 +66,6 @@ export const nextjsPlaybook: Playbook = {
   target,
   detect,
   packageRef: "@whisperr/next (npm)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
 };

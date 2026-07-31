@@ -21,9 +21,11 @@ The wizard is an agentic integrator with task-aware hybrid routing:
 2. **Design** — a separate Opus 5 low/fast session designs and validates the
    complete event batch from that saved survey. The batch is frozen and
    registered atomically; there is no terminal event-approval prompt.
-3. **Set up** — another isolated Opus 5 low/fast session installs and initializes
-   the SDK, binds generated wrappers, wires `identify()` for login/restoration,
-   and wires `reset()` for logout.
+3. **Set up** — Sol 5.6 medium/priority installs and initializes the SDK, binds
+   generated wrappers, and wires the target-appropriate identity lifecycle. A
+   deterministic safety assessment may return exact missing checks to the same
+   Sol conversation once; a second incomplete result stops with file-specific
+   diagnostics. Server SDKs pass user IDs per call and do not invent `reset()`.
 4. **Wire** — Terra 5.6 medium/priority runs a rolling queue of up to four
    file-isolated edit clusters, with no more than four events per cluster and
    no concurrent edits to the same file.

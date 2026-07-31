@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "web-js",
@@ -102,6 +103,7 @@ export const webPlaybook: Playbook = {
   target,
   detect,
   packageRef: "@whisperr/web (npm)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
   verifyCommand: undefined,
 };

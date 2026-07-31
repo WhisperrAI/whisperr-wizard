@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "php",
@@ -92,6 +93,7 @@ export const phpPlaybook: Playbook = {
   target,
   detect,
   packageRef: "whisperr/php (Packagist)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
   verifyCommand: undefined,
 };
