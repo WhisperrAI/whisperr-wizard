@@ -5,11 +5,14 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { generateBindings } from "../src/engine/bindings.js";
+import { sdkSetupFor } from "../src/core/playbooks/sdk-setup.js";
 import {
   runClusterIntegration,
   runSdkSetupPass,
   type IntegrationDeps,
+  sdkSetupFiles,
 } from "../src/engine/integrate.js";
+import { assessSdkSetup, type SetupValidationResult } from "../src/engine/setup-validation.js";
 import { createProgressSink } from "../src/engine/output.js";
 import { placementsFor, type RegisteredEvent } from "../src/engine/selection.js";
 import type { EngineModelConfig, EngineProvider, RoleInvocation } from "../src/engine/types.js";
@@ -49,6 +52,35 @@ test("bindings goldens carry wrappers, queue adapter, and payload docs", () => {
   const dart = generateBindings("flutter", registered);
   assert.equal(dart.relativePath, "whisperr_events.dart");
   assert.ok(dart.content.includes("static void trialStarted({required Object plan, required Object seatCount})"));
+
+  const js = generateBindings("web-js", registered, ["src/index.js"]);
+  assert.equal(js.relativePath, "whisperr-events.js");
+  assert.ok(!js.content.includes("type WhisperrPayloadValue"));
+
+  const nodeTs = generateBindings("node", registered, ["src/server.ts"]);
+  assert.match(nodeTs.content, /trialStarted\(externalUserId: string/);
+  assert.equal(nodeTs.lifecycleMode, "per-user");
+  const nodeJs = generateBindings("node", registered, ["server.js"]);
+  assert.match(nodeJs.content, /trialStarted\(externalUserId, payload\)/);
+
+  const python = generateBindings("python", registered);
+  assert.equal(python.relativePath, "whisperr_events.py");
+  assert.match(python.content, /def trial_started\(external_user_id/);
+  const php = generateBindings("php", registered);
+  assert.equal(php.relativePath, "WhisperrEvents.php");
+  assert.match(php.content, /trialStarted\(\$externalUserId/);
+});
+
+const passing = (id: string): SetupValidationResult => ({
+  ok: true,
+  passed: [{ id, message: id, files: [] }],
+  failed: [], warnings: [], evidenceFiles: [], manualConfigurationWarnings: [],
+});
+
+const failing = (id: string, file: string): SetupValidationResult => ({
+  ok: false, passed: [{ id: "scope", message: "scope passed", files: [] }],
+  failed: [{ id, message: `${id} is missing`, files: [file] }],
+  warnings: [], evidenceFiles: [file], manualConfigurationWarnings: [],
 });
 
 test("verify steps resolve from the repository honestly", () => {
@@ -160,6 +192,83 @@ test("SDK setup preserves the fixed Sol owner's terminal error", async () => {
   );
   assert.equal(result.completed, false);
   assert.match(result.error ?? "", /conversation binding was rejected/);
+});
+
+test("SDK setup uses at most one targeted follow-up in the returned Sol session", async () => {
+  const worktreePath = mkdtempSync(join(tmpdir(), "setup-followup-"));
+  writeFileSync(join(worktreePath, "package.json"), "{}");
+  const invocations: RoleInvocation[] = [];
+  const deps: IntegrationDeps = {
+    provider: { name: "sol", async invoke(invocation) { invocations.push(invocation); return { kind: "completed", text: "done", sessionId: "sol-session", costUsd: 0, turns: 1 }; } },
+    models: { survey: { model: "m" }, design: { model: "m" }, edit: { model: "sol" }, review: { model: "sol" }, sdk_setup: { model: "sol" } },
+    worktree: { kind: "snapshot", path: worktreePath, baseRef: "abc", repoPath: worktreePath },
+    target: "nextjs", playbookSystemPrompt: "ignored", registered,
+    ingestion: { apiKey: "pk", baseUrl: "https://api.example.test" },
+    sink: createProgressSink({ json: false, isTTY: false, write: () => {} }), saveClusters: () => {}, discardChanges: async () => {}, onClusterIntegrated: async () => {},
+  };
+  let validations = 0;
+  const result = await runSdkSetupPass(deps, generateBindings("nextjs", registered), async () => {
+    validations += 1;
+    return validations === 1 ? failing("reset", "src/authService.ts") : passing("reset");
+  });
+  assert.equal(result.completed, true);
+  assert.equal(invocations.length, 2);
+  assert.equal(invocations[1]?.resumeSessionId, "sol-session");
+  assert.match(invocations[1]?.userPrompt ?? "", /reset is missing \[src\/authService\.ts\]/);
+  assert.match(invocations[1]?.userPrompt ?? "", /scope/);
+
+  invocations.length = 0;
+  const failed = await runSdkSetupPass(deps, generateBindings("nextjs", registered), async () => failing("binding", "src/whisperr.ts"));
+  assert.equal(invocations.length, 2);
+  assert.equal(failed.completed, false);
+  assert.match(failed.error ?? "", /binding is missing \[src\/whisperr\.ts\]/);
+});
+
+test("production-shaped callers pass through one canonical Next.js auth service", async () => {
+  const repoPath = mkdtempSync(join(tmpdir(), "setup-assess-"));
+  mkdirSync(join(repoPath, "src"), { recursive: true });
+  const bindings = generateBindings("nextjs", registered, ["src/main.tsx"]);
+  writeFileSync(join(repoPath, bindings.relativePath), bindings.content);
+  writeFileSync(join(repoPath, "package.json"), JSON.stringify({ dependencies: { "@whisperr/next": "1", "@whisperr/web": "1" } }));
+  writeFileSync(join(repoPath, "src/main.tsx"), "export { authService } from './authService';\n");
+  writeFileSync(join(repoPath, "src/loginCaller.ts"), "export const login = () => authService.me();\n");
+  writeFileSync(join(repoPath, "src/logoutCaller.ts"), "export const logout = () => authService.logOut();\n");
+  writeFileSync(join(repoPath, "src/authService.ts"), [
+    "import { Whisperr } from '@whisperr/web';",
+    "import { bindWhisperr } from '../whisperr-events';",
+    "const whisperr = Whisperr.init({ apiKey: 'pk' });",
+    "bindWhisperr(whisperr);",
+    "export const authService = { me(user) { whisperr.identify(user.id); }, logOut() { whisperr.reset(); } };",
+  ].join("\n"));
+  const survey = {
+    stack: { frameworks: ["nextjs"], entryPoints: ["src/main.tsx"] }, featureAreas: [], existingAnalytics: [], integratableCallSites: [],
+    identifyAnchors: [{ file: "src/authService.ts", description: "canonical" }, { file: "src/loginCaller.ts", description: "caller" }],
+    logoutAnchors: [{ file: "src/authService.ts", description: "canonical" }, { file: "src/logoutCaller.ts", description: "caller" }],
+  };
+  const metadata = sdkSetupFor("nextjs");
+  const allowedFiles = await sdkSetupFiles(repoPath, survey, bindings.relativePath, metadata);
+  const result = await assessSdkSetup({ repoPath, target: "nextjs", metadata, bindings, allowedFiles, editedFiles: [bindings.relativePath, "package.json", "src/authService.ts"], registered: [], survey });
+  assert.equal(result.ok, true, result.failed.map((check) => check.message).join("; "));
+  assert.ok(result.warnings.some((warning) => warning.id === "caller-anchor" && warning.files.includes("src/loginCaller.ts")));
+});
+
+test("setup assessment keeps hard safety failures and makes reset target-aware", async () => {
+  const repoPath = mkdtempSync(join(tmpdir(), "setup-hard-"));
+  mkdirSync(join(repoPath, "src"), { recursive: true });
+  const bindings = generateBindings("node", registered, ["src/server.ts"]);
+  writeFileSync(join(repoPath, bindings.relativePath), bindings.content);
+  writeFileSync(join(repoPath, "package.json"), JSON.stringify({ dependencies: { "@whisperr/node": "1" } }));
+  writeFileSync(join(repoPath, "src/server.ts"), "const client = new Whisperr({ apiKey: process.env.WHISPERR_API_KEY }); bindWhisperr(client); client.identify(user.id); WhisperrEvents.trialStarted(user.id, payload);\n");
+  const survey = { stack: { frameworks: ["node"], entryPoints: ["src/server.ts"] }, featureAreas: [], identifyAnchors: [], logoutAnchors: [], existingAnalytics: [], integratableCallSites: [] };
+  const metadata = sdkSetupFor("node");
+  const allowedFiles = await sdkSetupFiles(repoPath, survey, bindings.relativePath, metadata);
+  const result = await assessSdkSetup({ repoPath, target: "node", metadata, bindings, allowedFiles, editedFiles: [bindings.relativePath, "src/server.ts", "outside.ts"], registered, survey });
+  assert.equal(result.failed.some((check) => check.id === "reset"), false);
+  assert.ok(result.failed.some((check) => check.id === "scope"));
+  assert.ok(result.failed.some((check) => check.id === "no-product-events"));
+  writeFileSync(join(repoPath, bindings.relativePath), `${bindings.content}\n// changed`);
+  const changed = await assessSdkSetup({ repoPath, target: "node", metadata, bindings, allowedFiles, editedFiles: [], registered: [], survey });
+  assert.ok(changed.failed.some((check) => check.id === "generated-binding"));
 });
 
 test("cluster integration marks overflow clusters resumable and structurally verifies the rest", async () => {

@@ -14,10 +14,17 @@ test(".env is denied", () => {
   assert.equal(policy("Read", { file_path: ".env" }).behavior, "deny");
 });
 
-test("all .env variants are denied, including examples and local files", () => {
-  for (const file_path of [".env", ".env.local", ".env.example", ".env.sample", ".env.template"]) {
+test("real .env variants remain denied", () => {
+  for (const file_path of [".env", ".env.local", ".env.template"]) {
     assert.equal(policy("Read", { file_path }).behavior, "deny");
     assert.equal(policy("Edit", { file_path }).behavior, "deny");
+  }
+});
+
+test("non-secret env templates are allowed", () => {
+  for (const file_path of [".env.example", ".env.sample"]) {
+    assert.equal(policy("Read", { file_path }).behavior, "allow");
+    assert.equal(policy("Edit", { file_path }).behavior, "allow");
   }
 });
 

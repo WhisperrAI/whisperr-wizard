@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "python",
@@ -120,6 +121,7 @@ export const pythonPlaybook: Playbook = {
   target,
   detect,
   packageRef: "whisperr (PyPI)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
   verifyCommand: undefined,
 };

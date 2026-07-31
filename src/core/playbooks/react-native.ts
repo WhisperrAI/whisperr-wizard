@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "react-native",
@@ -141,5 +142,6 @@ export const reactNativePlaybook: Playbook = {
   target,
   detect,
   packageRef: "@whisperr/react-native (npm)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
 };

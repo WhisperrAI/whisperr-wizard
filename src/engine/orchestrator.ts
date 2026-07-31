@@ -3,6 +3,8 @@ import { basename, resolve, sep } from "node:path";
 
 import type { ReportEvent } from "../core/report.js";
 import type { WizardConfig, WizardSession } from "../types.js";
+import type { SdkSetupMetadata } from "../types.js";
+import { sdkSetupFor } from "../core/playbooks/sdk-setup.js";
 import { eventWrapperName, generateBindings } from "./bindings.js";
 import {
   clusterIdFor,
@@ -15,10 +17,12 @@ import {
   reviewIntegratedFile,
   runClusterIntegration,
   runSdkSetupPass,
+  sdkSetupFiles,
   structuralClusterCheck,
   writeBindingsModule,
   type IntegrationDeps,
 } from "./integrate.js";
+import { assessSdkSetup, formatSetupFailures, type SetupValidationResult } from "./setup-validation.js";
 import type { ProgressSink } from "./output.js";
 import {
   RunsApiError,
@@ -65,6 +69,7 @@ export interface EngineRunInput {
   target: string;
   projectKind: "frontend" | "backend" | "fullstack";
   playbookSystemPrompt: string;
+  sdkSetup?: SdkSetupMetadata;
   sink: ProgressSink;
   force?: boolean;
 }
@@ -354,7 +359,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
 
   const prior = bootstrap.run.integrationEvidence;
   const changedFiles = new Set(prior?.changedFiles ?? []);
-  const eventStatuses = await reconcileProgress(input.repoPath, registered, prior, input.sink);
+  const eventStatuses = await reconcileProgress(input.repoPath, registered, prior, input.sink, input.target);
   const eventFailureReasons = new Map<string, string>();
   let verificationStatus: "pending" | "passed" | "failed" | "unavailable" = "pending";
   for (const event of registered) {
@@ -364,7 +369,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     }
   }
   let identifyWired = prior?.identifyWired === true &&
-    await setupLooksPresent(input.repoPath, changedFiles, survey);
+    (await setupLooksPresent(input.repoPath, changedFiles, survey, input.target, registered, input.sdkSetup, false)).ok;
 
   const progress = (): IntegrationProgress => ({
     changedFiles: [...changedFiles].sort(),
@@ -423,23 +428,17 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
   };
 
   try {
-    const bindings = await writeBindingsModule(setupWorktree, input.target, registered);
+    const bindings = await writeBindingsModule(setupWorktree, input.target, registered, sdkSurveyFiles(survey));
     if (!identifyWired && !preparedSetup?.completed) {
       const validateSetup = async () => {
-        if (
-          await readFile(resolve(setupWorktree.path, bindings.relativePath), "utf8") !==
-            bindings.content
-        ) {
-          return false;
-        }
         const candidatePatch = await worktreePatch(setupWorktree);
-        if (patchAddsProductEvents(candidatePatch, bindings.relativePath, registered)) {
-          return false;
-        }
         return setupLooksPresent(
           setupWorktree.path,
           new Set(patchFiles(candidatePatch)),
           survey,
+          input.target,
+          registered,
+          input.sdkSetup,
         );
       };
       const setupResult = await runSdkSetupPass({
@@ -448,6 +447,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         worktree: setupWorktree,
         target: input.target,
         playbookSystemPrompt: input.playbookSystemPrompt,
+        sdkSetup: input.sdkSetup ?? sdkSetupFor(input.target),
         registered,
         ingestion: bootstrap.ingestion,
         survey,
@@ -461,11 +461,12 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       }
       const setupPatch = await worktreePatch(setupWorktree);
       const setupFiles = patchFiles(setupPatch);
-      if (!await setupLooksPresent(setupWorktree.path, new Set(setupFiles), survey)) {
-        throw new Error("SDK initialization, identify(), session restoration, or logout reset() could not be verified");
+      const setupAssessment = await setupLooksPresent(setupWorktree.path, new Set(setupFiles), survey, input.target, registered, input.sdkSetup);
+      if (!setupAssessment.ok) {
+        throw new Error(`SDK setup checkpoint failed: ${formatSetupFailures(setupAssessment)}`);
       }
       await checkpoint(setupWorktree, "setup");
-      identifyWired = await setupLooksPresent(input.repoPath, changedFiles, survey);
+      identifyWired = (await setupLooksPresent(input.repoPath, changedFiles, survey, input.target, registered, input.sdkSetup, false)).ok;
       if (!identifyWired) {
         throw new Error("SDK initialization, bindings, identify(), and reset() could not be verified");
       }
@@ -473,17 +474,20 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     } else {
       if (
         preparedSetup?.completed &&
-        !await setupLooksPresent(
+        !(await setupLooksPresent(
           setupWorktree.path,
           new Set(patchFiles(await worktreePatch(setupWorktree))),
           survey,
-        )
+          input.target,
+          registered,
+          input.sdkSetup,
+        )).ok
       ) {
         throw new Error("prepared Sol SDK setup is missing initialization, identify(), binding, or reset()");
       }
       // The generated bindings may gain events after placement recovery.
       await checkpoint(setupWorktree, "setup");
-      identifyWired = await setupLooksPresent(input.repoPath, changedFiles, survey);
+      identifyWired = (await setupLooksPresent(input.repoPath, changedFiles, survey, input.target, registered, input.sdkSetup, false)).ok;
       if (!identifyWired) {
         throw new Error("SDK initialization, bindings, identify(), and reset() could not be verified");
       }
@@ -561,7 +565,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       if (worker.handle) await removeWorktree(worker.handle).catch(() => {});
       await runs.savePlacementManifest(
         runId,
-        await buildPlacementManifest(input.repoPath, registered, eventStatuses),
+        await buildPlacementManifest(input.repoPath, registered, eventStatuses, input.target),
       );
     }
     await saveProgress();
@@ -627,7 +631,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
           attempts: 1,
         };
         const structural = repairResult.completed
-          ? await structuralClusterCheck(repairWorktree.path, reviewCluster)
+          ? await structuralClusterCheck(repairWorktree.path, reviewCluster, input.target)
           : { ok: false, notes: repairResult.error ?? "Sol repair did not complete" };
         const recheck = structural.ok
           ? await reviewIntegratedFile(repairDeps, reviewed.file, reviewed.events, ":recheck")
@@ -665,7 +669,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         await saveProgress();
         await runs.savePlacementManifest(
           runId,
-          await buildPlacementManifest(input.repoPath, registered, eventStatuses),
+          await buildPlacementManifest(input.repoPath, registered, eventStatuses, input.target),
         );
       }
     }
@@ -699,6 +703,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         verificationWorktree.path,
         registered,
         repairFiles,
+        input.target,
       );
       if (
         repairPatch.trim() === "" ||
@@ -752,7 +757,8 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
       );
     }
     await removeWorktree(verificationWorktree).catch(() => {});
-    identifyWired = await setupLooksPresent(input.repoPath, changedFiles, survey);
+    const finalSetupAssessment = await setupLooksPresent(input.repoPath, changedFiles, survey, input.target, registered, input.sdkSetup, false);
+    identifyWired = finalSetupAssessment.ok;
     if (!identifyWired) {
       await rollbackOwnedPatches(input.repoPath, ownedPatches);
       changedFiles.clear();
@@ -761,7 +767,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
         eventFailureReasons.set(event.code, "SDK initialization or identify() is missing after final repair");
       }
       await saveProgress();
-      throw new Error("SDK initialization, identify(), and logout reset() must be present before completion");
+      throw new Error(`SDK setup failed after final repair: ${formatSetupFailures(finalSetupAssessment)}`);
     }
     for (const event of registered) {
       if (eventStatuses.get(event.code) === "reviewed") {
@@ -771,7 +777,7 @@ export async function runEngine(input: EngineRunInput): Promise<EngineRunResult>
     await saveProgress();
     await runs.savePlacementManifest(
       runId,
-      await buildPlacementManifest(input.repoPath, registered, eventStatuses),
+      await buildPlacementManifest(input.repoPath, registered, eventStatuses, input.target),
     );
     const failures = registered.filter((event) => eventStatuses.get(event.code) !== "build_verified");
     if (failures.length > 0) {
@@ -904,13 +910,14 @@ async function prepareSdkSetup(
     allowedDirtyFiles,
   );
   try {
-    const bindings = await writeBindingsModule(handle, input.target, []);
+    const bindings = await writeBindingsModule(handle, input.target, [], sdkSurveyFiles(survey));
     const deps: IntegrationDeps = {
       provider: input.provider,
       models: input.models,
       worktree: handle,
       target: input.target,
       playbookSystemPrompt: input.playbookSystemPrompt,
+      sdkSetup: input.sdkSetup ?? sdkSetupFor(input.target),
       registered: [],
       ingestion: bootstrap.ingestion,
       survey,
@@ -921,14 +928,8 @@ async function prepareSdkSetup(
       onClusterIntegrated: async () => {},
     };
     const result = await runSdkSetupPass(deps, bindings, async () => {
-      if (
-        await readFile(resolve(handle.path, bindings.relativePath), "utf8") !==
-          bindings.content
-      ) {
-        return false;
-      }
       const patch = await worktreePatch(handle);
-      return setupLooksPresent(handle.path, new Set(patchFiles(patch)), survey);
+      return setupLooksPresent(handle.path, new Set(patchFiles(patch)), survey, input.target, [], input.sdkSetup);
     });
     return { handle, ...result };
   } catch (error) {
@@ -984,17 +985,26 @@ function integrationDeps(
     worktree,
     target: input.target,
     playbookSystemPrompt: input.playbookSystemPrompt,
+    sdkSetup: input.sdkSetup ?? sdkSetupFor(input.target),
     registered,
     ingestion: bootstrap.ingestion,
     survey,
     allowedRepairFiles: allowedRepairFiles.filter(
-      (file) => file !== generateBindings(input.target, registered).relativePath,
+      (file) => file !== generateBindings(input.target, registered, sdkSurveyFiles(survey)).relativePath,
     ),
     sink: input.sink,
     saveClusters: () => {},
     discardChanges: async () => discardWorktreeChanges(worktree),
     onClusterIntegrated: async () => {},
   };
+}
+
+function sdkSurveyFiles(survey?: SurveyArtifact): string[] {
+  return [
+    ...(survey?.stack.entryPoints ?? []),
+    ...(survey?.identifyAnchors.map((anchor) => anchor.file) ?? []),
+    ...(survey?.logoutAnchors.map((anchor) => anchor.file) ?? []),
+  ];
 }
 
 function groupEventsByFile(events: RegisteredEvent[]): Map<string, RegisteredEvent[]> {
@@ -1011,6 +1021,7 @@ async function structuralRepairCheck(
   repoPath: string,
   events: RegisteredEvent[],
   files: string[],
+  target = "",
 ): Promise<{ ok: boolean; notes: string }> {
   const repairedFiles = new Set(files);
   for (const [file, fileEvents] of groupEventsByFile(
@@ -1022,7 +1033,7 @@ async function structuralRepairCheck(
       events: placementsFor(fileEvents),
       status: "verified",
       attempts: 1,
-    });
+    }, target);
     if (!result.ok) return result;
   }
   return { ok: true, notes: "" };
@@ -1131,6 +1142,7 @@ async function reconcileProgress(
   registered: RegisteredEvent[],
   prior: IntegrationProgress | undefined,
   sink: ProgressSink,
+  target = "",
 ): Promise<Map<string, EventIntegrationStatus>> {
   const priorById = new Map((prior?.events ?? []).map((event) => [event.eventId, event]));
   const statuses = new Map<string, EventIntegrationStatus>();
@@ -1140,7 +1152,7 @@ async function reconcileProgress(
       statuses.set(event.code, "unsupported");
       continue;
     }
-    const present = await fileContainsWrapper(repoPath, event.anchorFile, event.code);
+    const present = await fileContainsWrapper(repoPath, event.anchorFile, event.code, target);
     const savedIntegrated = saved && saved.status !== "planned" && saved.status !== "failed";
     const status = present ? (savedIntegrated ? saved.status : "applied") : "planned";
     statuses.set(event.code, status);
@@ -1161,11 +1173,12 @@ async function fileContainsWrapper(
   repoPath: string,
   file: string,
   eventCode: string,
+  target = "",
 ): Promise<boolean> {
   try {
     const path = safeRepoPath(repoPath, file);
     const content = await readFile(path, "utf8");
-    return content.includes(eventWrapperName(eventCode));
+    return content.includes(eventWrapperName(eventCode, target));
   } catch {
     return false;
   }
@@ -1175,10 +1188,11 @@ async function buildPlacementManifest(
   repoPath: string,
   registered: RegisteredEvent[],
   statuses: Map<string, EventIntegrationStatus>,
+  target = "",
 ) {
   const items = [];
   for (const event of registered) {
-    const wrapper = eventWrapperName(event.code);
+    const wrapper = eventWrapperName(event.code, target);
     let startLine: number | undefined;
     try {
       const content = await readFile(safeRepoPath(repoPath, event.anchorFile), "utf8");
@@ -1205,39 +1219,35 @@ async function setupLooksPresent(
   repoPath: string,
   changedFiles: Set<string>,
   survey?: SurveyArtifact,
-): Promise<boolean> {
-  let bindingsFound = false;
-  let bindingCallFound = false;
-  let identifyFound = false;
-  let resetFound = false;
-  let sdkInitializationFound = false;
-  const contents = new Map<string, string>();
-  for (const file of changedFiles) {
-    try {
-      const content = await readFile(safeRepoPath(repoPath, file), "utf8");
-      contents.set(file, content);
-      const generated = content.includes("Generated by @whisperr/wizard");
-      bindingsFound ||= generated;
-      if (!generated) {
-        bindingCallFound ||= content.includes("bindWhisperr(") ||
-          content.includes("WhisperrEvents.bind(");
-        identifyFound ||= /\bidentify\s*\(/.test(content);
-        resetFound ||= /\breset\s*\(/.test(content);
-        sdkInitializationFound ||= /whisperr/i.test(content) &&
-          /(initiali[sz]e|configure|client|setup)/i.test(content);
-      }
-    } catch {
-      // Missing progress files are handled as incomplete setup.
+  target = "nextjs",
+  registered: RegisteredEvent[] = [],
+  setupMetadata?: SdkSetupMetadata,
+  enforceEditScope = true,
+): Promise<SetupValidationResult> {
+  const sourceFiles = [
+    ...(survey?.stack.entryPoints ?? []),
+    ...(survey?.identifyAnchors.map((anchor) => anchor.file) ?? []),
+    ...(survey?.logoutAnchors.map((anchor) => anchor.file) ?? []),
+  ];
+  const bindings = generateBindings(target, registered, sourceFiles);
+  const metadata = setupMetadata ?? sdkSetupFor(target);
+  const allowedFiles = await sdkSetupFiles(repoPath, survey, bindings.relativePath, metadata);
+  if (!enforceEditScope) {
+    for (const file of changedFiles) {
+      if (!allowedFiles.includes(file)) allowedFiles.push(file);
     }
   }
-  const identifyAnchorsCovered = (survey?.identifyAnchors ?? []).every((anchor) =>
-    /\bidentify\s*\(/.test(contents.get(anchor.file) ?? "")
-  );
-  const logoutAnchorsCovered = (survey?.logoutAnchors ?? []).every((anchor) =>
-    /\breset\s*\(/.test(contents.get(anchor.file) ?? "")
-  );
-  return bindingsFound && bindingCallFound && identifyFound && resetFound &&
-    sdkInitializationFound && identifyAnchorsCovered && logoutAnchorsCovered;
+  return assessSdkSetup({
+    repoPath,
+    target,
+    metadata,
+    bindings,
+    allowedFiles,
+    editedFiles: enforceEditScope ? [...changedFiles] : [...changedFiles].filter((file) => allowedFiles.includes(file)),
+    registered,
+    survey,
+    forbidProductEvents: enforceEditScope,
+  });
 }
 
 function safeRepoPath(repoPath: string, file: string): string {
@@ -1298,29 +1308,4 @@ function patchFiles(patch: string): string[] {
     }
   }
   return [...files];
-}
-
-function patchAddsProductEvents(
-  patch: string,
-  bindingsFile: string,
-  events: RegisteredEvent[],
-): boolean {
-  const wrappers = events.map((event) => eventWrapperName(event.code));
-  let file = "";
-  for (const line of patch.split("\n")) {
-    const header = /^\+\+\+ b\/(.+)$/.exec(line);
-    if (header?.[1]) {
-      file = header[1];
-      continue;
-    }
-    if (
-      file !== bindingsFile &&
-      line.startsWith("+") &&
-      !line.startsWith("+++") &&
-      wrappers.some((wrapper) => line.includes(wrapper))
-    ) {
-      return true;
-    }
-  }
-  return false;
 }

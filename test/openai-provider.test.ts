@@ -29,15 +29,12 @@ test("OpenAI file tools hide and deny secret material", async () => {
   const replace = tools.find((tool) => tool.name === "replace_in_file")!;
 
   await assert.rejects(read.handler({ path: ".env.local" }), /secret material/);
-  await assert.rejects(read.handler({ path: ".env.example" }), /secret material/);
+  assert.deepEqual(await read.handler({ path: ".env.example" }), { content: "SECRET=example" });
   await assert.rejects(write.handler({ path: ".env.local", content: "changed" }), /secret material/);
-  await assert.rejects(
-    replace.handler({ path: ".env.example", oldText: "SECRET", newText: "KEY" }),
-    /secret material/,
-  );
+  await replace.handler({ path: ".env.example", oldText: "SECRET", newText: "KEY" });
 
   const listing = await list.handler({ path: "." }) as { entries: string[] };
-  assert.deepEqual(listing.entries, ["file:visible.txt"]);
+  assert.deepEqual(listing.entries, ["file:.env.example", "file:visible.txt"]);
 });
 
 test("openai provider binds a conversation and loops function calls", async () => {

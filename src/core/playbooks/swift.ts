@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "swift",
@@ -139,5 +140,6 @@ export const swiftPlaybook: Playbook = {
   target,
   detect,
   packageRef: "whisperr-swift (Swift Package)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
 };
