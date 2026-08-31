@@ -6,6 +6,42 @@ import { IntegrationMCPClient, INTEGRATION_CONTRACT, MCPBrowserAuthorization, mc
 
 const response = (body: unknown, status = 200) => new Response(status === 202 ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
+test("MCP HTTP deadline starts after slow browser authorization and still bounds the request", async (t) => {
+  const realTimeout = AbortSignal.timeout.bind(AbortSignal);
+  const order: string[] = [];
+  t.mock.method(AbortSignal, "timeout", (ms: number) => {
+    assert.equal(ms, 35_000);
+    order.push("deadline");
+    return realTimeout(10);
+  });
+  const token = async () => {
+    order.push("authorization");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    order.push("approved");
+    return "synthetic-token";
+  };
+  const request: typeof fetch = async (_url, init) => {
+    order.push("request");
+    assert.equal(init?.signal?.aborted, false);
+    assert.equal(new Headers(init?.headers).get("Authorization"), "Bearer synthetic-token");
+    return response({ jsonrpc: "2.0", id: 1, result: {} });
+  };
+  await new IntegrationMCPClient("https://api.whisperr.net", token, request).forward({ jsonrpc: "2.0", id: 1, method: "ping" });
+  assert.deepEqual(order, ["authorization", "approved", "deadline", "request"]);
+
+  const stalled: typeof fetch = async (_url, init) => {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    init?.signal?.throwIfAborted();
+    throw new Error("unbounded request");
+  };
+  await assert.rejects(new IntegrationMCPClient("https://api.whisperr.net", async () => "token", stalled).forward({ jsonrpc: "2.0", id: 2, method: "ping" }), { name: "TimeoutError" });
+});
+
+test("denied MCP authorization creates neither an HTTP deadline nor a request", async (t) => {
+  t.mock.method(AbortSignal, "timeout", () => { throw new Error("deadline created before authorization"); });
+  await assert.rejects(new IntegrationMCPClient("https://api.whisperr.net", async () => { throw new Error("consent denied"); }, async () => { throw new Error("request sent"); }).forward({ jsonrpc: "2.0", id: 1, method: "ping" }), /consent denied/);
+});
+
 test("MCP origins reject secret-bearing, foreign, and insecure URLs", () => {
   assert.equal(mcpBase("https://api.whisperr.net/"), "https://api.whisperr.net");
   assert.equal(mcpBase("http://127.0.0.1:8123"), "http://127.0.0.1:8123");

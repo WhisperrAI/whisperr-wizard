@@ -1,0 +1,28 @@
+{
+  "mode": "mock",
+  "generatedAt": "2026-07-29T07:50:56.066Z",
+  "results": [
+    {
+      "fixture": "sparse",
+      "passed": true,
+      "failures": [],
+      "registered": 0,
+      "runKind": "aborted"
+    },
+    {
+      "fixture": "webapp",
+      "passed": true,
+      "failures": [],
+      "registered": 1,
+      "runKind": "completed"
+    },
+    {
+      "fixture": "failure-injection",
+      "passed": true,
+      "failures": [],
+      "registered": 0,
+      "runKind": "aborted"
+    }
+  ],
+  "passed": true
+}

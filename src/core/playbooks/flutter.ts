@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "flutter",
@@ -79,6 +80,7 @@ export const flutterPlaybook: Playbook = {
   target,
   detect,
   packageRef: "whisperr (pub.dev)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
   verifyCommand: "flutter analyze",
 };

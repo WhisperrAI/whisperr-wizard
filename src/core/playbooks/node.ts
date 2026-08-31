@@ -1,4 +1,5 @@
 import type { Playbook, Detection, DetectContext } from "../../types.js";
+import { sdkSetupFor } from "./sdk-setup.js";
 
 const target = {
   id: "node",
@@ -168,6 +169,7 @@ export const nodePlaybook: Playbook = {
   target,
   detect,
   packageRef: "@whisperr/node (npm)",
+  sdkSetup: sdkSetupFor(target.id),
   systemPrompt,
   verifyCommand: undefined,
 };

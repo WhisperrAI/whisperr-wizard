@@ -47,6 +47,8 @@ export interface Playbook {
   detect(ctx: DetectContext): Promise<Detection | null>;
   /** Package/dependency the agent should add (for display + the prompt). */
   packageRef: string;
+  /** Deterministic contract used by the constrained SDK-setup pass. */
+  sdkSetup: SdkSetupMetadata;
   /**
    * The SDK-specific system-prompt fragment. This is the heart of the wizard:
    * the best-practice integration guide, API surface, and gotchas for THIS
@@ -58,6 +60,20 @@ export interface Playbook {
    * e.g. "flutter analyze". Optional.
    */
   verifyCommand?: string;
+}
+
+export interface SdkSetupMetadata {
+  lifecycleMode: "stateful" | "per-user";
+  requiredPackages: string[];
+  initializationMarkers: string[];
+  bindingStrategy: "stateful-client" | "per-user-client";
+  bindingMarkers: string[];
+  credentialMode: "publishable" | "server-env";
+  allowedNewSetupModules: string[];
+  /** Setup-only instructions; product-event placement is deliberately excluded. */
+  guide: string;
+  /** Raw Xcode projects may require adding the package through Xcode manually. */
+  manualDependencyAllowed?: boolean;
 }
 
 export interface DetectContext {

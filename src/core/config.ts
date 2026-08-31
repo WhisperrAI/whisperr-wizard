@@ -15,14 +15,11 @@ import type { WizardConfig } from "../types.js";
  */
 
 const DEFAULT_API_BASE = "https://api.whisperr.net";
-// Two-tier agent design:
-// - plannerModel (Opus by default) thinks: map the repo, choose event placement
-//   sites, and review the resulting diff with deeper reasoning.
-// - model (Sonnet by default) types: perform the mechanical SDK wiring at the
-//   already-planned sites quickly and cheaply.
+// Opus 5 runs every default engine role so all phases can use Anthropic fast
+// mode. Keep separate model/planner overrides for controlled experiments.
 // Override the editor with WHISPERR_WIZARD_MODEL or --model. Override the
 // planner with WHISPERR_WIZARD_PLANNER_MODEL.
-const DEFAULT_MODEL = "claude-sonnet-5";
+const DEFAULT_MODEL = "claude-opus-5";
 const DEFAULT_PLANNER_MODEL = "claude-opus-5";
 // Reasoning effort (pairs with adaptive thinking). "high" — placement is a
 // reasoning task (which moment, which branch, which properties), so we give it

@@ -153,9 +153,12 @@ export class IntegrationMCPClient {
   async forward(message: Json): Promise<Json | undefined> {
     const encoded = JSON.stringify(message);
     if (Buffer.byteLength(encoded) > MAX_MESSAGE || message.jsonrpc !== "2.0" || Array.isArray(message) || typeof message.method !== "string") throw new Error("Invalid MCP message.");
+    // Interactive login has its own deadline; do not spend the HTTP budget
+    // while the customer is reading and approving browser consent.
+    const token = await this.token();
     const response = await this.request(this.base + "/mcp", {
       method: "POST", redirect: "error", signal: AbortSignal.timeout(35_000),
-      headers: { Authorization: "Bearer " + await this.token(), "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": this.protocolVersion }, body: encoded,
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json, text/event-stream", "MCP-Protocol-Version": this.protocolVersion }, body: encoded,
     });
     if (!response.ok) throw new Error(`MCP request rejected (${response.status}); reconnect or repair permissions. No automatic mutation retry was attempted.`);
     if (response.status === 202) return undefined;

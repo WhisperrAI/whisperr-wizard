@@ -1,0 +1,6 @@
+{
+  "target": "nextjs",
+  "expectedEvents": [{ "code": "checkout_completed", "anchorFile": "src/checkout.ts" }],
+  "forbiddenFiles": ["src/admin.ts"],
+  "maxEvents": 3
+}

@@ -6,10 +6,17 @@ export type ToolPolicyDecision =
 
 export interface ToolPolicyContext {
   repoPath: string;
+  /**
+   * Exact tool names the current invocation may call beyond the repository
+   * allowlist (e.g. `mcp__engine__propose_event`). Prefix matching is never used.
+   */
+  trustedTools?: ReadonlySet<string>;
+  /** Exact repository-relative paths available to a constrained invocation. */
+  allowedFiles?: ReadonlySet<string>;
 }
 
 export const SECRET_MATERIAL_DENIAL =
-  "blocked: secret material - reference the variable name in .env.example instead of reading the real file";
+  "blocked: secret material must not be accessed";
 
 const WRITE_OUTSIDE_REPO_DENIAL =
   "blocked: writes must stay inside the target repository";
@@ -23,9 +30,35 @@ const BASH_ALLOWLIST_DENIAL =
 const CHAINED_COMMAND_DENIAL =
   "blocked: chained or substituted shell command - run one command at a time";
 
-const ENV_EXAMPLES = new Set([".env.example", ".env.sample", ".env.template"]);
-const SECRET_DIRECTORIES = new Set([".aws", ".ssh", ".gnupg"]);
-const SECRET_EXACT_FILES = new Set([".netrc", ".npmrc", ".pypirc"]);
+/** Claude Agent SDK name for an in-process engine MCP tool. */
+export function engineMcpToolName(toolName: string): string {
+  return `mcp__engine__${toolName}`;
+}
+
+/** Exact trusted MCP tool names for the engine tools on this invocation. */
+export function trustedEngineMcpTools(
+  tools: ReadonlyArray<{ name: string }>,
+): ReadonlySet<string> {
+  return new Set(tools.map((tool) => engineMcpToolName(tool.name)));
+}
+const SECRET_DIRECTORIES = new Set([
+  ".aws",
+  ".ssh",
+  ".gnupg",
+  ".azure",
+  ".docker",
+  ".kube",
+  ".secrets",
+  "secrets",
+]);
+const SECRET_EXACT_FILES = new Set([
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  "auth.json",
+  "google-services.json",
+  "googleservice-info.plist",
+]);
 const SENSITIVE_WRITE_DIRECTORIES = new Set([".git", ".circleci", ".buildkite"]);
 const SENSITIVE_WRITE_EXACT_FILES = new Set([
   ".gitlab-ci.yml",
@@ -41,6 +74,7 @@ const SECRET_SUFFIXES = [
   ".pfx",
   ".jks",
   ".keystore",
+  ".kdbx",
   ".tfvars",
 ];
 
@@ -53,6 +87,10 @@ export function evaluateToolUse(
   input: Record<string, unknown>,
   context: ToolPolicyContext,
 ): ToolPolicyDecision {
+  if (context.trustedTools?.has(toolName)) {
+    return { behavior: "allow" };
+  }
+
   switch (toolName) {
     case "Read":
       return evaluateReadLike(readPathInputs(input), readPathInputs(input), context);
@@ -78,9 +116,9 @@ export function isSecretPathLike(value: string): boolean {
   for (const rawPart of parts) {
     const part = stripOuterQuotes(rawPart.trim().toLowerCase());
     if (!part || part === "." || part === "**") continue;
-    if (ENV_EXAMPLES.has(part)) continue;
     if (SECRET_DIRECTORIES.has(part)) return true;
     if (SECRET_EXACT_FILES.has(part)) return true;
+    if (part === ".env.example" || part === ".env.sample") continue;
     if (
       part === ".env" ||
       part === ".envrc" ||
@@ -98,6 +136,7 @@ export function isSecretPathLike(value: string): boolean {
     }
     if (part.includes("credentials")) return true;
     if (part.startsWith("secrets.")) return true;
+    if (part.startsWith("service-account") && part.endsWith(".json")) return true;
     if (SECRET_SUFFIXES.some((suffix) => part.endsWith(suffix))) return true;
   }
   return false;
@@ -131,6 +170,12 @@ function evaluateReadLike(
         message: "blocked: reads must stay inside the target repository",
       };
     }
+    if (context.allowedFiles && !allowedPath(value, context)) {
+      return {
+        behavior: "deny",
+        message: "blocked: this task may only access its explicitly supplied repository files",
+      };
+    }
   }
 
   return { behavior: "allow" };
@@ -147,10 +192,25 @@ function evaluateWrite(
   if (!isPathInsideRepo(pathValue, context.repoPath)) {
     return { behavior: "deny", message: WRITE_OUTSIDE_REPO_DENIAL };
   }
+  if (isSecretPathLike(pathValue)) {
+    return { behavior: "deny", message: SECRET_MATERIAL_DENIAL };
+  }
   if (isSensitiveWritePath(pathValue, context.repoPath)) {
     return { behavior: "deny", message: SENSITIVE_WRITE_DENIAL };
   }
+  if (context.allowedFiles && !allowedPath(pathValue, context)) {
+    return {
+      behavior: "deny",
+      message: "blocked: this task may only edit its explicitly supplied repository files",
+    };
+  }
   return { behavior: "allow" };
+}
+
+function allowedPath(pathValue: string, context: ToolPolicyContext): boolean {
+  if (!context.allowedFiles) return true;
+  const relativePath = repoRelativePath(pathValue, context.repoPath);
+  return context.allowedFiles.has(relativePath);
 }
 
 function evaluateBash(input: Record<string, unknown>): ToolPolicyDecision {

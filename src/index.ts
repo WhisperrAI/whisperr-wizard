@@ -40,6 +40,8 @@ export function parseArgs(argv: string[]): RunOptions | { help: true } | { versi
         opts.force = true;
         break;
       case "--review-plan":
+        // Deprecated compatibility no-op: event batches are frozen and
+        // registered automatically.
         opts.reviewPlan = true;
         break;
       case "--propose-only":
@@ -77,7 +79,6 @@ function printHelp(): void {
       `  ${theme.bright("Options")}`,
       "    --offline         Use a demo manifest, no account/browser needed",
       "    --force           Proceed without a clean git tree (no safe undo)",
-      "    --review-plan     Confirm the placement plan before anything is wired",
       "    --propose-only    Send new events/interventions for dashboard approval",
       "                      instead of adding them to your universe now",
       "    --strict-review   Review the finished diff with the deeper planner model",

@@ -104,16 +104,17 @@ Anthropic key**:
   and run `--offline` to exercise the whole flow against a real model + a mock
   manifest, with no backend.
 
-Two tiers, because planning and typing want different models:
+The default preset routes by task:
 
-- **Planner** — `claude-opus-5` at high effort. Runs the single read-only pass
-  that maps the repo, places every event, and spots what the plan is missing.
-  Override with `WHISPERR_WIZARD_PLANNER_MODEL`.
-- **Editor** — `claude-sonnet-5`. Performs the mechanical edits at the sites the
-  planner already chose. Override with `WHISPERR_WIZARD_MODEL` or `--model`.
+- **Terra medium + priority** — repository survey and first-pass cluster edits
+  (four concurrent file-isolated clusters, at most four events each).
+- **Opus 5 medium + fast mode** — event design, SDK setup, review, final repair,
+  and any clean retry after a Terra failure (at most two concurrent tasks).
 
-The self-review pass runs on the editor model against `git diff` only;
-`--strict-review` promotes it to the planner model at full depth.
+Cluster patches merge serially and progress is checkpointed per event. The
+wizard runs structural checks inside each cluster worktree, one full verifier
+after merging, and an Opus repair pass only when that final verifier fails.
+`WHISPERR_WIZARD_PRESET=claude-default` retains the Opus-only rollback path.
 
 ## Contributing / local dev
 

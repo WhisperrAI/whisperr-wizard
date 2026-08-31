@@ -1,6 +1,109 @@
 # Changelog
 
-## Unreleased
+## 0.10.3
+
+- Preflight the authenticated model gateways before starting repository work,
+  with clear provider-availability failures instead of late raw routing errors.
+- Persist and register a completed event design independently while SDK setup
+  runs in parallel, retaining that progress when setup fails and recording the
+  failure under the binding phase.
+- Reserve “frozen” wording for the successful atomic server commit.
+
+## 0.10.2
+
+- Preserve the actual provider, validation, review, repair, verification, and
+  run-persistence failure details instead of replacing them with generic phase
+  errors.
+- Reject terminal OpenAI response envelopes returned with HTTP 200, report the
+  exact failed verification command, and surface nonfatal checkpoint and
+  reporting failures in the CLI.
+
+## 0.10.1
+
+- Persist the Opus survey conversation through the run's keyed `survey`
+  session and resume event design in that same conversation.
+- Stop writing new pipeline sessions into the legacy conversation field and
+  report survey/design persistence failures under their actual phase.
+
+## 0.10.0
+
+- Give each phase one fixed model owner: a single Opus 5 low/fast conversation
+  surveys and designs, Sol medium/priority owns SDK setup, Terra
+  medium/priority owns all event insertion, and a separate Sol
+  medium/priority conversation owns semantic and verification repair.
+- Run SDK setup beside event design after the saved survey, remove wizard
+  turn/time/output/spend quotas and model fallbacks, retry transient failures
+  with the same owner, and compact or roll context without switching models.
+- Serialize complete per-file event work through one Terra conversation, retain
+  deterministic validation and final verification, and support non-Git
+  repositories through isolated temporary snapshots.
+- Persist a lightweight placement manifest and send task/session metadata on
+  every model call so the runtime can retain encrypted prompts, exposed
+  reasoning, responses, and terminal outcomes.
+
+## 0.8.0
+
+- Make the hybrid router the default: Terra medium with priority processing
+  surveys and file-isolated event clusters, while Opus 5 medium with fast mode
+  designs events, initializes the SDK, reviews changes, and repairs failures.
+- Run four independent Terra clusters concurrently with same-file
+  serialization, serial patch merging, per-event server checkpoints, and
+  automatic clean rollback plus Opus escalation for incomplete or invalid
+  Terra work.
+- Batch event design for large universes, replace per-cluster full builds with
+  structural checks, and run one final verification followed by targeted Opus
+  repair.
+- Preserve exact resumable progress across task limits and interruptions,
+  improve nested gateway error reporting, and retain `claude-default` as the
+  emergency Opus-only preset.
+
+## 0.7.3
+
+- Run every default Wizard engine role on Claude Opus 5 with Anthropic fast
+  mode enabled.
+- Expand surveying and event selection to cover the complete observable
+  end-user lifecycle across every meaningful product area.
+- Apply the shared secret-material policy to OpenAI file tools and block reads
+  or writes of environment, credential, and service-account files.
+
+## 0.7.2
+
+- Allow only the exact engine MCP tools for the current invocation through the
+  tool-policy hooks and permission callback (no `mcp__engine__*` prefix allow).
+- Require a successful `finish_selection` before design can proceed; stream
+  completion alone is no longer treated as a finished selection.
+- Fail clearly during design when selection never finishes or no events are
+  accepted, and never POST `/wizard/runs/:id/complete` with an empty design.
+
+## 0.7.1
+
+- Accept both nested and legacy flattened wizard-run snapshots, with clear
+  validation errors for malformed runtime responses.
+- Fall back to a secure temporary run-state directory when the configured or
+  home directory cannot be created.
+- Mark runs failed when survey, design, state persistence, or completion fails,
+  instead of leaving the dashboard indefinitely stuck on an active phase.
+
+## 0.7.0
+
+- **Engine v2 for wizard-mode apps.** Whisperr apps onboarded in wizard mode get
+  the new flow: a read-only survey, event selection you review in the terminal
+  before anything is registered, typed event bindings with a queue-until-ready
+  adapter, and worktree-isolated instrumentation applied atomically at the end.
+- **Cluster-bounded integration.** Events are wired in small file clusters with
+  fresh model context, per-cluster verification and review, and honest statuses;
+  a context overflow fails one cluster as resumable instead of killing the run.
+- **Resumable by design.** Interrupt at any point and rerun: registered events,
+  cluster progress, and provider sessions are reconciled from the server and a
+  local state file — nothing is redone, nothing duplicates.
+- **Provider presets.** `WHISPERR_WIZARD_PRESET=sol-design` routes survey,
+  selection, and review through gpt-5.6-sol via the server-side OpenAI gateway;
+  edits stay on Claude. Default remains all-Claude.
+- **Automatic fallback.** Generated-mode apps get the unchanged 0.6 flow — the
+  server decides per app, the command stays `npx @whisperr/wizard`.
+- Mock eval harness under `evals/` (`npm run eval:mock`) gates engine changes.
+
+## 0.6.0
 
 - **One run, no interruptions.** The placement plan is printed and the run keeps
   going instead of stopping to ask. `--review-plan` restores the confirmation

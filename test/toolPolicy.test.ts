@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { evaluateToolUse } from "../src/core/toolPolicy.js";
+import { evaluateToolUse, engineMcpToolName, trustedEngineMcpTools } from "../src/core/toolPolicy.js";
 
 const repoPath = resolve(tmpdir(), "whisperr-policy-repo");
 
@@ -14,8 +14,18 @@ test(".env is denied", () => {
   assert.equal(policy("Read", { file_path: ".env" }).behavior, "deny");
 });
 
-test(".env.example is allowed", () => {
-  assert.equal(policy("Read", { file_path: ".env.example" }).behavior, "allow");
+test("real .env variants remain denied", () => {
+  for (const file_path of [".env", ".env.local", ".env.template"]) {
+    assert.equal(policy("Read", { file_path }).behavior, "deny");
+    assert.equal(policy("Edit", { file_path }).behavior, "deny");
+  }
+});
+
+test("non-secret env templates are allowed", () => {
+  for (const file_path of [".env.example", ".env.sample"]) {
+    assert.equal(policy("Read", { file_path }).behavior, "allow");
+    assert.equal(policy("Edit", { file_path }).behavior, "allow");
+  }
 });
 
 test("nested config/.env.production is denied", () => {
@@ -135,4 +145,58 @@ test("out-of-repo process environ reads are denied", () => {
 test("out-of-repo process environ search roots are denied", () => {
   assert.equal(policy("Grep", { path: "/proc/self/environ", pattern: "ANTHROPIC" }).behavior, "deny");
   assert.equal(policy("Glob", { path: "/proc/123/environ", pattern: "*" }).behavior, "deny");
+});
+
+test("exact trusted engine MCP tools are allowed", () => {
+  const trustedTools = trustedEngineMcpTools([
+    { name: "propose_event" },
+    { name: "finish_selection" },
+  ]);
+  assert.deepEqual(
+    evaluateToolUse("mcp__engine__propose_event", { code: "signup_completed" }, {
+      repoPath,
+      trustedTools,
+    }),
+    { behavior: "allow" },
+  );
+  assert.deepEqual(
+    evaluateToolUse("mcp__engine__finish_selection", { summary: "done" }, {
+      repoPath,
+      trustedTools,
+    }),
+    { behavior: "allow" },
+  );
+});
+
+test("unknown MCP tools remain denied even with a trusted allowlist", () => {
+  const trustedTools = trustedEngineMcpTools([
+    { name: "propose_event" },
+    { name: "finish_selection" },
+  ]);
+  assert.deepEqual(
+    evaluateToolUse("mcp__engine__delete_project", {}, { repoPath, trustedTools }),
+    {
+      behavior: "deny",
+      message: "blocked: tool mcp__engine__delete_project is not allowed by the wizard tool policy",
+    },
+  );
+  assert.deepEqual(
+    evaluateToolUse("mcp__engine__propose_event_extra", {}, { repoPath, trustedTools }),
+    {
+      behavior: "deny",
+      message:
+        "blocked: tool mcp__engine__propose_event_extra is not allowed by the wizard tool policy",
+    },
+  );
+  assert.deepEqual(evaluateToolUse("mcp__engine__propose_event", {}, { repoPath }), {
+    behavior: "deny",
+    message: "blocked: tool mcp__engine__propose_event is not allowed by the wizard tool policy",
+  });
+});
+
+test("trustedEngineMcpTools builds exact names without prefix wildcards", () => {
+  const trusted = trustedEngineMcpTools([{ name: "propose_event" }]);
+  assert.equal(trusted.has("mcp__engine__propose_event"), true);
+  assert.equal(trusted.has("mcp__engine__"), false);
+  assert.equal(engineMcpToolName("finish_selection"), "mcp__engine__finish_selection");
 });

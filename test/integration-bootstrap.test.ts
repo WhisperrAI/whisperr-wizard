@@ -1,62 +1,71 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { bootstrapIntegration, finishIntegration, opportunityDefinition, type IntegrationBootstrap } from "../src/core/integration-bootstrap.js";
-import { sanitizeOpportunities } from "../src/core/opportunities.js";
+import { preflightIntegration } from "../src/core/integration-bootstrap.js";
+import { primitivePayload, SharedEngineRegistration } from "../src/engine/shared-registration.js";
+import type { RunBootstrap } from "../src/engine/runs.js";
 import type { WizardConfig, WizardSession } from "../src/types.js";
-import type { IntegrationWorkflowClient } from "../src/core/integration-workflow.js";
 
-const config = { apiBaseUrl: "https://api.whisperr.net" } as WizardConfig;
-const session: WizardSession = { token: "synthetic-device-session", appId: "app_one", expiresAt: Date.now() / 1000 + 60 };
-const event = { code: "checkout_started", name: "Checkout", reasoning: "Committed checkout", payload_schema: { total: "number" } };
-
-test("opt-in bootstrap binds exact repo run with existing device session and no legacy manifest fallback", async () => {
-  let calls = 0;
-  const nested = { ...event, payload_schema: { type: "object", properties: { order: { type: "object", properties: { total: { type: "number" } }, additionalProperties: false } }, additionalProperties: false } };
-  const request: typeof fetch = async (url, init) => {
-    calls++;
-    assert.equal(new Headers(init?.headers).get("Authorization"), "Bearer synthetic-device-session");
-    if (calls === 2) {
-      assert.equal(String(url), "https://api.whisperr.net/wizard/runs/run_one/integration/status?contract_version=2.0.0");
-      return Response.json({ contract_version: "2.0.0", required_events: [nested] });
-    }
-    assert.equal(String(url), "https://api.whisperr.net/wizard/runs");
-    const body = JSON.parse(String(init?.body)); assert.deepEqual(body, { repoFingerprint: "opaque-fingerprint", displayName: "customer-app", target: "nextjs", kind: "fullstack" });
-    return Response.json({ universeMode: "wizard", run: { id: "run_one" }, project: { id: "project_one" }, app: { name: "App" },
-      ingestion: { apiKey: "synthetic-runtime-installation-key", baseUrl: "https://api.whisperr.net" },
-      snapshot: { events: [{ code: event.code, name: event.name, reasoning: event.reasoning, payloadSchema: event.payload_schema }] },
-    });
-  };
-  const setup = await bootstrapIntegration(config, session, "/local/customer-app", "opaque-fingerprint", "nextjs", request);
-  assert.equal(calls, 2); assert.equal(setup.runID, "run_one"); assert.equal(setup.manifest.events[0]?.eventType, event.code);
-  assert.deepEqual(setup.definitions.get(event.code)?.payload_schema, nested.payload_schema);
-  assert.match(setup.manifest.events[0]?.properties?.[0]?.description ?? "", /additionalProperties/);
-  assert.deepEqual(setup.manifest.identify.channels, []);
-  await assert.rejects(bootstrapIntegration(config, session, "/local/customer-app", "fp", "nextjs", async () => new Response(null, { status: 403 })), /no legacy manifest fallback/);
+test("local preflight refuses non-git, unborn, staged, untracked and dirty repositories", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "shared-preflight-"));
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "pipe" });
+  await assert.rejects(preflightIntegration(repo), /Not a git repository/);
+  await preflightIntegration(repo, true);
+  git("init", "-q");
+  await assert.rejects(preflightIntegration(repo, true), /no commit/);
+  git("-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "--allow-empty", "-m", "baseline");
+  await preflightIntegration(repo);
+  writeFileSync(join(repo, "app.ts"), "original");
+  await assert.rejects(preflightIntegration(repo), /uncommitted changes/);
+  git("add", "app.ts");
+  await assert.rejects(preflightIntegration(repo), /uncommitted changes/);
+  git("-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "-m", "app");
+  writeFileSync(join(repo, "app.ts"), "user work");
+  await assert.rejects(preflightIntegration(repo), /uncommitted changes/);
+  await preflightIntegration(repo, true);
 });
 
-test("typed opportunities survive sanitization; descriptions are never guessed into schema types", () => {
-  const clean = sanitizeOpportunities({ events: [{ code: event.code, properties: [{ name: "total", type: "number", description: "Order total" }] }] }, { events: [], identify: {} } as any);
-  assert.deepEqual(opportunityDefinition(clean.events[0]!).payload_schema, { total: "number" });
-  assert.throws(() => opportunityDefinition({ code: "unknown", properties: [{ name: "value", description: "Some value" }] }), /explicit primitive type/);
+test("engine consumes authoritative primitive schemas and never guesses prose or discards nested constraints", () => {
+  assert.deepEqual(primitivePayload({ count: "integer", total: "number", paid: "boolean", result: "null" }), { count: "integer", total: "number", paid: "boolean", result: "null" });
+  assert.deepEqual(primitivePayload({ type: "object", properties: { total: { type: "number" } }, additionalProperties: false }), { total: "number" });
+  assert.throws(() => primitivePayload({ value: "Order total" }), /not supported/);
+  assert.throws(() => primitivePayload({ value: { type: "string", enum: ["approved"] } }), /not supported/);
+  assert.throws(() => primitivePayload({ value: { type: "object", properties: {} } }), /not supported/);
 });
 
-test("local finalization records real code evidence and never claims deployment", async () => {
+test("shared resume replaces flattened snapshot types and retains the exact structured schema during placement recovery", async () => {
+  const approved = { code: "checkout_started", name: "Approved checkout", reasoning: "Approved reasoning", payload_schema: { type: "object", properties: { count: { type: "integer" }, plan: { type: "string" } }, required: ["plan"], additionalProperties: false } };
   const calls: string[] = [];
-  const client = {
-    async registerEvents() { calls.push("register"); return { revision: { revision_id: "rev_one" } }; },
-    async attachPlacement(revision: string, code: string, file: string) { calls.push("placement"); assert.equal(revision, "rev_one"); assert.equal(code, event.code); assert.equal(file, "src/checkout.ts"); return "event_stable"; },
-    async reportDeployment() { throw new Error("Local code is not deployed"); },
-  } as unknown as IntegrationWorkflowClient;
-  const setup = { client, runID: "run_one", definitions: new Map([[event.code, event]]) } as IntegrationBootstrap;
-  const request: typeof fetch = async (url, init) => {
-    if (String(url).endsWith("/complete")) {
-      const body = JSON.parse(String(init?.body)); calls.push("complete");
-      assert.equal(body.outcome, "completed"); assert.equal(body.verificationStatus, "passed");
-      assert.deepEqual(body.events, [{ eventId: "event_stable", eventCode: event.code, status: "build_verified", file: "src/checkout.ts" }]);
-      return Response.json({});
+  const request: typeof fetch = async (raw, init) => {
+    const path = new URL(String(raw)).pathname;
+    calls.push(path);
+    if (path.endsWith("/status")) return Response.json({ contract_version: "2.0.0", required_events: [approved] });
+    if (path.endsWith("/source")) return Response.json({ contract_version: "2.0.0", connection_id: "con_1" });
+    if (path.endsWith("/drafts")) {
+      assert.deepEqual(JSON.parse(String(init?.body)).events, [approved]);
+      return Response.json({ contract_version: "2.0.0", revision: { revision_id: "rev_existing", state: "committed", events: [approved] }, content_hash: "hash", gaps: [], current_event_codes: [approved.code] });
     }
-    return Response.json({ project: { id: "project_one" }, snapshot: { events: [{ id: "event_stable", code: event.code, projectId: "project_one" }] } });
+    assert.match(path, /\/rev_existing\/placement$/);
+    assert.equal(JSON.parse(String(init?.body)).event_code, approved.code);
+    return Response.json({ id: "event_canonical" });
   };
-  await finishIntegration(config, session, setup, [{ event_type: event.code, status: "wired", file: "src/checkout.ts" }], ["src/checkout.ts"], true, true, "completed", new Map(), request);
-  assert.deepEqual(calls, ["register", "placement", "complete"]);
+  const client = new SharedEngineRegistration({ apiBaseUrl: "https://api.whisperr.net" } as WizardConfig, { token: "token" } as WizardSession, "run_1", request);
+  const snapshot = { project: { id: "project_1" }, snapshot: { events: [{ id: "event_canonical", projectId: "project_1", code: approved.code, name: "stale name", reasoning: "stale reason", payloadSchema: { count: "flattened description" }, anchorFile: "checkout.ts" }] } } as RunBootstrap;
+  await client.restoreSnapshot(snapshot);
+  const saved = snapshot.snapshot.events[0]!;
+  assert.deepEqual(saved.payloadSchema, { count: "integer", plan: "string" });
+  assert.equal(saved.name, approved.name);
+  const placed = await client.registerAndPlace([{ code: saved.code, name: "model suggestion", reasoning: "model suggestion", anchorFile: "checkout.ts", payloadSchema: { plan: "string", count: "integer" } }]);
+  assert.equal(placed[0]?.eventId, "event_canonical");
+  assert.equal(placed[0]?.name, approved.name);
+  assert.doesNotMatch(calls.join("\n"), /\/tests|\/commit|\/items|\/deployment/);
+  await assert.rejects(client.registerAndPlace([{ ...placed[0]!, payloadSchema: { count: "string", plan: "string" } }]), /cannot redefine/);
+});
+
+test("shared resume refuses removed current definitions without reviving them from a legacy snapshot", async () => {
+  const client = new SharedEngineRegistration({ apiBaseUrl: "https://api.whisperr.net" } as WizardConfig, { token: "token" } as WizardSession, "run_1", async () => Response.json({ contract_version: "2.0.0", required_events: [] }));
+  await assert.rejects(client.restoreSnapshot({ project: { id: "project" }, snapshot: { events: [{ projectId: "project", code: "deleted_event", payloadSchema: {} }] } } as RunBootstrap), /no current approved registry definition/);
 });
