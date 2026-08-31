@@ -72,6 +72,7 @@ function printHelp(): void {
       "",
       `  ${theme.bright("Usage")}`,
       "    npx @whisperr/wizard [init] [path] [options]",
+      "    npx @whisperr/wizard mcp [--api <Whisperr origin>]",
       "",
       `  ${theme.bright("Options")}`,
       "    --offline         Use a demo manifest, no account/browser needed",
@@ -93,6 +94,16 @@ function printHelp(): void {
 }
 
 export async function main(): Promise<void> {
+  if (process.argv[2] === "mcp") {
+    try {
+      const { runMCPBridge } = await import("./core/mcp.js");
+      await runMCPBridge(process.argv.slice(3));
+    } catch {
+      process.stderr.write("Whisperr MCP stopped. Check browser authorization and the configured Whisperr server.\n");
+      process.exitCode = 1;
+    }
+    return;
+  }
   const parsed = parseArgs(process.argv.slice(2));
 
   if ("help" in parsed) {

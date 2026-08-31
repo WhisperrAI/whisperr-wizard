@@ -38,6 +38,7 @@ import { packageVersion } from "./core/version.js";
 import { buildGapReport, renderGapReport } from "./core/gapreport.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
+import { fetchIntegrationPlaybook } from "./core/integration-playbook.js";
 import type {
   Detection,
   IntegrationManifest,
@@ -117,6 +118,12 @@ export async function run(options: RunOptions): Promise<number> {
   // where the run sits on an interactive prompt with no traffic. Unref'd, so
   // it never outlives the process.
   startSessionKeepalive(config, session);
+
+  // Additive compatibility gate while run-bound registration is migrated.
+  // Existing offline/device flows stay available when this flag is disabled.
+  if (!config.offline && process.env.WHISPERR_SHARED_PLAYBOOK_ENABLED === "1") {
+    await fetchIntegrationPlaybook(config.apiBaseUrl, session.token);
+  }
 
   // 3. Pull the integration manifest (events/interventions/key), telling the
   //    backend which surface this is so it can mark what's already covered.
