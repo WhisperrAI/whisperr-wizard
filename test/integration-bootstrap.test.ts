@@ -42,7 +42,7 @@ test("shared resume replaces flattened snapshot types and retains the exact stru
   const request: typeof fetch = async (raw, init) => {
     const path = new URL(String(raw)).pathname;
     calls.push(path);
-    if (path.endsWith("/status")) return Response.json({ contract_version: "2.0.0", required_events: [approved] });
+    if (path.endsWith("/status")) return Response.json({ contract_version: "2.0.0", required_events: [approved], registrations: [] });
     if (path.endsWith("/source")) return Response.json({ contract_version: "2.0.0", connection_id: "con_1" });
     if (path.endsWith("/drafts")) {
       assert.deepEqual(JSON.parse(String(init?.body)).events, [approved]);
@@ -66,6 +66,15 @@ test("shared resume replaces flattened snapshot types and retains the exact stru
 });
 
 test("shared resume refuses removed current definitions without reviving them from a legacy snapshot", async () => {
-  const client = new SharedEngineRegistration({ apiBaseUrl: "https://api.whisperr.net" } as WizardConfig, { token: "token" } as WizardSession, "run_1", async () => Response.json({ contract_version: "2.0.0", required_events: [] }));
+  const client = new SharedEngineRegistration({ apiBaseUrl: "https://api.whisperr.net" } as WizardConfig, { token: "token" } as WizardSession, "run_1", async () => Response.json({ contract_version: "2.0.0", required_events: [], registrations: [] }));
   await assert.rejects(client.restoreSnapshot({ project: { id: "project" }, snapshot: { events: [{ projectId: "project", code: "deleted_event", payloadSchema: {} }] } } as RunBootstrap), /no current approved registry definition/);
+});
+
+test("historical committed registrations without declared run scope fail closed instead of claiming all app events", async () => {
+  const definition = { code: "existing_event", name: "Existing", payload_schema: {} };
+  for (const scope of [undefined, null, []]) {
+    const registration = { contract_version: "2.0.0", revision: { revision_id: "rev_old", state: "committed", events: [definition] }, content_hash: "hash", gaps: [], current_event_codes: [definition.code], requested_event_codes: scope };
+    const client = new SharedEngineRegistration({ apiBaseUrl: "https://api.whisperr.net" } as WizardConfig, { token: "token" } as WizardSession, "run_1", async () => Response.json({ contract_version: "2.0.0", required_events: [definition], registrations: [registration] }));
+    await assert.rejects(client.restoreSnapshot({ project: { id: "project" }, snapshot: { events: [{ id: "canonical", projectId: "project", code: definition.code, payloadSchema: {}, anchorFile: "existing.ts" }] } } as RunBootstrap), /no explicit run-owned event scope/);
+  }
 });

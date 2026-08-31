@@ -25,6 +25,7 @@ export function primitivePayload(schema: Record<string, unknown>): Record<string
 export class SharedEngineRegistration {
   private readonly client: IntegrationWorkflowClient;
   private readonly definitions = new Map<string, SharedEventDefinition>();
+  private readonly ownedRevisions = new Map<string, string>();
   constructor(config: WizardConfig, session: WizardSession, runId: string, request: typeof fetch = fetch) {
     this.client = new IntegrationWorkflowClient(config.apiBaseUrl, session.token, runId, request);
   }
@@ -32,6 +33,35 @@ export class SharedEngineRegistration {
   async restoreSnapshot(bootstrap: RunBootstrap): Promise<void> {
     const current = await this.client.status();
     for (const event of current.required_events) this.definitions.set(event.code, event);
+    // Commit expands revision.events into an app-wide snapshot. Only the
+    // separately persisted request scope identifies this run's intended work.
+    // Older records without that scope are ambiguous, not evidence of success.
+    if (current.registrations.length >= 50) throw new Error("Run registration history may be incomplete; resolve its full scope before resuming.");
+    for (const registration of current.registrations) {
+      if (!["committed", "superseded"].includes(registration.revision.state)) continue;
+      const codes = registration.requested_event_codes;
+      if (!Array.isArray(codes) || !codes.length || codes.some((code) => typeof code !== "string" || !code)) {
+        throw new Error("Saved registration has no explicit run-owned event scope; resolve this historical run before resuming.");
+      }
+      for (const code of codes) {
+        // The server returns revisions newest first. A newer approved revision
+        // can replace this run's older definition without losing its scope.
+        if (this.ownedRevisions.has(code)) continue;
+        const definition = this.definitions.get(code);
+        if (!definition || !registration.current_event_codes?.includes(code) ||
+          !registration.revision.events.some((event) => event.code === code)) {
+          throw new Error(`Run-owned event ${code} is no longer currently approved; resolve registration before resuming.`);
+        }
+        this.ownedRevisions.set(code, registration.revision.revision_id);
+        const placedHere = bootstrap.snapshot.events.find((event) => event.code === code && event.projectId === bootstrap.project.id);
+        if (placedHere) continue;
+        const canonical = bootstrap.snapshot.events.find((event) => event.code === code);
+        if (!canonical) throw new Error(`Run-owned event ${code} is missing from the canonical snapshot; reload before resuming.`);
+        // This is a local recovery worklist, not a fabricated server binding.
+        // Preserve the real canonical ID, but never borrow another repo's anchor.
+        bootstrap.snapshot.events.push({ ...canonical, projectId: bootstrap.project.id, anchorFile: undefined, anchorSymbol: undefined });
+      }
+    }
     for (const event of bootstrap.snapshot.events) {
       if (event.projectId !== bootstrap.project.id) continue;
       const definition = this.definitions.get(event.code);
@@ -54,10 +84,17 @@ export class SharedEngineRegistration {
       // flattening is solely for the local primitive wrapper signature.
       return existing ?? { code: event.code, name: event.name, reasoning: event.reasoning, payload_schema: payload };
     });
-    const committed = await this.client.registerEvents(definitions);
+    const newDefinitions = definitions.filter((definition) => !this.ownedRevisions.has(definition.code));
+    if (newDefinitions.length) {
+      const committed = await this.client.registerEvents(newDefinitions);
+      for (const definition of newDefinitions) {
+        this.ownedRevisions.set(definition.code, committed.revision.revision_id);
+        this.definitions.set(definition.code, definition);
+      }
+    }
     const registered: RegisteredEvent[] = [];
     for (const event of events) {
-      const eventId = await this.client.attachPlacement(committed.revision.revision_id, event.code, event.anchorFile, event.anchorSymbol);
+      const eventId = await this.client.attachPlacement(this.ownedRevisions.get(event.code)!, event.code, event.anchorFile, event.anchorSymbol);
       const definition = definitions.find((candidate) => candidate.code === event.code)!;
       registered.push({ ...event, eventId, name: definition.name, reasoning: definition.reasoning ?? "", payloadSchema: primitivePayload(definition.payload_schema) });
     }

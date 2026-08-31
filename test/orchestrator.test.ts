@@ -69,6 +69,7 @@ interface MockState {
   failSharedStatus?: boolean;
   failSharedCommit?: boolean;
   failSharedPlacement?: boolean;
+  failSharedPlacementCode?: string;
   invalidBootstrap?: boolean;
   wrongMode?: boolean;
 }
@@ -78,7 +79,8 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
   state.calls ??= [];
   let registrationState = "draft";
   let isolatedReceived = false;
-  const revision = () => ({ contract_version: "2.0.0", revision: { revision_id: "rev_shared", state: registrationState, events: state.sharedEvents ?? [] }, content_hash: "hash", current_event_codes: registrationState === "committed" ? state.sharedEvents!.map((event) => event.code) : [], gaps: isolatedReceived ? [] : state.sharedEvents!.map((event) => ({ event_code: event.code, reason: "isolated_test_event_not_received" })) });
+  let requestedCodes: string[] = [];
+  const revision = () => ({ contract_version: "2.0.0", revision: { revision_id: "rev_shared", state: registrationState, events: registrationState === "committed" ? state.sharedEvents ?? [] : state.sharedEvents!.filter((event) => requestedCodes.includes(event.code)) }, requested_event_codes: requestedCodes, content_hash: "hash", current_event_codes: registrationState === "committed" ? state.sharedEvents!.map((event) => event.code) : [], gaps: isolatedReceived ? [] : requestedCodes.map((code) => ({ event_code: code, reason: "isolated_test_event_not_received" })) });
   const server = createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => (body += String(chunk)));
@@ -97,10 +99,11 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
       if (url.startsWith("/wizard/runs/wrun_1/integration/")) {
         const bodyValue = body ? JSON.parse(body) : {};
         if (url.includes("/status?")) {
-          send(state.failSharedStatus ? { error: { code: "denied" } } : { contract_version: "2.0.0", required_events: state.sharedEvents ?? [] }, state.failSharedStatus ? 403 : 200);
+          send(state.failSharedStatus ? { error: { code: "denied" } } : { contract_version: "2.0.0", required_events: state.sharedEvents ?? [], registrations: requestedCodes.length ? [revision()] : [] }, state.failSharedStatus ? 403 : 200);
         } else if (url.endsWith("/source")) send({ contract_version: "2.0.0", connection_id: "con_shared" });
         else if (url.endsWith("/drafts")) {
-          state.sharedEvents = bodyValue.events;
+          requestedCodes = bodyValue.events.map((event: { code: string }) => event.code);
+          state.sharedEvents = [...state.sharedEvents?.filter((event) => !requestedCodes.includes(event.code)) ?? [], ...bodyValue.events];
           registrationState = "draft";
           send(revision());
         } else if (url.endsWith("/validation")) { registrationState = "validating"; send(revision()); }
@@ -111,14 +114,22 @@ function startMockRuntime(state: MockState): Promise<{ server: Server; port: num
         } else if (url.endsWith("/commit")) {
           assert.equal(isolatedReceived, true);
           if (state.failSharedCommit) send({ error: { code: "registration_conflict" } }, 409);
-          else { registrationState = "committed"; send(revision()); }
+          else {
+            registrationState = "committed";
+            for (const code of requestedCodes) {
+              if (state.snapshotEvents.some((event) => event.code === code)) continue;
+              const definition = state.sharedEvents!.find((event) => event.code === code)!;
+              state.snapshotEvents.push({ id: state.snapshotEvents.length ? `aev_shared_${state.snapshotEvents.length + 1}` : "aev_shared", code, name: definition.name, reasoning: definition.reasoning, payloadSchema: definition.payload_schema, projectId: "" });
+            }
+            send(revision());
+          }
         } else if (url.endsWith("/placement")) {
           assert.equal(registrationState, "committed");
-          if (state.failSharedPlacement) send({ error: { code: "placement_failed" } }, 409);
+          if (state.failSharedPlacement || bodyValue.event_code === state.failSharedPlacementCode) send({ error: { code: "placement_failed" } }, 409);
           else {
-            const definition = state.sharedEvents!.find((event) => event.code === bodyValue.event_code)!;
-            state.snapshotEvents.push({ id: "aev_shared", code: definition.code, name: definition.name, reasoning: definition.reasoning, payloadSchema: definition.payload_schema, projectId: "wproj_1", anchorFile: bodyValue.anchor_file, anchorSymbol: bodyValue.anchor_symbol });
-            send({ id: "aev_shared", placement_recorded: true, live_verified: false });
+            const canonical = state.snapshotEvents.find((event) => event.code === bodyValue.event_code)!;
+            Object.assign(canonical, { projectId: "wproj_1", anchorFile: bodyValue.anchor_file, anchorSymbol: bodyValue.anchor_symbol });
+            send({ id: canonical.id, placement_recorded: true, live_verified: false });
           }
         } else send(revision());
         return;
@@ -329,6 +340,7 @@ function scriptedProvider(options: {
   invoked?: string[];
   setupError?: string;
   strictTypes?: boolean;
+  twoEvents?: boolean;
 } = {}): EngineProvider {
   return {
     name: "scripted",
@@ -357,7 +369,7 @@ function scriptedProvider(options: {
               anchorFile: "signup.ts",
               anchorSymbol: "completeSignup",
               payloadSchema: { plan: options.strictTypes ? "string" : "Chosen plan" },
-            }],
+            }, ...options.twoEvents ? [{ code: "subscription_started", name: "Subscription started", reasoning: "Subscription committed", anchorFile: "signup.ts", anchorSymbol: "completeSignup", payloadSchema: { plan: "string" } }] : []],
           });
         }
         if (options.finishDesign !== false) {
@@ -409,6 +421,7 @@ function scriptedProvider(options: {
             "export async function completeSignup() {",
             "  await saveSignup();",
             '  WhisperrEvents.signupCompleted({ plan: "pro" });',
+            ...options.twoEvents ? ['  WhisperrEvents.subscriptionStarted({ plan: "pro" });'] : [],
             "}",
             "",
           ].join("\n"),
@@ -480,6 +493,43 @@ test("actual CLI engine route performs typed shared registration, placement, rev
     else process.env.WHISPERR_SHARED_PLAYBOOK_ENABLED = before;
     server.close();
   }
+});
+
+test("shared commit of two events cannot resume as successful after only one placement attaches", async () => {
+  const repo = initRepo();
+  const foreign = { code: "native_logged", name: "Other source", reasoning: "Unrelated source work", payload_schema: {} };
+  const state: MockState = { items: [], completions: [], patches: [],
+    sharedEvents: [foreign], snapshotEvents: [{ id: "native_event", code: foreign.code, name: foreign.name, reasoning: foreign.reasoning, payloadSchema: {}, projectId: "another_project", anchorFile: "foreign.ts" }],
+    failSharedPlacementCode: "subscription_started" };
+  const { server, port } = await startMockRuntime(state);
+  const input = () => ({ ...engineInput(repo, port, scriptedProvider({ strictTypes: true, twoEvents: true }), "partial-placement"), sharedRegistration: true });
+  try {
+    const first = await runEngine(input());
+    assert.equal(first.kind, "aborted");
+    assert.deepEqual(state.snapshotEvents.filter((event) => event.projectId === "wproj_1").map((event) => event.code), ["signup_completed"]);
+    assert.equal(state.snapshotEvents.find((event) => event.code === "subscription_started")?.projectId, "");
+    assert.equal(state.completions.length, 0);
+
+    // The server's owned revision now contains the unrelated app-wide event,
+    // but requested_event_codes contains exactly this run's two-event intent.
+    state.resumed = true;
+    const attemptsBefore = state.calls!.filter((call) => call.endsWith("/placement")).length;
+    const second = await runEngine(input());
+    assert.equal(second.kind, "aborted", "a durable failed placement must not disappear from the resumed worklist");
+    assert.equal(state.completions.length, 0, "no one-event completion after a two-event committed design");
+    assert.equal(state.calls!.filter((call) => call.endsWith("/placement")).length, attemptsBefore + 1, "resume retries only the missing placement");
+
+    state.failSharedPlacementCode = undefined;
+    const third = await runEngine(input());
+    assert.equal(third.kind, "completed", third.kind === "aborted" ? third.reason : third.kind === "partial" ? third.summary : "");
+    assert.equal(state.completions.length, 1);
+    const completed = state.completions[0]!.events as Array<{ eventCode: string; status: string }>;
+    assert.deepEqual(completed.map((event) => event.eventCode).sort(), ["signup_completed", "subscription_started"]);
+    assert.ok(completed.every((event) => event.status === "build_verified"));
+    assert.equal(state.snapshotEvents.find((event) => event.code === foreign.code)?.projectId, "another_project");
+    assert.equal(state.calls!.filter((call) => call.endsWith("/drafts")).length, 1, "recovery reuses the committed owned revision, without redefining or retesting");
+    assert.equal(state.items.length, 0);
+  } finally { server.close(); }
 });
 
 test("shared local preflight creates no remote run for non-git or dirty repositories", async () => {

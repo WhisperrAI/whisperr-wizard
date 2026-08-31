@@ -17,6 +17,8 @@ export interface SharedRevision {
   content_hash: string;
   gaps: Array<{ event_code: string; reason: string }>;
   current_event_codes: string[];
+  /** Exact run-owned request scope, not the additive app-wide revision snapshot. */
+  requested_event_codes?: string[] | null;
 }
 export class IntegrationWorkflowError extends Error {
   constructor(readonly status: number, readonly code: string) {
@@ -99,13 +101,15 @@ export class IntegrationWorkflowClient {
     }
     return value;
   }
-  async status(): Promise<{ contract_version: string; required_events: SharedEventDefinition[] }> {
-    const result = await this.call<{ contract_version: string; required_events: SharedEventDefinition[] }>("GET", "/status");
+  async status(): Promise<{ contract_version: string; required_events: SharedEventDefinition[]; registrations: SharedRevision[] }> {
+    const result = await this.call<{ contract_version: string; required_events: SharedEventDefinition[]; registrations: SharedRevision[]; run_id?: string }>("GET", "/status");
     if (result.contract_version !== SHARED_CONTRACT_VERSION || !Array.isArray(result.required_events) ||
+      !Array.isArray(result.registrations) || (result.run_id !== undefined && result.run_id !== this.runID) ||
       result.required_events.some((event) => !event || typeof event.code !== "string" || typeof event.name !== "string" ||
         !event.payload_schema || typeof event.payload_schema !== "object" || Array.isArray(event.payload_schema))) {
       throw new Error("Integration contract mismatch; update the executor.");
     }
+    for (const registration of result.registrations) this.revision(registration);
     return result;
   }
   async read(revisionID: string): Promise<SharedRevision> {
