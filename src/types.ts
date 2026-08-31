@@ -79,7 +79,7 @@ export interface ManifestEvent {
   /** What this event means / when it fires — guides placement. */
   description?: string;
   /** Suggested properties to attach, with descriptions. */
-  properties?: Array<{ name: string; description?: string; required?: boolean }>;
+  properties?: Array<{ name: string; type?: string; description?: string; required?: boolean }>;
   /** Why this event matters: the interventions it drives + weights. */
   interventions?: Array<{ code: string; label?: string; weight?: number }>;
   /** Relative importance 0..1 (max weight across its interventions). */
@@ -155,7 +155,7 @@ export interface OpportunityEvent {
   expectedEffect?: string;
   /** 0..1 */
   confidence?: number;
-  properties?: Array<{ name: string; description?: string; required?: boolean }>;
+  properties?: Array<{ name: string; type?: string; description?: string; required?: boolean }>;
   /** Existing (or same-batch) interventions this event should feed. */
   links?: Array<{ interventionCode: string; weight?: number }>;
 }

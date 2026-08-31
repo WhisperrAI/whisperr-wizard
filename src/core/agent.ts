@@ -100,6 +100,7 @@ export async function runIntegrationAgent(opts: {
   onOpportunitiesReady?: (
     opportunities: UniverseOpportunities,
   ) => Promise<OpportunityEvent[]>;
+  strictRegistration?: boolean;
 }): Promise<AgentRunOutcome> {
   const {
     repoPath,
@@ -113,7 +114,9 @@ export async function runIntegrationAgent(opts: {
   } = opts;
 
   applyModelAuthEnv(config, session);
-  const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt].join("\n\n");
+  const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt,
+    opts.strictRegistration ? "Shared registration is enabled. Every opportunity property MUST include type: string, number, integer, boolean, or null, based on actual code. No guessed types, arrays, unrestricted objects, free text, names, emails, or other personal data. Only emit approved payload fields. Identify with stable user ID only; do not add contact channels or infer messaging consent." : "",
+  ].join("\n\n");
 
   const started = Date.now();
   let costUsd = 0;
@@ -183,8 +186,9 @@ export async function runIntegrationAgent(opts: {
     "   they'd land in different controllers, you've picked the wrong login.",
     "   Wire it at the primary end-user login success and on session restore at",
     "   startup; call reset() on logout. One end-user login path plus session",
-    "   restore is enough. Keep channels minimal: email if readily at hand;",
-    "   phone/push optional.",
+    opts.strictRegistration
+      ? "   restore is enough. Use stable user ID only; do not add email, phone, or push channels. Delivery setup is separate."
+      : "   restore is enough. Keep channels minimal: email if readily at hand; phone/push optional.",
     "",
     "This is a real app — be quick and decisive, aim to finish in ~15 steps.",
     "Do NOT instrument product events yet — that is a separate step. Do not run",
@@ -218,6 +222,7 @@ export async function runIntegrationAgent(opts: {
     try {
       appliedOpportunityEvents = await onOpportunitiesReady(planning.opportunities);
     } catch (err) {
+      if (opts.strictRegistration) throw err;
       debugNote(`universe additions failed: ${(err as Error).message}`);
     }
   }

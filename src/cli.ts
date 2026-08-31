@@ -39,6 +39,7 @@ import { buildGapReport, renderGapReport } from "./core/gapreport.js";
 import { banner } from "./ui/banner.js";
 import { theme } from "./ui/theme.js";
 import { fetchIntegrationPlaybook } from "./core/integration-playbook.js";
+import { bootstrapIntegration, finishIntegration, opportunityDefinition, startIntegrationHeartbeat } from "./core/integration-bootstrap.js";
 import type {
   Detection,
   IntegrationManifest,
@@ -119,22 +120,25 @@ export async function run(options: RunOptions): Promise<number> {
   // it never outlives the process.
   startSessionKeepalive(config, session);
 
-  // Additive compatibility gate while run-bound registration is migrated.
-  // Existing offline/device flows stay available when this flag is disabled.
-  if (!config.offline && process.env.WHISPERR_SHARED_PLAYBOOK_ENABLED === "1") {
+  // Both executors consume the same registry workflow when explicitly enabled.
+  // Offline and existing manifest/device flows stay unchanged by default.
+  const sharedEnabled = !config.offline && process.env.WHISPERR_SHARED_PLAYBOOK_ENABLED === "1";
+  if (sharedEnabled) {
     await fetchIntegrationPlaybook(config.apiBaseUrl, session.token);
   }
 
   // 3. Pull the integration manifest (events/interventions/key), telling the
   //    backend which surface this is so it can mark what's already covered.
   const fingerprint = await repoFingerprint(repoPath);
+  const sharedSetup = sharedEnabled ? await bootstrapIntegration(config, session, repoPath, fingerprint, chosen.playbook.target.id) : undefined;
+  const sharedRevisions = new Map<string, string>();
   const manifest = await withSpinner("Loading your onboarding context", () =>
-    fetchManifest(config, session, chosen.playbook.target.id, fingerprint),
+    sharedSetup ? Promise.resolve(sharedSetup.manifest) : fetchManifest(config, session, chosen.playbook.target.id, fingerprint),
   );
   // Approval immediately merges suggestions into the manifest. Fetch the
   // approved records in parallel with the run so the end-of-run bookkeeping
   // only has to reconcile what this surface actually wired.
-  const approvedSuggestionsPromise = config.offline
+  const approvedSuggestionsPromise = config.offline || sharedSetup
     ? null
     : fetchSuggestions(config, session, ["approved"]);
   p.note(
@@ -175,6 +179,7 @@ export async function run(options: RunOptions): Promise<number> {
   }
 
   // 5. Run the coding agent.
+  const stopSharedHeartbeat = sharedSetup ? startIntegrationHeartbeat(config, session, sharedSetup.runID) : () => {};
   const spin = p.spinner();
   const useIntegrationSpinner = Boolean(process.stdout.isTTY);
   let phaseLabel = "Integrating";
@@ -211,6 +216,7 @@ export async function run(options: RunOptions): Promise<number> {
     session,
     playbook: chosen.playbook,
     manifest,
+    strictRegistration: sharedEnabled,
     // The plan is always shown — it's the last look at what's about to change
     // in their code. It only becomes a question under --review-plan; the
     // default run reads it out and keeps going.
@@ -243,6 +249,33 @@ export async function run(options: RunOptions): Promise<number> {
     },
     async onOpportunitiesReady(raw) {
       if (useIntegrationSpinner) spin.stop(theme.success("Planning done"));
+      if (sharedSetup) {
+        const clean = sanitizeOpportunities(raw, manifest);
+        additions.proposed = clean.events.length;
+        if (clean.interventions.length) p.log.info("Interventions will be planned from the approved event universe in your dashboard.");
+        if (!clean.events.length) return [];
+        const definitions = clean.events.map(opportunityDefinition);
+        p.note(clean.events.map((event) => `${event.code} — ${event.rationale || event.description || "Code-supported event"}`).join("\n"), "Proposed event definitions");
+        if (config.proposeOnly) {
+          await sharedSetup.client.stageEvents(definitions);
+          p.log.info("Saved a draft. No events were committed or marked live.");
+          return [];
+        }
+        const registration = await sharedSetup.client.registerEvents(definitions);
+        for (const definition of definitions) {
+          sharedSetup.definitions.set(definition.code, definition);
+          sharedRevisions.set(definition.code, registration.revision.revision_id);
+        }
+        additions.applied = clean.events;
+        // Include first-run proposals in the existing placement/review pass,
+        // including an initially empty event manifest.
+        manifest.events.push(...clean.events.map((event) => ({ eventType: event.code, label: event.label,
+          description: event.description, properties: event.properties,
+        })));
+        p.log.info("Event schemas accepted using isolated test data. Code placement and live traffic are still separate checks.");
+        if (useIntegrationSpinner) spin.start(theme.bright("Continuing integration"));
+        return clean.events;
+      }
       const applied = await applyOpportunities({
         config,
         session,
@@ -284,6 +317,7 @@ export async function run(options: RunOptions): Promise<number> {
   // seeing, so the report goes out on every exit below — not just the happy one.
   let verified: boolean | null = null;
   let reported = false;
+  let sharedFinalizeFailed = false;
 
   // Derive per-event coverage from the diff AT REPORT TIME rather than reading
   // a variable assigned later in the happy path. A verify failure reports from
@@ -294,10 +328,10 @@ export async function run(options: RunOptions): Promise<number> {
     const eventOutcomeByType = new Map(
       outcome.eventOutcomes.map((event) => [event.event, event]),
     );
-    const eventTypes = [
+    const eventTypes = [...new Set([
       ...manifest.events.map((e) => e.eventType),
       ...additions.applied.map((e) => e.code),
-    ];
+    ])];
     let wired = new Map<string, string>();
     try {
       wired = await scanWiredEvents(
@@ -323,6 +357,18 @@ export async function run(options: RunOptions): Promise<number> {
     if (reported) return [];
     reported = true;
     const reportEvents = await collectReportEvents();
+    if (sharedSetup) {
+      stopSharedHeartbeat();
+      try {
+        await finishIntegration(config, session, sharedSetup, reportEvents,
+          await changedFiles(repoPath, checkpoint), outcome?.coreOk ?? false, verified, exitClass, sharedRevisions);
+      } catch (error) {
+        sharedFinalizeFailed = true;
+        p.log.warn(`Shared integration is not finalized: ${(error as Error).message}`);
+        // This is never converted into legacy additions or a deployment claim.
+      }
+      return reportEvents;
+    }
     const result = await postRunReport(config, session, {
       target: chosen.playbook.target.id,
       repo_fingerprint: fingerprint,
@@ -641,12 +687,18 @@ export async function run(options: RunOptions): Promise<number> {
   const nextSteps = [
     `${theme.signal("1.")} Review the diff above.`,
     `${theme.signal("2.")} Run / rebuild your app to start sending events.`,
-    `${theme.signal("3.")} Commit & deploy — Whisperr starts working on real users.`,
+    sharedSetup
+      ? `${theme.signal("3.")} Review, commit, and deploy. Live receipt and messaging readiness are checked separately in your dashboard.`
+      : `${theme.signal("3.")} Commit & deploy — Whisperr starts working on real users.`,
     undo ? theme.muted(`Undo everything: ${undo}`) : "",
   ]
     .filter(Boolean)
     .join("\n");
   p.note(nextSteps, theme.bright("Next"));
+  if (sharedFinalizeFailed) {
+    p.outro(theme.warn("Code changes remain local; the shared integration still needs attention in your dashboard."));
+    return 1;
+  }
   p.outro(theme.signal("⌁ ") + theme.bright("Whisperr is wired in."));
   return 0;
 }

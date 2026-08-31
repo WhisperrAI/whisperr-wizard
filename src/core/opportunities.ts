@@ -273,6 +273,7 @@ function coerceEvent(entry: unknown): OpportunityEvent | null {
     const desc = asString(pr.description);
     properties.push({
       name,
+      ...(asString(pr.type) ? { type: asString(pr.type) } : {}),
       ...(desc ? { description: desc } : {}),
       ...(pr.required === true ? { required: true } : {}),
     });
