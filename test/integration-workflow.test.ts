@@ -1,8 +1,15 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { IntegrationWorkflowClient, syntheticProperties } from "../src/core/integration-workflow.js";
+import { IntegrationWorkflowClient, sharedServerKeyGuidance, syntheticProperties } from "../src/core/integration-workflow.js";
 
 const event = { code: "checkout_started", name: "Checkout", payload_schema: { plan: "string", total: "number", active: "boolean" } };
+test("shared server guidance keeps credentials in hosting config and distinguishes code from live proof", () => {
+  assert.equal(sharedServerKeyGuidance(false), "");
+  const guidance = sharedServerKeyGuidance(true);
+  assert.match(guidance, /bootstrap key is publishable/);
+  assert.match(guidance, /Never read, echo, invent, hard-code, or commit a server secret/);
+  assert.match(guidance, /not deployment or live proof/);
+});
 function revision(state: string, missing = false) {
   return { contract_version: "2.0.0", revision: { revision_id: "rev_1", state, events: [event] },
     content_hash: "hash", current_event_codes: ["committed", "superseded"].includes(state) ? [event.code] : [],

@@ -18,6 +18,7 @@ import {
   renderOpportunitiesBrief,
 } from "./playbooks/shared-prompt.js";
 import { evaluateToolUse } from "./toolPolicy.js";
+import { sharedServerKeyGuidance } from "./integration-workflow.js";
 
 export interface AgentProgress {
   /** A new phase started, e.g. "Installing the SDK". */
@@ -116,6 +117,7 @@ export async function runIntegrationAgent(opts: {
   applyModelAuthEnv(config, session);
   const systemPrompt = [BASE_WIZARD_PROMPT, playbook.systemPrompt,
     opts.strictRegistration ? "Shared registration is enabled. Every opportunity property MUST include type: string, number, integer, boolean, or null, based on actual code. No guessed types, arrays, unrestricted objects, free text, names, emails, or other personal data. Only emit approved payload fields. Identify with stable user ID only; do not add contact channels or infer messaging consent." : "",
+    sharedServerKeyGuidance(opts.strictRegistration === true),
   ].join("\n\n");
 
   const started = Date.now();

@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { SHARED_CONTRACT_VERSION } from "./integration-playbook.js";
 
+export function sharedServerKeyGuidance(enabled: boolean): string {
+  return enabled ? "Trusted server-source setup: the bootstrap key is publishable and cannot prove server activity. Preserve the backend's environment/config key reference (for example WHISPERR_API_KEY); the customer must configure their explicitly approved server key in their hosting environment. Never read, echo, invent, hard-code, or commit a server secret or place one in a browser/mobile bundle. Do not add profile/contact fields or infer consent. A PR, local build, synthetic schema test, or key binding is not deployment or live proof; only accepted traffic from that approved server key establishes live server activity." : "";
+}
+
 export interface SharedEventDefinition {
   code: string;
   name: string;
