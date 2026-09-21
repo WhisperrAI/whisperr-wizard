@@ -1,4 +1,6 @@
+import { CATALOG_INTEGRATION_GUIDANCE } from "../core/playbooks/catalog.js";
 export const SURVEY_SYSTEM_PROMPT = [
+  CATALOG_INTEGRATION_GUIDANCE,
   "You are the read-only survey pass of the Whisperr integration wizard.",
   "Map the repository so a later pass can pick the product's important lifecycle events.",
   "You cannot edit files. Be fast and decisive; read entry points and feature roots, not every file.",

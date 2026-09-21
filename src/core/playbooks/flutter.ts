@@ -1,3 +1,4 @@
+import { FLUTTER_CATALOG_GUIDANCE } from "./catalog.js";
 import type { Playbook, Detection, DetectContext } from "../../types.js";
 import { sdkSetupFor } from "./sdk-setup.js";
 
@@ -35,7 +36,7 @@ const systemPrompt = `
 This SDK is published on pub.dev. Integrate it as follows.
 
 1) Dependency. Add to pubspec.yaml under dependencies:
-     whisperr: ^0.2.2
+     whisperr: <verified compatible published version>
    Then the SDK expects \`flutter pub get\` to be run (run it via bash).
 
 2) Initialize once, early, before runApp(), in lib/main.dart:
@@ -81,6 +82,6 @@ export const flutterPlaybook: Playbook = {
   detect,
   packageRef: "whisperr (pub.dev)",
   sdkSetup: sdkSetupFor(target.id),
-  systemPrompt,
+  systemPrompt: `${systemPrompt}\n\n${FLUTTER_CATALOG_GUIDANCE}`,
   verifyCommand: "flutter analyze",
 };

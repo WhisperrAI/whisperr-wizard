@@ -79,8 +79,8 @@ EFFICIENCY — non-negotiable:
 - Use Grep and Glob to find code. Do NOT read whole files; read the smallest
   slice you need.
 - NEVER re-read a file you just edited. Trust your edit.
-- Do not run the app, build, or the analyzer/test suites. The human reviews the
-  diff.
+- Do not start the customer app or contact live users. Run the focused checks
+  provided by the existing verification workflow and report their actual result.
 - Make several related edits in a row before pausing to think.
 
 DECISIVENESS:
@@ -121,6 +121,8 @@ dashboard — write for a human, not a changelog):
   them, e.g. "Wired the 6 subscription + signup events in your auth and billing
   controllers."). End with what you deliberately left as follow-ups and why.
 - Mention concrete file names in prose if helpful, but no diffs, no snippets.
+- Separate implemented code and local checks from deployment, complete catalog
+  synchronization and observed events. Never claim the latter without evidence.
 `.trim();
 
 /** Phase 1 brief: just what identify() needs. */

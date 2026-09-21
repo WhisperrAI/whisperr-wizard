@@ -1,3 +1,4 @@
+import { CATALOG_INTEGRATION_GUIDANCE } from "./catalog.js";
 import type { Playbook } from "../../types.js";
 import { flutterPlaybook } from "./flutter.js";
 import { nextjsPlaybook } from "./nextjs.js";
@@ -18,7 +19,7 @@ import { swiftPlaybook } from "./swift.js";
  * More-specific playbooks (nextjs, react-native) return null when a more
  * specific match should win, so the generic web playbook doesn't shadow them.
  */
-export const ALL_PLAYBOOKS: Playbook[] = [
+const registeredPlaybooks: Playbook[] = [
   flutterPlaybook,
   nextjsPlaybook,
   reactNativePlaybook,
@@ -28,6 +29,11 @@ export const ALL_PLAYBOOKS: Playbook[] = [
   phpPlaybook,
   swiftPlaybook,
 ];
+
+export const ALL_PLAYBOOKS: Playbook[] = registeredPlaybooks.map((playbook) => ({
+  ...playbook,
+  systemPrompt: `${playbook.systemPrompt}\n\n${CATALOG_INTEGRATION_GUIDANCE}`,
+}));
 
 export function playbookByTargetId(id: string): Playbook | undefined {
   return ALL_PLAYBOOKS.find((p) => p.target.id === id);
