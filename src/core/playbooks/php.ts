@@ -1,3 +1,4 @@
+import { PHP_CATALOG_GUIDANCE } from "./catalog.js";
 import type { Playbook, Detection, DetectContext } from "../../types.js";
 import { sdkSetupFor } from "./sdk-setup.js";
 
@@ -94,6 +95,6 @@ export const phpPlaybook: Playbook = {
   detect,
   packageRef: "whisperr/php (Packagist)",
   sdkSetup: sdkSetupFor(target.id),
-  systemPrompt,
+  systemPrompt: `${systemPrompt}\n\n${PHP_CATALOG_GUIDANCE}`,
   verifyCommand: undefined,
 };

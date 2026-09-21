@@ -408,6 +408,7 @@ test("orchestrator automatically freezes design, integrates, reviews, and verifi
     );
 
     assert.equal(result.kind, "completed", result.kind === "aborted" ? result.reason : result.kind === "partial" ? result.summary : undefined);
+    if (result.kind === "completed") assert.match(result.summary, /Repository checks describe the code only/);
     if (result.kind !== "completed") return;
     assert.equal(state.items.length, 1);
     assert.equal(state.items[0].code, "signup_completed");

@@ -1,3 +1,4 @@
+import { REPOSITORY_READINESS_NOTICE } from "../core/playbooks/catalog.js";
 import { readFile } from "node:fs/promises";
 import { basename, resolve, sep } from "node:path";
 
@@ -1293,10 +1294,10 @@ function summarize(
   registered: RegisteredEvent[],
   statuses: Map<string, EventIntegrationStatus>,
 ): string[] {
-  return registered.map((event) => {
+  return [...registered.map((event) => {
     const status = statuses.get(event.code) ?? "planned";
     return `${event.code}: ${status} (${event.anchorFile})`;
-  });
+  }), REPOSITORY_READINESS_NOTICE];
 }
 
 function patchFiles(patch: string): string[] {

@@ -1,3 +1,4 @@
+import { CATALOG_REVIEW_GUIDANCE } from "../core/playbooks/catalog.js";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 
@@ -593,6 +594,7 @@ export async function reviewIntegratedFile(
       sessionKey: "semantic_review",
       systemPrompt: [
         "You are the file-isolated semantic review pass for product analytics instrumentation.",
+        CATALOG_REVIEW_GUIDANCE,
         "Use finish_review exactly once. Do not browse the repository and do not edit files.",
       ].join("\n"),
       userPrompt: [
